@@ -36,7 +36,7 @@ The easiest way to try the module is using Docker:
 
 ```bash
 # Clone the repository
-git clone https://github.com/crowdsecurity/ngx_http_crowdsec_module.git
+git clone https://github.com/LaurenceJJones/ngx_http_crowdsec_module.git
 cd ngx_http_crowdsec_module
 
 # Build and start the containers
