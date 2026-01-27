@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log
+
+# NGINX build artifacts
+*.o
+*.so
+objs/
+
+# Planning and internal documentation
+PLAN.md
+*.plan
+
+# Environment and secrets
+.env
+.env.*

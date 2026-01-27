@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access Denied</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            color: #333;
+        }
+        .container {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            padding: 40px;
+            max-width: 500px;
+            text-align: center;
+        }
+        h1 {
+            color: #e74c3c;
+            margin-top: 0;
+            font-size: 2.5em;
+        }
+        .info {
+            background: #f8f9fa;
+            border-left: 4px solid #e74c3c;
+            padding: 15px;
+            margin: 20px 0;
+            text-align: left;
+            border-radius: 4px;
+        }
+        .info-item {
+            margin: 8px 0;
+            font-family: 'Courier New', monospace;
+        }
+        .label {
+            font-weight: bold;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚫 Access Denied</h1>
+        <p>Your access to this resource has been restricted.</p>
+        
+        <div class="info">
+            <div class="info-item">
+                <span class="label">IP Address:</span> {{client_ip}}
+            </div>
+            <div class="info-item">
+                <span class="label">Request:</span> {{request_method}} {{request_uri}}
+            </div>
+        </div>
+        
+        <p style="color: #666; font-size: 0.9em;">
+            If you believe this is an error, please contact the administrator.
+        </p>
+    </div>
+</body>
+</html>

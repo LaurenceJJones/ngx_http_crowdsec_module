@@ -1,0 +1,15 @@
+#!/bin/sh
+
+# NGINX module configuration script for ngx_http_crowdsec_module
+# This script is used when building with --add-dynamic-module=
+
+. "$ngx_addon_dir/auto/rust"
+
+ngx_addon_name="ngx_http_crowdsec_module"
+
+if [ "$HTTP" = YES ]; then
+    ngx_module_name="ngx_http_crowdsec_module"
+    ngx_module_libs="-lm"
+    ngx_rust_target="ngx_http_crowdsec_module"
+    ngx_rust_module
+fi
