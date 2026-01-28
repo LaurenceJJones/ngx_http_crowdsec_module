@@ -225,6 +225,16 @@ pub struct TemplateVariables {
     pub request_uri: Option<String>,
     /// Request method
     pub request_method: Option<String>,
+    /// Captcha site key (public key for widget)
+    pub captcha_site_key: Option<String>,
+    /// Captcha provider script URL
+    pub captcha_script_url: Option<String>,
+    /// Captcha widget div class
+    pub captcha_div_class: Option<String>,
+    /// Captcha error message (if verification failed)
+    pub captcha_error: Option<String>,
+    /// Form action URL for captcha submission
+    pub form_action: Option<String>,
 }
 
 impl TemplateVariables {
@@ -239,6 +249,11 @@ impl TemplateVariables {
             "reason" => self.reason.as_deref(),
             "request_uri" => self.request_uri.as_deref(),
             "request_method" => self.request_method.as_deref(),
+            "captcha_site_key" => self.captcha_site_key.as_deref(),
+            "captcha_script_url" => self.captcha_script_url.as_deref(),
+            "captcha_div_class" => self.captcha_div_class.as_deref(),
+            "captcha_error" => self.captcha_error.as_deref(),
+            "form_action" => self.form_action.as_deref(),
             _ => None,
         }
     }

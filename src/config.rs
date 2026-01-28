@@ -1,3 +1,4 @@
+use crate::captcha::{CaptchaConfig, CaptchaProvider, CookieSecure};
 use crate::template::BanTemplate;
 use ngx::core::{NgxStr, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::ffi::{
@@ -29,17 +30,64 @@ pub struct MainConfig {
 }
 
 /// Location configuration for CrowdSec module
+/// All fields use Option to support inheritance from parent contexts
 #[derive(Debug, Default, Clone)]
 pub struct LocConfig {
     /// Whether CrowdSec checking is enabled for this location
-    /// None = not explicitly set (should inherit from parent)
-    /// Some(true) = explicitly set to on
-    /// Some(false) = explicitly set to off
     pub enabled: Option<bool>,
-    /// Ban template for rendering 403 responses (Arc for cheap cloning during config merge)
-    /// None = not explicitly set (should inherit from parent)
-    /// Some(Arc<template>) = shared pointer to parsed template
+    /// Ban template for rendering 403 responses
     pub ban_template: Option<Arc<BanTemplate>>,
+    /// Captcha template for rendering captcha challenge pages
+    pub captcha_template: Option<Arc<BanTemplate>>,
+
+    // === Captcha configuration (inheritable at server/location level) ===
+    /// Captcha provider (hcaptcha, turnstile, recaptcha)
+    pub captcha_provider: Option<CaptchaProvider>,
+    /// Public site key for the captcha widget
+    pub captcha_site_key: Option<String>,
+    /// Secret key for server-side verification
+    pub captcha_secret_key: Option<String>,
+    /// HMAC signing key for JWT tokens (32 bytes)
+    pub captcha_signing_key: Option<[u8; 32]>,
+    /// Cookie name for storing the captcha session
+    pub captcha_cookie_name: Option<String>,
+    /// Session expiry in seconds
+    pub captcha_expiry_secs: Option<u64>,
+    /// Whether to fail open when provider is unreachable
+    pub captcha_fail_open: Option<bool>,
+    /// Whether to bind JWT to client IP
+    pub captcha_bind_ip: Option<bool>,
+    /// Cookie Secure flag setting (auto/on/off)
+    pub captcha_cookie_secure: Option<CookieSecure>,
+}
+
+impl LocConfig {
+    /// Build a CaptchaConfig from the merged location config
+    /// Returns None if captcha is not fully configured
+    pub fn captcha_config(&self) -> Option<CaptchaConfig> {
+        // Check if we have the minimum required fields
+        let provider = self.captcha_provider?;
+        let site_key = self.captcha_site_key.clone()?;
+        let secret_key = self.captcha_secret_key.clone()?;
+        let signing_key = self.captcha_signing_key?;
+
+        // signing_key must not be all zeros
+        if signing_key == [0u8; 32] {
+            return None;
+        }
+
+        Some(CaptchaConfig {
+            provider,
+            site_key,
+            secret_key,
+            signing_key,
+            cookie_name: self.captcha_cookie_name.clone().unwrap_or_else(|| "crowdsec_captcha".to_string()),
+            expiry_secs: self.captcha_expiry_secs.unwrap_or(3600),
+            fail_open: self.captcha_fail_open.unwrap_or(true),
+            bind_ip: self.captcha_bind_ip.unwrap_or(true),
+            cookie_secure: self.captcha_cookie_secure.unwrap_or(CookieSecure::Auto),
+        })
+    }
 }
 
 /// Directive handler for `crowdsec on|off;`
@@ -325,12 +373,367 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_template(
     NGX_CONF_OK
 }
 
+/// Directive handler for `crowdsec_captcha_provider hcaptcha|turnstile|recaptcha;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_provider(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        let provider = match CaptchaProvider::from_str(value_str) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "crowdsec: invalid captcha provider '{}' (expected: hcaptcha, turnstile, recaptcha)",
+                    value_str
+                );
+                return NGX_CONF_ERROR;
+            }
+        };
+
+        conf.captcha_provider = Some(provider);
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_captcha_site_key <key>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_site_key(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        conf.captcha_site_key = Some(value_str.to_string());
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_captcha_secret_key <key>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_secret_key(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        conf.captcha_secret_key = Some(value_str.to_string());
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_captcha_signing_key <hex-key>;`
+/// Key must be 64 hex characters (32 bytes)
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_signing_key(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        // Parse hex string to bytes
+        let key = match parse_hex_key(value_str) {
+            Some(k) => k,
+            None => {
+                eprintln!(
+                    "crowdsec: invalid signing key (expected 64 hex characters, got {} chars)",
+                    value_str.len()
+                );
+                return NGX_CONF_ERROR;
+            }
+        };
+
+        conf.captcha_signing_key = Some(key);
+    }
+
+    NGX_CONF_OK
+}
+
+/// Parse a 64-character hex string to a 32-byte key
+fn parse_hex_key(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+
+    let mut key = [0u8; 32];
+    for i in 0..32 {
+        let byte_str = &hex[i * 2..i * 2 + 2];
+        key[i] = u8::from_str_radix(byte_str, 16).ok()?;
+    }
+    Some(key)
+}
+
+/// Directive handler for `crowdsec_captcha_cookie_name <name>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_cookie_name(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        conf.captcha_cookie_name = Some(value_str.to_string());
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_captcha_expiry <seconds>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_expiry(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        match value_str.parse::<u64>() {
+            Ok(n) if n > 0 && n <= 86400 * 30 => {
+                // Max 30 days
+                conf.captcha_expiry_secs = Some(n);
+            }
+            _ => {
+                eprintln!("crowdsec: invalid captcha expiry (1-2592000 seconds)");
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_captcha_fail_open on|off;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_fail_open(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        conf.captcha_fail_open = Some(value_str.eq_ignore_ascii_case("on"));
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_captcha_bind_ip on|off;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_bind_ip(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        conf.captcha_bind_ip = Some(value_str.eq_ignore_ascii_case("on"));
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_captcha_cookie_secure auto|on|off;`
+///
+/// Controls the Secure flag on the captcha session cookie:
+/// - `auto` (default): Detect based on connection SSL or X-Forwarded-Proto header
+/// - `on`: Always set Secure flag (use when behind TLS-terminating proxy)
+/// - `off`: Never set Secure flag (for testing only)
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_cookie_secure(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        match CookieSecure::from_str(value_str) {
+            Some(secure) => conf.captcha_cookie_secure = Some(secure),
+            None => {
+                eprintln!(
+                    "crowdsec: invalid cookie_secure value '{}', expected auto|on|off",
+                    value_str
+                );
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_captcha_template <path>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[no_mangle]
+pub extern "C" fn ngx_http_crowdsec_set_captcha_template(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let path_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        // Check cache first (reuse same cache as ban templates)
+        let mut cache = TEMPLATE_CACHE.lock().unwrap();
+
+        let template = match cache.get(path_str) {
+            Some(cached_template) => Arc::clone(cached_template),
+            None => {
+                match BanTemplate::from_file(path_str) {
+                    Ok(template) => {
+                        let arc_template = Arc::new(template);
+                        cache.insert(path_str.to_string(), Arc::clone(&arc_template));
+                        arc_template
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "crowdsec: failed to load captcha template from {}: {}",
+                            path_str, e
+                        );
+                        return NGX_CONF_ERROR;
+                    }
+                }
+            }
+        };
+
+        conf.captcha_template = Some(template);
+    }
+
+    NGX_CONF_OK
+}
+
 /// Generate the commands array for NGINX module registration
 ///
 /// Returns the static commands array for the module.
 /// The array is null-terminated with an empty command.
 #[rustfmt::skip]
-pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 8] = [
+pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 18] = [
     // crowdsec on|off; - enable/disable at location level
     ngx_command_t {
         name: ngx_string!("crowdsec"),
@@ -390,6 +793,97 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 8] = [
         name: ngx_string!("crowdsec_ban_template"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_ban_template),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // ===== Captcha directives (inheritable at http/server/location levels) =====
+    // crowdsec_captcha_provider hcaptcha|turnstile|recaptcha;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_provider"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_provider),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_site_key <key>;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_site_key"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_site_key),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_secret_key <key>;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_secret_key"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_secret_key),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_signing_key <hex-key>;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_signing_key"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_signing_key),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_cookie_name <name>;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_cookie_name"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_cookie_name),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_expiry <seconds>;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_expiry"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_expiry),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_fail_open on|off;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_fail_open"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_fail_open),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_bind_ip on|off;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_bind_ip"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_bind_ip),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_cookie_secure auto|on|off;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_cookie_secure"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_cookie_secure),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_captcha_template <path>; (location-level)
+    ngx_command_t {
+        name: ngx_string!("crowdsec_captcha_template"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_captcha_template),
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
         post: std::ptr::null_mut(),

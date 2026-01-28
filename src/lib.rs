@@ -1,9 +1,10 @@
 //! CrowdSec NGINX Module
 //!
-//! This module integrates NGINX with CrowdSec LAPI to enforce IP ban decisions.
+//! This module integrates NGINX with CrowdSec LAPI to enforce IP ban and captcha decisions.
 //! It uses the stream mode to efficiently sync decisions and checks incoming
 //! requests against a shared memory decision cache accessible by all workers.
 
+mod captcha;
 mod config;
 mod handler;
 pub mod shm;
@@ -59,11 +60,39 @@ impl Merge for LocConfig {
         if self.ban_template.is_none() {
             self.ban_template = prev.ban_template.clone();
         }
+        if self.captcha_template.is_none() {
+            self.captcha_template = prev.captcha_template.clone();
+        }
+        // Captcha configuration inheritance
+        if self.captcha_provider.is_none() {
+            self.captcha_provider = prev.captcha_provider;
+        }
+        if self.captcha_site_key.is_none() {
+            self.captcha_site_key = prev.captcha_site_key.clone();
+        }
+        if self.captcha_secret_key.is_none() {
+            self.captcha_secret_key = prev.captcha_secret_key.clone();
+        }
+        if self.captcha_signing_key.is_none() {
+            self.captcha_signing_key = prev.captcha_signing_key;
+        }
+        if self.captcha_cookie_name.is_none() {
+            self.captcha_cookie_name = prev.captcha_cookie_name.clone();
+        }
+        if self.captcha_expiry_secs.is_none() {
+            self.captcha_expiry_secs = prev.captcha_expiry_secs;
+        }
+        if self.captcha_fail_open.is_none() {
+            self.captcha_fail_open = prev.captcha_fail_open;
+        }
+        if self.captcha_bind_ip.is_none() {
+            self.captcha_bind_ip = prev.captcha_bind_ip;
+        }
         Ok(())
     }
 }
 
-// Access phase handler - uses shared memory for ban checks
+// Access phase handler - uses shared memory for ban and captcha checks
 http_request_handler!(crowdsec_access_handler, |request: &mut ngx::http::Request| {
     let loc_conf = Module::location_conf(request).expect("module config is none");
     let result = handle_access(request, loc_conf);
