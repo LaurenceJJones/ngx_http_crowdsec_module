@@ -33,6 +33,10 @@ services:
     container_name: nginx-crowdsec
     environment:
       CROWDSEC_BOUNCER_KEY: "test-bouncer-key-12345"
+      # Captcha configuration (set in .env file)
+      CAPTCHA_SITE_KEY: ${CAPTCHA_SITE_KEY:-}
+      CAPTCHA_SECRET_KEY: ${CAPTCHA_SECRET_KEY:-}
+      CAPTCHA_SIGNING_KEY: ${CAPTCHA_SIGNING_KEY:-}
     ports:
       - "9090:8080"
     volumes:

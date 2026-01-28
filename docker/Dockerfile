@@ -1,23 +1,23 @@
 # Multi-stage build for CrowdSec NGINX module
 # Build NGINX and the Rust module together to ensure binary compatibility
 
-# Stage 1: Build NGINX and the Rust module
-FROM rust:1.83-bookworm AS builder
+# =============================================================================
+# Stage 1: Build NGINX (cached separately - rarely changes)
+# =============================================================================
+FROM rust:1.83-bookworm AS nginx-builder
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
     libssl-dev \
     libpcre2-dev \
     zlib1g-dev \
-    clang \
-    llvm \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and build NGINX first
 WORKDIR /nginx
 ENV NGINX_VERSION=1.26.2
+
+# Download and build NGINX - this layer is cached unless NGINX_VERSION changes
 RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
     && tar xzf nginx-${NGINX_VERSION}.tar.gz \
     && cd nginx-${NGINX_VERSION} \
@@ -39,20 +39,44 @@ RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
     && make \
     && make install
 
+# =============================================================================
+# Stage 2: Build Rust module
+# =============================================================================
+FROM rust:1.83-bookworm AS rust-builder
+
+# Install build dependencies for ngx crate
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libssl-dev \
+    libpcre2-dev \
+    zlib1g-dev \
+    clang \
+    llvm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy NGINX build artifacts from previous stage
+COPY --from=nginx-builder /nginx /nginx
+COPY --from=nginx-builder /etc/nginx /etc/nginx
+COPY --from=nginx-builder /usr/sbin/nginx /usr/sbin/nginx
+
 # Set up environment for nginx-sys to find NGINX
 ENV NGINX_SOURCE_DIR=/nginx/nginx-1.26.2
 ENV NGINX_BUILD_DIR=/nginx/nginx-1.26.2/objs
 
 WORKDIR /build
 
-# Copy the source code
+# Copy source code and build
+# Note: We can't use the dummy lib.rs trick here because the ngx crate's build.rs
+# needs to generate bindings that depend on our actual code structure
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 
-# Build the module WITHOUT vendored feature (uses the NGINX we just built)
+# Build the module
 RUN cargo build --release
 
-# Stage 2: Create the final runtime image
+# =============================================================================
+# Stage 3: Create the final runtime image
+# =============================================================================
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
@@ -66,12 +90,12 @@ RUN apt-get update && apt-get install -y \
     && ln -sf /dev/stdout /var/log/nginx/access.log \
     && ln -sf /dev/stderr /var/log/nginx/error.log
 
-# Copy NGINX from builder
-COPY --from=builder /usr/sbin/nginx /usr/sbin/nginx
-COPY --from=builder /etc/nginx /etc/nginx
+# Copy NGINX from nginx-builder stage
+COPY --from=nginx-builder /usr/sbin/nginx /usr/sbin/nginx
+COPY --from=nginx-builder /etc/nginx /etc/nginx
 
-# Copy the built module
-COPY --from=builder /build/target/release/libngx_http_crowdsec_module.so /etc/nginx/modules/
+# Copy the built module from rust-builder stage
+COPY --from=rust-builder /build/target/release/libngx_http_crowdsec_module.so /etc/nginx/modules/
 
 # Copy configuration template and entrypoint
 COPY docker/nginx.conf /etc/nginx/nginx.conf.template
