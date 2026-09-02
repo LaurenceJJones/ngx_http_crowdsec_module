@@ -125,6 +125,10 @@ pub fn handle_access(request: &mut Request, loc_conf: &LocConfig) -> HandlerResu
     let lookup = shm::lookup_ip(&client_ip);
 
     if !lookup.found {
+        let appsec = crate::appsec::inspect(request, loc_conf);
+        if !matches!(appsec, HandlerResult::Declined) {
+            return appsec;
+        }
         // No remediation - but check if client has a stale captcha cookie to clear
         maybe_clear_stale_captcha_cookie(request, loc_conf);
         return HandlerResult::Declined;
@@ -163,7 +167,7 @@ pub fn handle_access(request: &mut Request, loc_conf: &LocConfig) -> HandlerResu
 }
 
 /// Handle a captcha decision for a client
-fn handle_captcha_decision(
+pub(crate) fn handle_captcha_decision(
     request: &mut Request,
     loc_conf: &LocConfig,
     client_ip: &IpAddr,
@@ -381,6 +385,49 @@ fn send_empty_response(request: &mut Request, status: HTTPStatus) -> Result<(), 
         ngx::ffi::ngx_http_finalize_request(r, rc);
     }
 
+    Ok(())
+}
+
+pub(crate) fn send_raw_response(
+    request: &mut Request,
+    status: HTTPStatus,
+    body: &str,
+    headers: &[(String, String)],
+) -> Result<(), ()> {
+    request.set_status(status);
+    request.set_content_length_n(body.len());
+    request.discard_request_body();
+    for (name, value) in headers {
+        let lower = name.to_ascii_lowercase();
+        if !matches!(
+            lower.as_str(),
+            "connection" | "content-length" | "transfer-encoding" | "upgrade"
+        ) {
+            request.add_header_out(name, value);
+        }
+    }
+    let pool = request.pool();
+    let mut buffer = pool.create_buffer_from_str(body).ok_or(())?;
+    buffer.set_last_buf(true);
+    buffer.set_last_in_chain(true);
+    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
+    let cl = unsafe {
+        let cl = ngx::ffi::ngx_alloc_chain_link(pool.as_ptr());
+        if cl.is_null() {
+            return Err(());
+        }
+        (*cl).buf = buffer.as_ngx_buf_mut();
+        (*cl).next = std::ptr::null_mut();
+        cl
+    };
+    let rc = request.send_header();
+    if rc != Status::NGX_OK {
+        return Err(());
+    }
+    unsafe {
+        let rc = ngx::ffi::ngx_http_output_filter(r, cl);
+        ngx::ffi::ngx_http_finalize_request(r, rc);
+    }
     Ok(())
 }
 

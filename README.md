@@ -111,6 +111,25 @@ cp target/release/libngx_http_crowdsec_module.so /etc/nginx/modules/
 
 ## Configuration
 
+### AppSec and CrowdSec 1.8 bot detection
+
+```nginx
+crowdsec_appsec_url http://127.0.0.1:7422/;
+crowdsec_appsec on;
+crowdsec_appsec_timeout 1000;
+crowdsec_appsec_max_body_size 10m;
+crowdsec_appsec_failure_action passthrough;
+crowdsec_bot_challenge on;
+```
+
+`crowdsec_appsec_api_key` defaults to `crowdsec_api_key`. AppSec and bot
+challenges are disabled unless explicitly enabled. Bot detection follows the
+CrowdSec 1.8 challenge protocol and should be treated as experimental until
+CrowdSec marks that feature stable. Invalid challenge envelopes fail closed.
+
+The internal `/crowdsec-internal/challenge/*` paths are handled by AppSec and
+must not be routed around this module to the protected origin.
+
 ### Loading the Module
 
 Add to the top of your `nginx.conf`:
