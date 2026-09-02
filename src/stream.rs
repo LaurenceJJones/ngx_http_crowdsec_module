@@ -99,8 +99,8 @@ impl StreamClient {
             .into_json()
             .map_err(|e| StreamError::Json(e.to_string()))?;
 
-        let new_decisions = stream_response.new_decisions();
-        let deleted_decisions = stream_response.deleted_decisions();
+        let new_decisions = stream_response.new.unwrap_or_default();
+        let deleted_decisions = stream_response.deleted.unwrap_or_default();
 
         let new_count = new_decisions.len();
         let deleted_count = deleted_decisions.len();

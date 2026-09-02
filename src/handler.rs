@@ -41,9 +41,9 @@ impl From<HandlerResult> for Status {
 /// shouldn't receive full HTML ban/captcha pages.
 fn is_static_asset_request(request: &Request) -> bool {
     if let Ok(path) = request.path().to_str() {
-        let path_lower = path.to_lowercase();
-        // Check for favicon and other common browser-requested assets
-        path_lower.ends_with(".ico")
+        path.as_bytes()
+            .get(path.len().saturating_sub(4)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".ico"))
     } else {
         false
     }

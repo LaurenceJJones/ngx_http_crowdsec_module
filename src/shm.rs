@@ -36,7 +36,6 @@ const HASH_TOMBSTONE: u32 = 1;
 
 /// Flag bits in the flags field
 const FLAG_TOMBSTONE: u8 = 0b0000_0001;
-const FLAG_ACCESSED: u8 = 0b0000_0010;
 const FLAG_IS_CIDR: u8 = 0b0000_0100;
 
 /// Decision types from CrowdSec
@@ -201,7 +200,7 @@ pub struct ShmHashEntry {
     pub decision_types: u8,
     /// Origin of the decision (most recent)
     pub origin: u8,
-    /// Flags: bit 0 = tombstone, bit 1 = accessed (LRU), bit 2 = is_cidr
+    /// Flags: bit 0 = tombstone, bit 2 = is_cidr
     pub flags: u8,
     /// CIDR prefix length (32 for IPv4 single IP, 128 for IPv6 single IP)
     pub prefix_len: u8,
@@ -253,20 +252,6 @@ impl ShmHashEntry {
     #[inline]
     pub fn is_cidr(&self) -> bool {
         (self.flags & FLAG_IS_CIDR) != 0
-    }
-
-    #[inline]
-    pub fn is_accessed(&self) -> bool {
-        (self.flags & FLAG_ACCESSED) != 0
-    }
-
-    #[inline]
-    pub fn set_accessed(&mut self, accessed: bool) {
-        if accessed {
-            self.flags |= FLAG_ACCESSED;
-        } else {
-            self.flags &= !FLAG_ACCESSED;
-        }
     }
 
     #[inline]
@@ -824,7 +809,7 @@ unsafe fn find_vacant_slot(entries: *mut ShmHashEntry, capacity: u32, hash: u32)
     }
 }
 
-/// Evict an entry using clock algorithm
+/// Evict an entry in round-robin order.
 /// Must be called with write lock held
 /// Returns the index of the evicted slot
 unsafe fn evict_clock(shm_data: *mut ShmData) -> Option<u32> {
@@ -832,38 +817,21 @@ unsafe fn evict_clock(shm_data: *mut ShmData) -> Option<u32> {
         let entries = get_entries(shm_data);
         let capacity = (*shm_data).capacity;
         let mut hand = (*shm_data).clock_hand;
-        let start_hand = hand;
+        let start = hand;
 
-        // First pass: try to find an entry with accessed=0
         loop {
             let entry = &mut *entries.add(hand as usize);
 
             if !entry.is_vacant() {
-                if entry.is_accessed() {
-                    // Clear accessed bit, give second chance
-                    entry.set_accessed(false);
-                } else {
-                    // Found victim - evict it
-                    let evicted_idx = hand;
-                    entry.mark_tombstone();
-                    (*shm_data).count = (*shm_data).count.saturating_sub(1);
-                    (*shm_data).eviction_count += 1;
-                    (*shm_data).clock_hand = (hand + 1) % capacity;
-                    return Some(evicted_idx);
-                }
+                entry.mark_tombstone();
+                (*shm_data).count = (*shm_data).count.saturating_sub(1);
+                (*shm_data).eviction_count += 1;
+                (*shm_data).clock_hand = (hand + 1) % capacity;
+                return Some(hand);
             }
 
             hand = (hand + 1) % capacity;
-            if hand == start_hand {
-                // Wrapped around twice - just evict current position
-                let entry = &mut *entries.add(hand as usize);
-                if !entry.is_vacant() {
-                    entry.mark_tombstone();
-                    (*shm_data).count = (*shm_data).count.saturating_sub(1);
-                    (*shm_data).eviction_count += 1;
-                    (*shm_data).clock_hand = (hand + 1) % capacity;
-                    return Some(hand);
-                }
+            if hand == start {
                 break;
             }
         }
@@ -890,9 +858,7 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
     };
 
     unsafe {
-        // The clock eviction policy updates the accessed bit on a hit, so this
-        // must be a write lock. A read lock here caused cross-worker data races.
-        ngx_rwlock_wlock(&mut (*shm_data).lock);
+        ngx_rwlock_rlock(&mut (*shm_data).lock);
 
         let entries = get_entries(shm_data);
         let capacity = (*shm_data).capacity;
@@ -906,9 +872,8 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
         let (idx, found) = find_slot_ip(entries, capacity, hash, ip);
 
         if found {
-            let entry = &mut *entries.add(idx as usize);
+            let entry = &*entries.add(idx as usize);
             if !entry.is_expired_at(now) {
-                entry.set_accessed(true);
                 let result = LookupResult {
                     found: true,
                     decision_type: entry.decision_type(),
@@ -950,9 +915,8 @@ unsafe fn lookup_cidr_v4(
             let (idx, found) = find_slot_cidr(entries, capacity, hash, 4, prefix_len, &network);
 
             if found {
-                let entry = &mut *entries.add(idx as usize);
+                let entry = &*entries.add(idx as usize);
                 if !entry.is_expired_at(now) {
-                    entry.set_accessed(true);
                     return LookupResult {
                         found: true,
                         decision_type: entry.decision_type(),
@@ -991,9 +955,8 @@ unsafe fn lookup_cidr_v6(
             let (idx, found) = find_slot_cidr(entries, capacity, hash, 6, prefix_len, &network);
 
             if found {
-                let entry = &mut *entries.add(idx as usize);
+                let entry = &*entries.add(idx as usize);
                 if !entry.is_expired_at(now) {
-                    entry.set_accessed(true);
                     return LookupResult {
                         found: true,
                         decision_type: entry.decision_type(),
@@ -1059,7 +1022,6 @@ pub fn add_decision(info: &DecisionInfo) {
             let entry = &mut *entries.add(idx as usize);
             entry.decision_types |= decision_bit;
             entry.origin = info.origin as u8;
-            entry.flags |= FLAG_ACCESSED;
             // Keep the longer expiry
             if expires > entry.expires {
                 entry.expires = expires;
@@ -1080,7 +1042,7 @@ pub fn add_decision(info: &DecisionInfo) {
         new_entry.origin = info.origin as u8;
         new_entry.expires = expires;
         new_entry.scenario_id = scenario_id;
-        new_entry.flags = FLAG_ACCESSED;
+        new_entry.flags = 0;
 
         match info.ip {
             IpAddr::V4(v4) => {
@@ -1170,7 +1132,6 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
             let entry = &mut *entries.add(idx as usize);
             entry.decision_types |= decision_bit;
             entry.origin = info.origin as u8;
-            entry.flags |= FLAG_ACCESSED;
             if expires > entry.expires {
                 entry.expires = expires;
             }
@@ -1191,7 +1152,7 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         new_entry.origin = info.origin as u8;
         new_entry.expires = expires;
         new_entry.scenario_id = scenario_id;
-        new_entry.flags = FLAG_ACCESSED | FLAG_IS_CIDR;
+        new_entry.flags = FLAG_IS_CIDR;
 
         let len = if info.family == 4 { 4 } else { 16 };
         new_entry.addr[..len].copy_from_slice(&info.network[..len]);
