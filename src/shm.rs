@@ -810,6 +810,7 @@ unsafe fn find_vacant_slot(entries: *mut ShmHashEntry, capacity: u32, hash: u32)
 }
 
 /// Evict an entry in round-robin order.
+/// ponytail: upgrade to sampled eviction only if full-zone churn is measured.
 /// Must be called with write lock held
 /// Returns the index of the evicted slot
 unsafe fn evict_clock(shm_data: *mut ShmData) -> Option<u32> {
