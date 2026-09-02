@@ -22,6 +22,8 @@ pub enum HandlerResult {
     Done,
     /// Captcha required - body read initiated (async)
     CaptchaPending,
+    /// AppSec is waiting for the request body before calling the WAF
+    AppSecPending,
 }
 
 impl From<HandlerResult> for Status {
@@ -31,7 +33,9 @@ impl From<HandlerResult> for Status {
             HandlerResult::Forbidden => Status::from(HTTPStatus::FORBIDDEN),
             HandlerResult::Error => Status::NGX_DECLINED, // Fail-open
             HandlerResult::Done => Status::NGX_DONE, // Request fully handled and finalized - don't touch it
-            HandlerResult::CaptchaPending => Status::NGX_DONE, // Body read in progress
+            HandlerResult::CaptchaPending | HandlerResult::AppSecPending => {
+                Status::NGX_DONE // Body read in progress
+            }
         }
     }
 }

@@ -92,6 +92,10 @@ jobs:
           echo '{"_status":403,"action":"ban","http_status":403}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
           test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 403
 
+          echo '{"_status":403,"action":"ban","http_status":403,"check_body":"evil"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'clean' http://nginx:8080/)" = 200
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'evil-payload' http://nginx:8080/)" = 403
+
           cat > "$RUNNER_TEMP/crowdsec-state/appsec.json" <<'EOF'
           {"_status":403,"action":"challenge","http_status":200,"user_body_content":"<!doctype html><title>CrowdSec challenge</title>","user_headers":{"Content-Type":["text/html"],"Cache-Control":["no-store"]},"user_cookies":["__crowdsec_challenge=test; Path=/; HttpOnly; SameSite=Lax"]}
           EOF

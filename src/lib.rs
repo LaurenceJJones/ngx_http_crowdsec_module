@@ -10,6 +10,7 @@ mod config;
 mod handler;
 mod metrics;
 mod realip;
+mod request_body;
 pub mod shm;
 mod stream;
 mod template;
@@ -24,7 +25,7 @@ use ngx::ffi::{
 };
 use ngx::http::{
     HttpModule, HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError,
-    NgxHttpCoreModule,
+    NgxHttpCoreModule, Request,
 };
 use ngx::{http_request_handler, ngx_modules, ngx_string};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +42,10 @@ static POLLING_HANDLE: Mutex<Option<(JoinHandle<()>, Arc<AtomicBool>)>> = Mutex:
 
 /// The CrowdSec HTTP module
 struct Module;
+
+pub(crate) fn crowdsec_loc_conf(request: &Request) -> Option<&LocConfig> {
+    Module::location_conf(request)
+}
 
 unsafe impl HttpModuleMainConf for Module {
     type MainConf = MainConfig;
@@ -176,6 +181,7 @@ impl HttpModule for Module {
                         .unwrap_or_default(),
                     timeout_ms: conf.appsec_timeout_ms.unwrap_or(1000),
                     max_body_size: conf.appsec_max_body_size.unwrap_or(10 * 1024 * 1024),
+                    drop_unreadable_body: conf.appsec_drop_unreadable_body.unwrap_or(false),
                 }
             }));
 

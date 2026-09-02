@@ -35,6 +35,8 @@ pub struct MainConfig {
     pub appsec_api_key: Option<String>,
     pub appsec_timeout_ms: Option<u64>,
     pub appsec_max_body_size: Option<usize>,
+    /// When true, reject requests whose body cannot be buffered for AppSec (temp file / unreadable).
+    pub appsec_drop_unreadable_body: Option<bool>,
     /// When the TCP peer matches one of these CIDRs, client IP is taken from `real_ip_header`
     /// (default `X-Forwarded-For`) using recursive right-to-left trusted stripping.
     pub trusted_proxies: Vec<TrustedCidr>,
@@ -50,8 +52,6 @@ pub enum AppSecFailureAction {
     Passthrough,
     Deny,
 }
-
-/// How NGINX responds when CrowdSec has a **ban** decision for the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BanActionMode {
     /// Return 403 (optionally with `crowdsec_ban_template` body)
@@ -1225,6 +1225,23 @@ appsec_setter!(
     }
 );
 appsec_setter!(
+    set_appsec_drop_unreadable_body,
+    MainConfig,
+    |c: &mut MainConfig, v: &str| {
+        match v.to_lowercase().as_str() {
+            "on" | "true" | "1" => {
+                c.appsec_drop_unreadable_body = Some(true);
+                true
+            }
+            "off" | "false" | "0" => {
+                c.appsec_drop_unreadable_body = Some(false);
+                true
+            }
+            _ => false,
+        }
+    }
+);
+appsec_setter!(
     set_appsec_enabled,
     LocConfig,
     |c: &mut LocConfig, v: &str| {
@@ -1272,7 +1289,7 @@ appsec_setter!(
 /// Returns the static commands array for the module.
 /// The array is null-terminated with an empty command.
 #[rustfmt::skip]
-pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 34] = [
+pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 35] = [
     // crowdsec on|off; - enable/disable at location level
     ngx_command_t {
         name: ngx_string!("crowdsec"),
@@ -1512,6 +1529,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 34] = [
     ngx_command_t { name: ngx_string!("crowdsec_appsec_api_key"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_api_key), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec_timeout"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_timeout), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec_max_body_size"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_max_body), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_appsec_drop_unreadable_body"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_drop_unreadable_body), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_enabled), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec_failure_action"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_failure), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_bot_challenge"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_bot_challenge), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },

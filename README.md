@@ -29,7 +29,7 @@ A high-performance NGINX dynamic module written in Rust that integrates [CrowdSe
 ### Runtime Requirements
 
 - NGINX 1.30+ (compiled with dynamic module support)
-- Two small **shared-memory zones** are registered: `crowdsec_decisions` (size from `crowdsec_shm_size`) and `crowdsec_metrics` (4KB, for counters)
+- Two small **shared-memory zones** are registered: `crowdsec_decisions` (size from `crowdsec_shm_size`) and `crowdsec_metrics` (8KB, for counters)
 - CrowdSec LAPI (v1.x)
 - Registered bouncer API key
 

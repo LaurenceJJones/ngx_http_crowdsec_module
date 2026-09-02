@@ -1626,6 +1626,10 @@ fn get_metrics_shm() -> Option<*mut MetricsShm> {
     }
 }
 
+/// Fixed size for the metrics zone. Must exceed one OS page plus the slab pool
+/// header; a 4KB zone leaves zero allocatable pages on typical 4096-byte pages.
+const METRICS_SHM_SIZE: usize = 8192;
+
 /// Second shared zone for counters (fixed size; safe across `ShmData` upgrades).
 ///
 /// # Safety
@@ -1635,7 +1639,7 @@ pub unsafe fn init_metrics_shm_zone(cf: *mut ngx::ffi::ngx_conf_t) -> Result<(),
     let shm_zone = ngx::ffi::ngx_shared_memory_add(
         cf,
         &name as *const _ as *mut _,
-        4096,
+        METRICS_SHM_SIZE,
         &raw const crate::ngx_http_crowdsec_module as *mut _,
     );
     if shm_zone.is_null() {
@@ -1664,8 +1668,10 @@ unsafe extern "C" fn metrics_zone_init(
     let sz = std::mem::size_of::<MetricsShm>();
     let p = ngx_slab_alloc_locked(shpool, sz);
     if p.is_null() {
-        eprintln!("crowdsec: failed to allocate metrics SHM");
-        return ngx::ffi::NGX_ERROR as ngx_int_t;
+        eprintln!(
+            "crowdsec: warning: failed to allocate metrics SHM; counters disabled"
+        );
+        return NGX_OK as ngx_int_t;
     }
 
     ptr::write(

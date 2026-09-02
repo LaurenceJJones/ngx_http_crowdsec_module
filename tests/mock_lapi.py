@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.server.server_address[1] == 7422:
-            self.appsec()
+            self.appsec(b"")
             return
         if not self.path.startswith("/v1/decisions/stream"):
             self.send_error(404)
@@ -28,13 +28,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        self.appsec()
+        if self.server.server_address[1] == 7422:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            payload = self.rfile.read(length) if length else b""
+            self.appsec(payload)
+            return
+        self.appsec(b"")
 
-    def appsec(self):
+    def appsec(self, request_body: bytes):
         try:
             with open(os.getenv("APPSEC_STATE_FILE", "/state/appsec.json")) as state:
                 payload = json.load(state)
             status = payload.pop("_status", 200)
+            needle = payload.pop("check_body", None)
+            if needle is not None and needle.encode() not in request_body:
+                status = 200
+                payload = {"action": "allow"}
             body = json.dumps(payload).encode()
         except (OSError, ValueError):
             self.send_error(500)

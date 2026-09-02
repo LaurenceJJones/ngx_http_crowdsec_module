@@ -1,8 +1,17 @@
 use crate::config::{AppSecFailureAction, LocConfig, MainConfig};
-use crate::handler::{HandlerResult, get_client_ip, handle_captcha_decision, send_raw_response};
+use crate::handler::{
+    HandlerResult, get_client_ip, handle_captcha_decision, send_raw_response,
+};
+use crate::request_body::{
+    APPSEC_BODY_CTX_MAGIC, BodyExtractResult, extract_request_body_limited, finalize_allow,
+    get_content_length, has_request_body, initiate_body_read,
+};
+use ngx::ffi::{ngx_http_finalize_request, ngx_http_request_t, ngx_int_t};
 use ngx::http::{HTTPStatus, Method, Request};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::ptr;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -12,10 +21,62 @@ pub struct AppSecConfig {
     pub api_key: String,
     pub timeout_ms: u64,
     pub max_body_size: usize,
+    pub drop_unreadable_body: bool,
 }
 
 static CONFIG: Mutex<Option<AppSecConfig>> = Mutex::new(None);
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(ureq::Agent::new);
+
+/// Stored in the module request context while AppSec waits for the body.
+#[repr(C)]
+pub struct AppSecBodyContext {
+    pub magic: u32,
+    pub client_ip: [u8; 64],
+    pub client_ip_len: usize,
+    pub failure_action: u8,
+    pub internal_challenge: u8,
+    pub bot_challenge: u8,
+}
+
+impl AppSecBodyContext {
+    fn new(
+        ip: &IpAddr,
+        failure_action: AppSecFailureAction,
+        internal_challenge: bool,
+        bot_challenge: bool,
+    ) -> Self {
+        let ip_str = ip.to_string();
+        let ip_bytes = ip_str.as_bytes();
+        let mut client_ip = [0u8; 64];
+        let ip_len = ip_bytes.len().min(63);
+        client_ip[..ip_len].copy_from_slice(&ip_bytes[..ip_len]);
+        Self {
+            magic: APPSEC_BODY_CTX_MAGIC,
+            client_ip,
+            client_ip_len: ip_len,
+            failure_action: match failure_action {
+                AppSecFailureAction::Passthrough => 0,
+                AppSecFailureAction::Deny => 1,
+            },
+            internal_challenge: u8::from(internal_challenge),
+            bot_challenge: u8::from(bot_challenge),
+        }
+    }
+
+    fn failure_action(&self) -> AppSecFailureAction {
+        match self.failure_action {
+            1 => AppSecFailureAction::Deny,
+            _ => AppSecFailureAction::Passthrough,
+        }
+    }
+
+    fn client_ip(&self) -> Option<IpAddr> {
+        std::str::from_utf8(&self.client_ip[..self.client_ip_len])
+            .ok()?
+            .parse()
+            .ok()
+    }
+}
 
 pub fn configure(config: Option<AppSecConfig>) {
     *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = config;
@@ -41,6 +102,13 @@ fn failure(action: AppSecFailureAction) -> HandlerResult {
     }
 }
 
+fn method_may_carry_body(method: Method) -> bool {
+    matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
 pub fn inspect(request: &mut Request, loc: &LocConfig, main_conf: &MainConfig) -> HandlerResult {
     let uri = request.unparsed_uri().to_str().unwrap_or("/");
     let internal_challenge = uri.starts_with("/crowdsec-internal/challenge/");
@@ -54,32 +122,182 @@ pub fn inspect(request: &mut Request, loc: &LocConfig, main_conf: &MainConfig) -
     if internal_challenge && loc.bot_challenge_enabled != Some(true) {
         return HandlerResult::Forbidden;
     }
+
     let failure_action = if internal_challenge {
         AppSecFailureAction::Deny
     } else {
         loc.appsec_failure_action.unwrap_or_default()
     };
-    let config = CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let Some(config) = config else {
-        return failure(failure_action);
+
+    let config = match CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        Some(c) => c,
+        None => return failure(failure_action),
     };
-    let Some(ip) = get_client_ip(request, main_conf) else {
-        return failure(failure_action);
+
+    let ip = match get_client_ip(request, main_conf) {
+        Some(ip) => ip,
+        None => return failure(failure_action),
     };
-    let content_length = request
-        .headers_in_iterator()
-        .find_map(|(k, v)| {
-            let (Ok(k), Ok(v)) = (k.to_str(), v.to_str()) else {
-                return None;
-            };
-            k.eq_ignore_ascii_case("content-length")
-                .then(|| v.parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(0);
-    if content_length > config.max_body_size {
-        return failure(failure_action);
+
+    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
+    if method_may_carry_body(request.method()) && unsafe { has_request_body(r) } {
+        let content_length = unsafe { get_content_length(r) };
+        if content_length > config.max_body_size as i64 {
+            return failure(failure_action);
+        }
+
+        return unsafe {
+            match initiate_appsec_body_read(
+                r,
+                &ip,
+                failure_action,
+                internal_challenge,
+                loc.bot_challenge_enabled == Some(true),
+            ) {
+                Ok(()) => HandlerResult::AppSecPending,
+                Err(result) => result,
+            }
+        };
     }
+
+    inspect_with_body(request, loc, &ip, &config, failure_action, internal_challenge, None)
+}
+
+unsafe fn initiate_appsec_body_read(
+    r: *mut ngx_http_request_t,
+    ip: &IpAddr,
+    failure_action: AppSecFailureAction,
+    internal_challenge: bool,
+    bot_challenge: bool,
+) -> Result<(), HandlerResult> {
+    unsafe {
+        let ctx = ngx::ffi::ngx_palloc((*r).pool, std::mem::size_of::<AppSecBodyContext>())
+            as *mut AppSecBodyContext;
+        if ctx.is_null() {
+            return Err(failure(failure_action));
+        }
+
+        ptr::write(
+            ctx,
+            AppSecBodyContext::new(ip, failure_action, internal_challenge, bot_challenge),
+        );
+
+        let rc = initiate_body_read(r, ctx.cast(), appsec_body_handler);
+        if rc == ngx::ffi::NGX_DONE as ngx_int_t {
+            Ok(())
+        } else if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx_int_t {
+            Err(HandlerResult::Forbidden)
+        } else {
+            Err(failure(failure_action))
+        }
+    }
+}
+
+unsafe extern "C" fn appsec_body_handler(r: *mut ngx_http_request_t) {
+    unsafe {
+        let main_r = (*r).main;
+        let module = &raw const crate::ngx_http_crowdsec_module;
+        let ctx_ptr = (*main_r).ctx.wrapping_add((*module).ctx_index as usize);
+        let ctx = *ctx_ptr as *const AppSecBodyContext;
+
+        if ctx.is_null() || (*ctx).magic != APPSEC_BODY_CTX_MAGIC {
+            ngx_http_finalize_request(r, ngx::ffi::NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+            return;
+        }
+
+        let context = &*ctx;
+        let failure_action = context.failure_action();
+        let config = match CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            Some(c) => c,
+            None => {
+                finalize_handler_result(r, failure(failure_action));
+                return;
+            }
+        };
+
+        let ip = match context.client_ip() {
+            Some(ip) => ip,
+            None => {
+                finalize_handler_result(r, failure(failure_action));
+                return;
+            }
+        };
+
+        let body_result = extract_request_body_limited(
+            r,
+            config.max_body_size,
+            !config.drop_unreadable_body,
+        );
+
+        let body = match body_result {
+            BodyExtractResult::Ok(body) => body,
+            BodyExtractResult::TooLarge => {
+                finalize_handler_result(r, failure(failure_action));
+                return;
+            }
+            BodyExtractResult::Unreadable => {
+                let action = if config.drop_unreadable_body {
+                    AppSecFailureAction::Deny
+                } else {
+                    AppSecFailureAction::Passthrough
+                };
+                finalize_handler_result(r, failure(action));
+                return;
+            }
+        };
+
+        let mut request = Request::from_ngx_http_request(r);
+        let loc = match crate::crowdsec_loc_conf(&request).cloned() {
+            Some(c) => c,
+            None => {
+                finalize_handler_result(r, failure(failure_action));
+                return;
+            }
+        };
+
+        let result = inspect_with_body(
+            &mut request,
+            &loc,
+            &ip,
+            &config,
+            failure_action,
+            context.internal_challenge != 0,
+            Some(body.as_slice()),
+        );
+        finalize_handler_result(r, result);
+    }
+}
+
+fn inspect_with_body(
+    request: &mut Request,
+    loc: &LocConfig,
+    ip: &IpAddr,
+    config: &AppSecConfig,
+    failure_action: AppSecFailureAction,
+    internal_challenge: bool,
+    body: Option<&[u8]>,
+) -> HandlerResult {
+    match call_appsec(request, ip, config, body) {
+        Ok(response) => apply_appsec_response(
+            request,
+            loc,
+            ip,
+            response,
+            failure_action,
+            internal_challenge,
+            loc.bot_challenge_enabled == Some(true),
+        ),
+        Err(_) => failure(failure_action),
+    }
+}
+
+fn call_appsec(
+    request: &Request,
+    ip: &IpAddr,
+    config: &AppSecConfig,
+    body: Option<&[u8]>,
+) -> Result<ureq::Response, ureq::Error> {
+    let uri = request.unparsed_uri().to_str().unwrap_or("/");
     let user_agent = request
         .user_agent()
         .and_then(|v| v.to_str().ok())
@@ -94,16 +312,19 @@ pub fn inspect(request: &mut Request, loc: &LocConfig, main_conf: &MainConfig) -
         })
         .unwrap_or("");
 
-    let mut call = AGENT
-        .get(&config.url)
-        .set("X-Crowdsec-Appsec-Ip", &ip.to_string())
-        .set("X-Crowdsec-Appsec-Uri", uri)
-        .set("X-Crowdsec-Appsec-Host", host)
-        .set("X-Crowdsec-Appsec-Verb", request.method().as_str())
-        .set("X-Crowdsec-Appsec-Api-Key", &config.api_key)
-        .set("X-Crowdsec-Appsec-User-Agent", user_agent)
-        .set("X-Crowdsec-Appsec-Http-Version", "11")
-        .timeout(Duration::from_millis(config.timeout_ms));
+    let mut call = if body.is_some() {
+        AGENT.post(&config.url)
+    } else {
+        AGENT.get(&config.url)
+    }
+    .set("X-Crowdsec-Appsec-Ip", &ip.to_string())
+    .set("X-Crowdsec-Appsec-Uri", uri)
+    .set("X-Crowdsec-Appsec-Host", host)
+    .set("X-Crowdsec-Appsec-Verb", request.method().as_str())
+    .set("X-Crowdsec-Appsec-Api-Key", &config.api_key)
+    .set("X-Crowdsec-Appsec-User-Agent", user_agent)
+    .set("X-Crowdsec-Appsec-Http-Version", "11")
+    .timeout(Duration::from_millis(config.timeout_ms));
 
     for (name, value) in request.headers_in_iterator() {
         let (Ok(name), Ok(value)) = (name.to_str(), value.to_str()) else {
@@ -119,66 +340,85 @@ pub fn inspect(request: &mut Request, loc: &LocConfig, main_conf: &MainConfig) -
         }
     }
 
-    // NGINX has not read ordinary request bodies at access phase yet. Internal
-    // challenge submissions are still routed to AppSec and fail safely if the
-    // engine requires a body that is not available.
-    // ponytail: this bounded local call blocks a worker; replace it with an
-    // NGINX subrequest/event client if production profiling shows contention.
-    let response = if request.method() == Method::POST {
-        call.send_bytes(&[])
+    if let Some(body) = body {
+        call.send_bytes(body)
     } else {
         call.call()
+    }
+}
+
+fn apply_appsec_response(
+    request: &mut Request,
+    loc: &LocConfig,
+    ip: &IpAddr,
+    response: ureq::Response,
+    failure_action: AppSecFailureAction,
+    internal_challenge: bool,
+    bot_challenge: bool,
+) -> HandlerResult {
+    if response.status() == 200 {
+        return HandlerResult::Declined;
+    }
+
+    if response.status() != 403 {
+        return failure(failure_action);
+    }
+
+    let Ok(envelope) = response.into_json::<Envelope>() else {
+        return HandlerResult::Forbidden;
     };
 
-    match response {
-        Ok(response) if response.status() == 200 => HandlerResult::Declined,
-        Ok(_) => failure(failure_action),
-        Err(ureq::Error::Status(403, response)) => {
-            let Ok(envelope) = response.into_json::<Envelope>() else {
-                return HandlerResult::Forbidden;
-            };
-            match envelope.action.as_str() {
-                "allow" => HandlerResult::Declined,
-                "ban" => HandlerResult::Forbidden,
-                "captcha" => handle_captcha_decision(request, loc, &ip),
-                "challenge"
-                    if loc.bot_challenge_enabled == Some(true)
-                        && !envelope.user_body_content.is_empty() =>
-                {
-                    let status = HTTPStatus::from_u16(if envelope.http_status == 0 {
-                        200
-                    } else {
-                        envelope.http_status
+    match envelope.action.as_str() {
+        "allow" => HandlerResult::Declined,
+        "ban" => HandlerResult::Forbidden,
+        "captcha" => handle_captcha_decision(request, loc, ip),
+        "challenge" if bot_challenge && !envelope.user_body_content.is_empty() => {
+            let status = HTTPStatus::from_u16(if envelope.http_status == 0 {
+                200
+            } else {
+                envelope.http_status
+            })
+            .unwrap_or(HTTPStatus::FORBIDDEN);
+            let headers = envelope
+                .user_headers
+                .into_iter()
+                .flat_map(|(name, values)| {
+                    values.into_iter().filter_map(move |value| {
+                        safe_header(&name, &value).then(|| (name.clone(), value))
                     })
-                    .unwrap_or(HTTPStatus::FORBIDDEN);
-                    let headers = envelope
-                        .user_headers
+                })
+                .chain(
+                    envelope
+                        .user_cookies
                         .into_iter()
-                        .flat_map(|(name, values)| {
-                            values.into_iter().filter_map(move |value| {
-                                safe_header(&name, &value).then(|| (name.clone(), value))
-                            })
-                        })
-                        .chain(
-                            envelope
-                                .user_cookies
-                                .into_iter()
-                                .filter(|v| !v.contains(['\r', '\n']))
-                                .map(|v| ("Set-Cookie".to_string(), v)),
-                        )
-                        .collect::<Vec<_>>();
-                    if send_raw_response(request, status, &envelope.user_body_content, &headers)
-                        .is_ok()
-                    {
-                        HandlerResult::Done
-                    } else {
-                        HandlerResult::Forbidden
-                    }
-                }
-                _ => HandlerResult::Forbidden,
+                        .filter(|v| !v.contains(['\r', '\n']))
+                        .map(|v| ("Set-Cookie".to_string(), v)),
+                )
+                .collect::<Vec<_>>();
+            if send_raw_response(request, status, &envelope.user_body_content, &headers).is_ok() {
+                HandlerResult::Done
+            } else {
+                HandlerResult::Forbidden
             }
         }
-        Err(_) => failure(failure_action),
+        _ if internal_challenge => HandlerResult::Forbidden,
+        _ => HandlerResult::Forbidden,
+    }
+}
+
+fn finalize_handler_result(r: *mut ngx_http_request_t, result: HandlerResult) {
+    match result {
+        HandlerResult::Declined => unsafe { finalize_allow(r) },
+        HandlerResult::Forbidden => unsafe {
+            ngx_http_finalize_request(
+                r,
+                ngx::core::Status::from(HTTPStatus::FORBIDDEN).0,
+            );
+        },
+        HandlerResult::Done => {}
+        HandlerResult::Error | HandlerResult::CaptchaPending | HandlerResult::AppSecPending => {
+            unsafe { finalize_allow(r) }
+        }
     }
 }
 
@@ -208,5 +448,17 @@ mod tests {
         assert!(safe_header("Location", "/challenge"));
         assert!(!safe_header("X-Test", "ok\r\nInjected: yes"));
         assert!(!safe_header("Content-Length", "1"));
+    }
+
+    #[test]
+    fn appsec_body_context_roundtrip() {
+        let ctx = AppSecBodyContext::new(
+            &"203.0.113.10".parse().unwrap(),
+            AppSecFailureAction::Deny,
+            false,
+            true,
+        );
+        assert_eq!(ctx.client_ip().unwrap().to_string(), "203.0.113.10");
+        assert_eq!(ctx.failure_action(), AppSecFailureAction::Deny);
     }
 }

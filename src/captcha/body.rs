@@ -7,22 +7,19 @@ use crate::captcha::config::CaptchaConfig;
 use crate::captcha::cookie::{SameSite, build_set_cookie, should_cookie_be_secure};
 use crate::captcha::jwt::JwtManager;
 use crate::captcha::verifier::{VerifyResult, parse_captcha_response, verify_captcha};
+use crate::request_body::{
+    extract_request_body, get_content_length, get_request_log,
+    initiate_body_read as start_body_read,
+};
 use crate::template::BanTemplate;
 use ngx::ffi::{
-    NGX_AGAIN, NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_buf_t, ngx_chain_t, ngx_http_finalize_request,
-    ngx_http_read_client_request_body, ngx_http_request_t, ngx_int_t, ngx_palloc,
+    NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_buf_t, ngx_http_finalize_request, ngx_http_request_t,
+    ngx_int_t, ngx_palloc,
 };
 use ngx::ngx_log_debug;
 use std::net::IpAddr;
+use std::ptr;
 use std::sync::Arc;
-
-/// Helper to get the connection log from a request pointer
-///
-/// # Safety
-/// Requires a valid NGINX request pointer
-unsafe fn get_request_log(r: *const ngx_http_request_t) -> *mut ngx::ffi::ngx_log_t {
-    unsafe { (*(*r).connection).log }
-}
 
 /// Context stored in the request for captcha POST handling
 #[repr(C)]
@@ -164,28 +161,7 @@ pub unsafe fn initiate_body_read(
         let context = CaptchaPostContext::from_config(config, client_ip, template);
         std::ptr::write(ctx, context);
 
-        // Store context in request - use main request's ctx
-        let main_r = (*r).main;
-        let module = &raw const crate::ngx_http_crowdsec_module;
-        let ctx_ptr = (*main_r).ctx.wrapping_add((*module).ctx_index as usize);
-        *ctx_ptr = ctx as *mut std::ffi::c_void;
-
-        // Initiate body reading with callback
-        let rc = ngx_http_read_client_request_body(r, Some(captcha_body_handler));
-
-        if rc == NGX_AGAIN as ngx_int_t {
-            // Body reading in progress, NGINX will call our handler
-            return ngx::ffi::NGX_DONE as ngx_int_t;
-        }
-
-        if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx_int_t {
-            // Error occurred
-            return rc;
-        }
-
-        // When rc == NGX_OK, the callback has already been called by NGINX
-        // and the request has been finalized. Just return NGX_DONE.
-        ngx::ffi::NGX_DONE as ngx_int_t
+        start_body_read(r, ctx.cast(), captcha_body_handler)
     }
 }
 
@@ -647,96 +623,6 @@ unsafe fn get_request_uri(r: *mut ngx_http_request_t) -> String {
 
         let data = std::slice::from_raw_parts(uri.data, uri.len);
         std::str::from_utf8(data).unwrap_or("/").to_string()
-    }
-}
-
-/// Extract the request body from an NGINX request
-///
-/// This should only be called after the body has been fully read
-/// (e.g., in a post_handler callback after ngx_http_read_client_request_body)
-///
-/// # Safety
-/// Requires a valid NGINX request pointer with body already read
-pub unsafe fn extract_request_body(r: *const ngx_http_request_t) -> Vec<u8> {
-    unsafe {
-        if r.is_null() {
-            return Vec::new();
-        }
-
-        let body = (*r).request_body;
-        if body.is_null() {
-            return Vec::new();
-        }
-
-        let mut result = Vec::new();
-
-        // Check if body is stored in temporary file
-        let temp_file = (*body).temp_file;
-        if !temp_file.is_null() {
-            // Body is in a temp file - for now we don't support this
-            // as captcha responses should be small enough to fit in memory
-            ngx_log_debug!(
-                get_request_log(r),
-                "crowdsec: request body in temp file, not supported"
-            );
-            return Vec::new();
-        }
-
-        // Body is in buffer chain
-        let mut chain: *mut ngx_chain_t = (*body).bufs;
-
-        while !chain.is_null() {
-            let buf: *mut ngx_buf_t = (*chain).buf;
-            if !buf.is_null() {
-                // Check if buffer has data
-                let pos = (*buf).pos;
-                let last = (*buf).last;
-
-                if !pos.is_null() && !last.is_null() && last > pos {
-                    let len = last.offset_from(pos) as usize;
-                    let data = std::slice::from_raw_parts(pos, len);
-                    result.extend_from_slice(data);
-                }
-            }
-            chain = (*chain).next;
-        }
-
-        result
-    }
-}
-
-/// Check if the request has a body that needs to be read
-///
-/// # Safety
-/// Requires a valid NGINX request pointer
-pub unsafe fn has_request_body(r: *const ngx_http_request_t) -> bool {
-    unsafe {
-        if r.is_null() {
-            return false;
-        }
-
-        // Check Content-Length header
-        let content_length = (*r).headers_in.content_length_n;
-        if content_length > 0 {
-            return true;
-        }
-
-        // Check for chunked transfer encoding
-        let chunked = (*r).headers_in.chunked();
-        chunked != 0
-    }
-}
-
-/// Get the Content-Length of the request body
-///
-/// # Safety
-/// Requires a valid NGINX request pointer
-pub unsafe fn get_content_length(r: *const ngx_http_request_t) -> i64 {
-    unsafe {
-        if r.is_null() {
-            return -1;
-        }
-        (*r).headers_in.content_length_n
     }
 }
 
