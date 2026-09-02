@@ -194,6 +194,7 @@ pub unsafe extern "C" fn ngx_http_crowdsec_exit_worker(_cycle: *mut ngx_cycle_t)
         // Don't join - let the thread terminate naturally
         let _ = handle;
     }
+    shm::release_poller();
 }
 
 // Module context for HTTP module registration

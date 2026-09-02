@@ -553,6 +553,12 @@ unsafe extern "C" fn shm_zone_init(
     if !data.is_null() {
         // Zone already exists (reload), reuse the data
         (*shm_zone).data = data;
+        // The previous generation's poller exits after new workers start. Reset
+        // its claim now so one of the new workers can take over immediately.
+        let shm_data = data as *mut ShmData;
+        let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
+            as *const std::sync::atomic::AtomicIsize);
+        poller_atomic.store(0, Ordering::SeqCst);
         return NGX_OK as ngx_int_t;
     }
 
@@ -1411,6 +1417,27 @@ pub fn try_become_poller() -> bool {
 /// Check if this worker is the designated poller
 pub fn is_poller() -> bool {
     IS_POLLER.load(Ordering::SeqCst)
+}
+
+/// Release this worker's poller claim without clearing a newer worker's claim.
+pub fn release_poller() {
+    let shm_data = match get_shm_data() {
+        Some(data) => data,
+        None => return,
+    };
+
+    let my_pid = std::process::id() as isize;
+    unsafe {
+        let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
+            as *const std::sync::atomic::AtomicIsize);
+        let _ = poller_atomic.compare_exchange(
+            my_pid,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+    IS_POLLER.store(false, Ordering::SeqCst);
 }
 
 /// Parse a CIDR string like "192.168.1.0/24" or "2001:db8::/32"

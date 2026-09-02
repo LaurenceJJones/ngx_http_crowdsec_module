@@ -155,7 +155,7 @@ For startup/config errors without request context, `eprintln!` is appropriate (g
 ```nginx
 # Main context
 crowdsec_url "http://crowdsec:8080";
-crowdsec_bouncer_key "your-api-key";
+crowdsec_api_key "your-api-key";
 crowdsec_shm_size 512k;
 
 # Captcha configuration (http context)

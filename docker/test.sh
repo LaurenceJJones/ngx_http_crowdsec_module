@@ -2,6 +2,11 @@
 # Test script for CrowdSec NGINX module
 set -e
 
+if [ -z "${CONTAINER_ENGINE:-}" ]; then
+    CONTAINER_ENGINE=$(command -v docker || command -v podman || true)
+fi
+[ -n "$CONTAINER_ENGINE" ] || { echo "docker or podman is required" >&2; exit 1; }
+
 NGINX_URL="${NGINX_URL:-http://localhost:9090}"
 CROWDSEC_CONTAINER="${CROWDSEC_CONTAINER:-crowdsec}"
 
@@ -54,7 +59,7 @@ fi
 # Test 3: Add a ban decision for a test IP
 echo ""
 echo "Test 3: Adding ban decision for IP 192.168.100.100"
-docker exec "$CROWDSEC_CONTAINER" cscli decisions add --ip 192.168.100.100 --type ban --duration 10m --reason "test ban"
+"$CONTAINER_ENGINE" exec "$CROWDSEC_CONTAINER" cscli decisions add --ip 192.168.100.100 --type ban --duration 10m --reason "test ban"
 if [ $? -eq 0 ]; then
     pass "Ban decision added successfully"
 else
@@ -68,7 +73,7 @@ sleep 15
 # Test 4: Check that decisions are visible in CrowdSec
 echo ""
 echo "Test 4: Verify decision exists in CrowdSec"
-DECISION_COUNT=$(docker exec "$CROWDSEC_CONTAINER" cscli decisions list -o json | grep -c "192.168.100.100" || true)
+DECISION_COUNT=$("$CONTAINER_ENGINE" exec "$CROWDSEC_CONTAINER" cscli decisions list -o json | grep -c "192.168.100.100" || true)
 if [ "$DECISION_COUNT" -gt 0 ]; then
     pass "Decision exists in CrowdSec"
 else
@@ -90,7 +95,7 @@ fi
 # Test 6: Remove the ban decision
 echo ""
 echo "Test 6: Removing ban decision"
-docker exec "$CROWDSEC_CONTAINER" cscli decisions delete --ip 192.168.100.100
+"$CONTAINER_ENGINE" exec "$CROWDSEC_CONTAINER" cscli decisions delete --ip 192.168.100.100
 if [ $? -eq 0 ]; then
     pass "Ban decision removed successfully"
 else
@@ -100,7 +105,7 @@ fi
 # Test 7: Check NGINX logs for CrowdSec activity
 echo ""
 echo "Test 7: Check NGINX logs for module activity"
-NGINX_LOGS=$(docker logs nginx-crowdsec 2>&1 | grep -i "crowdsec" | head -5 || true)
+NGINX_LOGS=$("$CONTAINER_ENGINE" logs nginx-crowdsec 2>&1 | grep -i "crowdsec" | head -5 || true)
 if [ -n "$NGINX_LOGS" ]; then
     pass "CrowdSec module is logging"
     echo "    Sample logs:"

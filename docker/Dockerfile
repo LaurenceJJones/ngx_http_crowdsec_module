@@ -4,7 +4,10 @@
 # =============================================================================
 # Stage 1: Build NGINX (cached separately - rarely changes)
 # =============================================================================
-FROM rust:1.83-bookworm AS nginx-builder
+ARG NGINX_VERSION=1.30.3
+
+FROM rust:1.98-bookworm AS nginx-builder
+ARG NGINX_VERSION
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -15,7 +18,6 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /nginx
-ENV NGINX_VERSION=1.26.2
 
 # Download and build NGINX - this layer is cached unless NGINX_VERSION changes
 RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
@@ -42,7 +44,8 @@ RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
 # =============================================================================
 # Stage 2: Build Rust module
 # =============================================================================
-FROM rust:1.83-bookworm AS rust-builder
+FROM rust:1.98-bookworm AS rust-builder
+ARG NGINX_VERSION
 
 # Install build dependencies for ngx crate
 RUN apt-get update && apt-get install -y \
@@ -60,8 +63,8 @@ COPY --from=nginx-builder /etc/nginx /etc/nginx
 COPY --from=nginx-builder /usr/sbin/nginx /usr/sbin/nginx
 
 # Set up environment for nginx-sys to find NGINX
-ENV NGINX_SOURCE_DIR=/nginx/nginx-1.26.2
-ENV NGINX_BUILD_DIR=/nginx/nginx-1.26.2/objs
+ENV NGINX_SOURCE_DIR=/nginx/nginx-${NGINX_VERSION}
+ENV NGINX_BUILD_DIR=/nginx/nginx-${NGINX_VERSION}/objs
 
 WORKDIR /build
 
@@ -71,8 +74,9 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 
-# Build the module
-RUN cargo build --release
+# Compile test targets and build against the same NGINX source as the runtime binary.
+# NGINX module unit-test binaries cannot link without the host NGINX executable.
+RUN cargo check --tests --locked && cargo build --release --locked
 
 # =============================================================================
 # Stage 3: Create the final runtime image

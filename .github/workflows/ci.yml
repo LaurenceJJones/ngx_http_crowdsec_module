@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ github.token }}
+      - name: Build and test module image
+        run: docker build --pull --tag nginx-crowdsec:test --file docker/Dockerfile .
+      - name: Validate NGINX configuration
+        run: |
+          docker network create crowdsec-ci
+          docker run -d --name crowdsec --network crowdsec-ci \
+            -e DISABLE_AGENT=true -e DISABLE_ONLINE_API=true \
+            -e BOUNCER_KEY_nginx=test-bouncer-key-12345 \
+            crowdsecurity/crowdsec:v1.7.8
+          for i in {1..30}; do
+            docker exec crowdsec cscli lapi status >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker run -d --name nginx --network crowdsec-ci \
+            -e CROWDSEC_BOUNCER_KEY=test-bouncer-key-12345 \
+            -e CAPTCHA_SITE_KEY=test -e CAPTCHA_SECRET_KEY=test \
+            -e CAPTCHA_SIGNING_KEY=0000000000000000000000000000000000000000000000000000000000000000 \
+            nginx-crowdsec:test
+          sleep 2
+          docker exec nginx nginx -t

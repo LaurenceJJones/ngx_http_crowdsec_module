@@ -2,14 +2,15 @@
 
 A high-performance NGINX dynamic module written in Rust that integrates [CrowdSec](https://www.crowdsec.net/) security into your NGINX web server. This module enables real-time IP-based threat enforcement through seamless integration with the CrowdSec Local API (LAPI).
 
-> **Status**: Proof of Concept - This module implements core functionality for IP-based blocking. See [Roadmap](#roadmap) for planned features.
+> **Status**: Proof of Concept - This module implements IP-based ban and captcha remediation. See [Roadmap](#roadmap) for remaining work.
 
 ## Features
 
 - **Real-time decision streaming** - Continuously polls CrowdSec LAPI for ban decisions
 - **Cross-worker shared memory** - All NGINX workers share a single decision cache
 - **Fast lookups** - O(1) hash table for individual IPs with CIDR range support
-- **Multiple decision types** - Supports Ban, Captcha (framework ready), and extensible types
+- **Multiple decision types** - Supports Ban and Captcha decisions
+- **Captcha verification** - Supports hCaptcha, reCAPTCHA, and Cloudflare Turnstile with signed session cookies
 - **Automatic expiration** - TTL-based cleanup of expired decisions
 - **LRU eviction** - Clock algorithm for memory management when cache fills
 - **Customizable responses** - Template-based ban pages (HTML, JSON, plain text)
@@ -19,14 +20,14 @@ A high-performance NGINX dynamic module written in Rust that integrates [CrowdSe
 
 ### Build Requirements
 
-- Rust 1.70+ with Cargo
+- Rust 1.98+ with Cargo
 - NGINX source code (matching your target NGINX version)
 - Build tools: `gcc`, `make`, `clang`, `llvm`
 - Libraries: `libssl-dev`, `libpcre2-dev`, `zlib1g-dev`
 
 ### Runtime Requirements
 
-- NGINX 1.24+ (compiled with dynamic module support)
+- NGINX 1.30+ (compiled with dynamic module support)
 - CrowdSec LAPI (v1.x)
 - Registered bouncer API key
 
@@ -40,7 +41,7 @@ git clone https://github.com/LaurenceJJones/ngx_http_crowdsec_module.git
 cd ngx_http_crowdsec_module
 
 # Build and start the containers
-docker-compose up --build -d
+docker compose up --build -d
 
 # Test the endpoints
 curl http://localhost:9090/        # Protected endpoint
@@ -53,7 +54,7 @@ docker exec crowdsec cscli decisions add --ip 1.2.3.4 --type ban --duration 1h -
 docker exec crowdsec cscli decisions list
 
 # Stop the containers
-docker-compose down
+docker compose down
 ```
 
 See [docker/README.md](docker/README.md) for detailed Docker documentation.
@@ -72,9 +73,9 @@ docker build -f docker/Dockerfile -t nginx-crowdsec .
 
 ```bash
 # Download NGINX source (use version matching your production NGINX)
-wget https://nginx.org/download/nginx-1.26.2.tar.gz
-tar -xzf nginx-1.26.2.tar.gz
-cd nginx-1.26.2
+wget https://nginx.org/download/nginx-1.30.3.tar.gz
+tar -xzf nginx-1.30.3.tar.gz
+cd nginx-1.30.3
 
 # Configure NGINX
 ./configure \
@@ -87,8 +88,8 @@ cd nginx-1.26.2
 
 ```bash
 # Set environment variables for nginx-sys crate
-export NGINX_SOURCE_DIR=/path/to/nginx-1.26.2
-export NGINX_BUILD_DIR=/path/to/nginx-1.26.2/objs
+export NGINX_SOURCE_DIR=/path/to/nginx-1.30.3
+export NGINX_BUILD_DIR=/path/to/nginx-1.30.3/objs
 
 # Build with Cargo
 cd /path/to/ngx_http_crowdsec_module
@@ -125,6 +126,16 @@ All directives can be set at the `http`, `server`, or `location` level unless no
 | `crowdsec_max_retries` | http | `3` | Max connection retries on startup |
 | `crowdsec_retry_interval` | http | `5` | Seconds between retry attempts |
 | `crowdsec_ban_template` | http, server, location | built-in | Path to custom ban response template |
+| `crowdsec_captcha_provider` | http, server, location | `turnstile` | `hcaptcha`, `recaptcha`, or `turnstile` |
+| `crowdsec_captcha_site_key` | http, server, location | - | Captcha provider site key |
+| `crowdsec_captcha_secret_key` | http, server, location | - | Captcha provider secret key |
+| `crowdsec_captcha_signing_key` | http, server, location | - | 64-character hex key for signed sessions |
+| `crowdsec_captcha_cookie_name` | http, server, location | `crowdsec_captcha` | Session cookie name |
+| `crowdsec_captcha_expiry` | http, server, location | `3600` | Session lifetime in seconds |
+| `crowdsec_captcha_fail_open` | http, server, location | `on` | Allow requests when verification fails operationally |
+| `crowdsec_captcha_bind_ip` | http, server, location | `on` | Bind captcha sessions to client IP |
+| `crowdsec_captcha_cookie_secure` | http, server, location | `auto` | Secure cookie mode: `auto`, `on`, or `off` |
+| `crowdsec_captcha_template` | http, server, location | built-in | Path to custom captcha template |
 
 ### Example Configuration
 
@@ -140,6 +151,12 @@ http {
     crowdsec_url http://127.0.0.1:8080;
     crowdsec_api_key your-bouncer-api-key;
     crowdsec_shm_size 1m;
+
+    # Generate the signing key with: openssl rand -hex 32
+    crowdsec_captcha_provider hcaptcha;
+    crowdsec_captcha_site_key your-site-key;
+    crowdsec_captcha_secret_key your-secret-key;
+    crowdsec_captcha_signing_key your-64-character-hex-key;
 
     # Default ban template for all servers
     crowdsec_ban_template /etc/nginx/templates/default.html;
@@ -265,10 +282,9 @@ cscli decisions add --range 10.0.0.0/24 --type ban --duration 24h
 Features planned for future releases (working towards feature parity with [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer)):
 
 - [ ] X-Forwarded-For header support (extracting real client IP behind proxies)
-- [ ] Captcha challenge flow (redirect to captcha page, verify response)
+- [x] Captcha challenge flow (hCaptcha, reCAPTCHA, and Turnstile)
 - [ ] Prometheus metrics endpoint
 - [ ] AppSec/WAF integration (request body inspection)
-- [ ] Live recaptcha/turnstile integration
 - [ ] Ban action customization (redirect vs block)
 
 ## Troubleshooting

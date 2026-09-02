@@ -8,16 +8,16 @@ From the project root directory:
 
 ```bash
 # Build and start the containers
-docker-compose up --build -d
+docker compose up --build -d
 
 # View logs
-docker-compose logs -f
+docker compose logs -f
 
 # Run the test suite
 ./docker/test.sh
 
 # Stop the containers
-docker-compose down
+docker compose down
 ```
 
 ## Services
@@ -84,6 +84,9 @@ crowdsec off;  # Disable checking
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `CROWDSEC_BOUNCER_KEY` | API key for LAPI authentication | `test-bouncer-key-12345` |
+| `CAPTCHA_SITE_KEY` | Captcha provider public site key | empty |
+| `CAPTCHA_SECRET_KEY` | Captcha provider secret key | empty |
+| `CAPTCHA_SIGNING_KEY` | 64-character hex key for signed sessions | empty |
 
 ## Testing IP Blocking
 
@@ -145,15 +148,18 @@ docker exec crowdsec cscli bouncers list
 ### Rebuild after code changes
 
 ```bash
-docker-compose down
-docker-compose build --no-cache
-docker-compose up -d
+docker compose down
+docker compose build --no-cache
+docker compose up -d
 ```
 
 ## Development Workflow
 
 1. Make code changes in `src/`
-2. Rebuild: `docker-compose build`
-3. Restart: `docker-compose up -d`
+2. Rebuild: `docker compose build`
+3. Restart: `docker compose up -d`
 4. Test: `./docker/test.sh`
-5. Check logs: `docker-compose logs -f nginx`
+5. Check logs: `docker compose logs -f nginx`
+
+Podman users can substitute `podman-compose` for `docker compose` and run tests with
+`CONTAINER_ENGINE=podman ./docker/test.sh`.

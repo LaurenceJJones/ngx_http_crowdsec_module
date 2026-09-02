@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "NGINX dynamic module for CrowdSec integration"
-repository = "https://github.com/crowdsecurity/ngx_http_crowdsec_module"
+repository = "https://github.com/LaurenceJJones/ngx_http_crowdsec_module"
 keywords = ["nginx", "crowdsec", "security", "firewall", "waf"]
 categories = ["web-programming", "network-programming"]
 
@@ -12,7 +12,7 @@ categories = ["web-programming", "network-programming"]
 crate-type = ["cdylib"]
 
 [dependencies]
-ngx = "0.5"
+ngx = "0.5.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2.9", features = ["json"] }
