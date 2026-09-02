@@ -24,14 +24,12 @@ jobs:
         run: |
           set -euo pipefail
           docker network create crowdsec-ci
+          mkdir -p "$RUNNER_TEMP/crowdsec-state"
+          echo '{"new":[],"deleted":[]}' > "$RUNNER_TEMP/crowdsec-state/decisions.json"
           docker run -d --name crowdsec --network crowdsec-ci \
-            -e DISABLE_AGENT=true -e DISABLE_ONLINE_API=true \
-            -e BOUNCER_KEY_nginx=test-bouncer-key-12345 \
-            crowdsecurity/crowdsec:v1.7.8
-          for i in {1..30}; do
-            docker exec crowdsec cscli lapi status >/dev/null 2>&1 && break
-            sleep 2
-          done
+            -v "$PWD/tests:/mock:ro" \
+            -v "$RUNNER_TEMP/crowdsec-state:/state:ro" \
+            python:3.13-alpine python /mock/mock_lapi.py
           docker run -d --name nginx --network crowdsec-ci \
             -e CROWDSEC_BOUNCER_KEY=test-bouncer-key-12345 \
             -e CAPTCHA_SITE_KEY=test -e CAPTCHA_SECRET_KEY=test \
@@ -44,7 +42,8 @@ jobs:
           client_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' client)
 
           test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
-          docker exec crowdsec cscli decisions add --ip "$client_ip" --type ban --duration 2m
+          printf '{"new":[{"type":"ban","scope":"ip","value":"%s","duration":"2m"}],"deleted":[]}' \
+            "$client_ip" > "$RUNNER_TEMP/crowdsec-state/decisions.json"
           for i in {1..20}; do
             code=$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)
             [ "$code" = 403 ] && break
@@ -52,25 +51,29 @@ jobs:
           done
           test "$code" = 403
 
-          docker exec crowdsec cscli decisions delete --ip "$client_ip"
+          printf '{"new":[],"deleted":[{"type":"ban","scope":"ip","value":"%s"}]}' \
+            "$client_ip" > "$RUNNER_TEMP/crowdsec-state/decisions.json"
           for i in {1..20}; do
             code=$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)
             [ "$code" = 200 ] && break
             sleep 1
           done
           test "$code" = 200
+          echo '{"new":[],"deleted":[]}' > "$RUNNER_TEMP/crowdsec-state/decisions.json"
 
           # Exercise poller hand-off and the CIDR boundary path after reload.
           docker exec nginx nginx -s reload
           sleep 2
-          docker exec crowdsec cscli decisions add --range "$client_ip/32" --type ban --duration 2m
+          printf '{"new":[{"type":"ban","scope":"range","value":"%s/32","duration":"2m"}],"deleted":[]}' \
+            "$client_ip" > "$RUNNER_TEMP/crowdsec-state/decisions.json"
           for i in {1..20}; do
             code=$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)
             [ "$code" = 403 ] && break
             sleep 1
           done
           test "$code" = 403
-          docker exec crowdsec cscli decisions delete --range "$client_ip/32"
+          printf '{"new":[],"deleted":[{"type":"ban","scope":"range","value":"%s/32"}]}' \
+            "$client_ip" > "$RUNNER_TEMP/crowdsec-state/decisions.json"
 
           for i in {1..20}; do
             code=$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)
