@@ -33,6 +33,16 @@ Release candidate: major feature expansion since 0.1.0, combining upstream merge
 
 - Decision polling remains active across worker reloads instead of stopping when the previous poller worker exits.
 
+### Known limitations (RC)
+
+- **AppSec / bot challenge** — Experimental; CrowdSec 1.8 challenge protocol may change. Requires `crowdsec_appsec_url` and a matching CrowdSec AppSec component.
+- **Captcha verification** — Provider API calls on POST are synchronous in the worker; high traffic may need async verification (planned post-0.2.0).
+- **Prometheus metrics** — No built-in authentication; protect the `crowdsec_metrics on` location with `allow`, `internal`, or auth. Metrics SHM init failure disables counters but does not block the module.
+- **Shared-memory upgrades** — Incompatible `crowdsec_decisions` layout changes require a full nginx restart, not `reload` only.
+- **Remediation types** — Ban and captcha only; throttle and other LAPI types are ignored.
+- **Trusted-proxy IP** — Forwarded headers are honored only when the TCP peer matches `crowdsec_trusted_proxies`.
+- **Parity gaps** — Some lua-cs-bouncer edge cases may remain; tracked for post-0.2.0.
+
 ## [0.1.0] - 2025
 
 Initial release.
