@@ -1,9 +1,7 @@
-version: '3.8'
-
 services:
   # CrowdSec LAPI
   crowdsec:
-    image: crowdsecurity/crowdsec:latest
+    image: crowdsecurity/crowdsec:v1.7.8
     container_name: crowdsec
     environment:
       # Disable agent scenarios (we only need LAPI for testing)
