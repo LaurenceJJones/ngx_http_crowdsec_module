@@ -112,7 +112,8 @@ mod tests {
 
     #[test]
     fn test_stream_response_with_reason() {
-        let json = r#"{"new":[{"type":"ban","scope":"ip","value":"1.2.3.4","reason":"manual test"}]}"#;
+        let json =
+            r#"{"new":[{"type":"ban","scope":"ip","value":"1.2.3.4","reason":"manual test"}]}"#;
         let response: StreamResponse = serde_json::from_str(json).unwrap();
         let d = response.new.unwrap().into_iter().next().unwrap();
         assert_eq!(d.reason.as_deref(), Some("manual test"));

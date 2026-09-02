@@ -454,11 +454,7 @@ fn ban_redirect_status(code: u16) -> HTTPStatus {
 }
 
 /// Redirect response for ban remediation (`crowdsec_ban_action redirect`).
-fn send_ban_redirect(
-    request: &mut Request,
-    location: &str,
-    status: HTTPStatus,
-) -> Result<(), ()> {
+fn send_ban_redirect(request: &mut Request, location: &str, status: HTTPStatus) -> Result<(), ()> {
     let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
 
     unsafe {

@@ -1169,6 +1169,7 @@ unsafe fn directive_value<'a>(cf: *mut ngx_conf_t) -> Option<&'a str> {
 
 macro_rules! appsec_setter {
     ($name:ident, $conf:ty, $body:expr) => {
+        #[unsafe(no_mangle)]
         pub extern "C" fn $name(
             cf: *mut ngx_conf_t,
             _cmd: *mut ngx_command_t,
@@ -1227,11 +1228,13 @@ appsec_setter!(
     set_appsec_enabled,
     LocConfig,
     |c: &mut LocConfig, v: &str| {
-        match v {
-            "on" => c.appsec_enabled = Some(true),
-            "off" => c.appsec_enabled = Some(false),
-            _ => return false,
-        };
+        if v.eq_ignore_ascii_case("on") {
+            c.appsec_enabled = Some(true);
+        } else if v.eq_ignore_ascii_case("off") {
+            c.appsec_enabled = Some(false);
+        } else {
+            return false;
+        }
         true
     }
 );
@@ -1239,11 +1242,13 @@ appsec_setter!(
     set_bot_challenge,
     LocConfig,
     |c: &mut LocConfig, v: &str| {
-        match v {
-            "on" => c.bot_challenge_enabled = Some(true),
-            "off" => c.bot_challenge_enabled = Some(false),
-            _ => return false,
-        };
+        if v.eq_ignore_ascii_case("on") {
+            c.bot_challenge_enabled = Some(true);
+        } else if v.eq_ignore_ascii_case("off") {
+            c.bot_challenge_enabled = Some(false);
+        } else {
+            return false;
+        }
         true
     }
 );
@@ -1251,10 +1256,12 @@ appsec_setter!(
     set_appsec_failure,
     LocConfig,
     |c: &mut LocConfig, v: &str| {
-        c.appsec_failure_action = match v {
-            "passthrough" => Some(AppSecFailureAction::Passthrough),
-            "deny" => Some(AppSecFailureAction::Deny),
-            _ => return false,
+        c.appsec_failure_action = if v.eq_ignore_ascii_case("passthrough") {
+            Some(AppSecFailureAction::Passthrough)
+        } else if v.eq_ignore_ascii_case("deny") {
+            Some(AppSecFailureAction::Deny)
+        } else {
+            return false;
         };
         true
     }

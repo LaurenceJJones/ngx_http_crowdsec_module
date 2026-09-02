@@ -1622,11 +1622,7 @@ fn get_metrics_shm() -> Option<*mut MetricsShm> {
     }
     unsafe {
         let data = (*zone).data.cast::<MetricsShm>();
-        if data.is_null() {
-            None
-        } else {
-            Some(data)
-        }
+        if data.is_null() { None } else { Some(data) }
     }
 }
 
@@ -1740,8 +1736,7 @@ pub fn metrics_inc_lapi_poll_ok() {
         .unwrap_or(0);
     unsafe {
         (*p).lapi_poll_ok.fetch_add(1, Ordering::Relaxed);
-        (*p)
-            .lapi_last_success_unix_secs
+        (*p).lapi_last_success_unix_secs
             .store(now, Ordering::Relaxed);
     }
 }

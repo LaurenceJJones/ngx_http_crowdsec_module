@@ -62,14 +62,7 @@ pub fn try_serve_metrics(
          # HELP crowdsec_decision_cache_entries Current IP/CIDR rows in the decision shared-memory cache.\n\
          # TYPE crowdsec_decision_cache_entries gauge\n\
          crowdsec_decision_cache_entries {}\n",
-        lookups,
-        bans,
-        captcha,
-        bypass,
-        poll_ok,
-        poll_err,
-        lapi_last_ok_unix,
-        entries
+        lookups, bans, captcha, bypass, poll_ok, poll_err, lapi_last_ok_unix, entries
     );
 
     if send_text_response(
