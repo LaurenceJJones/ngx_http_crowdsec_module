@@ -1,7 +1,7 @@
 //! Captcha configuration types and provider definitions
 
-use std::sync::Arc;
 use crate::template::BanTemplate;
+use std::sync::Arc;
 
 /// Cookie secure flag setting
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -132,9 +132,9 @@ impl Default for CaptchaConfig {
             secret_key: String::new(),
             signing_key: [0u8; 32],
             cookie_name: "crowdsec_captcha".to_string(),
-            expiry_secs: 3600,              // 1 hour default
-            fail_open: true,                // Default to fail-open for availability
-            bind_ip: true,                  // Default to binding JWT to IP for security
+            expiry_secs: 3600,                 // 1 hour default
+            fail_open: true,                   // Default to fail-open for availability
+            bind_ip: true,                     // Default to binding JWT to IP for security
             cookie_secure: CookieSecure::Auto, // Auto-detect by default
         }
     }
@@ -143,9 +143,7 @@ impl Default for CaptchaConfig {
 impl CaptchaConfig {
     /// Check if captcha is fully configured
     pub fn is_configured(&self) -> bool {
-        !self.site_key.is_empty()
-            && !self.secret_key.is_empty()
-            && self.signing_key != [0u8; 32]
+        !self.site_key.is_empty() && !self.secret_key.is_empty() && self.signing_key != [0u8; 32]
     }
 }
 
@@ -162,25 +160,50 @@ mod tests {
 
     #[test]
     fn test_provider_from_str() {
-        assert_eq!(CaptchaProvider::from_str("hcaptcha"), Some(CaptchaProvider::HCaptcha));
-        assert_eq!(CaptchaProvider::from_str("HCAPTCHA"), Some(CaptchaProvider::HCaptcha));
-        assert_eq!(CaptchaProvider::from_str("turnstile"), Some(CaptchaProvider::Turnstile));
-        assert_eq!(CaptchaProvider::from_str("recaptcha"), Some(CaptchaProvider::ReCaptcha));
+        assert_eq!(
+            CaptchaProvider::from_str("hcaptcha"),
+            Some(CaptchaProvider::HCaptcha)
+        );
+        assert_eq!(
+            CaptchaProvider::from_str("HCAPTCHA"),
+            Some(CaptchaProvider::HCaptcha)
+        );
+        assert_eq!(
+            CaptchaProvider::from_str("turnstile"),
+            Some(CaptchaProvider::Turnstile)
+        );
+        assert_eq!(
+            CaptchaProvider::from_str("recaptcha"),
+            Some(CaptchaProvider::ReCaptcha)
+        );
         assert_eq!(CaptchaProvider::from_str("invalid"), None);
     }
 
     #[test]
     fn test_provider_urls() {
         assert!(CaptchaProvider::HCaptcha.verify_url().contains("hcaptcha"));
-        assert!(CaptchaProvider::Turnstile.verify_url().contains("cloudflare"));
+        assert!(
+            CaptchaProvider::Turnstile
+                .verify_url()
+                .contains("cloudflare")
+        );
         assert!(CaptchaProvider::ReCaptcha.verify_url().contains("google"));
     }
 
     #[test]
     fn test_provider_response_fields() {
-        assert_eq!(CaptchaProvider::HCaptcha.response_field(), "h-captcha-response");
-        assert_eq!(CaptchaProvider::Turnstile.response_field(), "cf-turnstile-response");
-        assert_eq!(CaptchaProvider::ReCaptcha.response_field(), "g-recaptcha-response");
+        assert_eq!(
+            CaptchaProvider::HCaptcha.response_field(),
+            "h-captcha-response"
+        );
+        assert_eq!(
+            CaptchaProvider::Turnstile.response_field(),
+            "cf-turnstile-response"
+        );
+        assert_eq!(
+            CaptchaProvider::ReCaptcha.response_field(),
+            "g-recaptcha-response"
+        );
     }
 
     #[test]

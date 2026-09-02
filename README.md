@@ -20,7 +20,7 @@ A high-performance NGINX dynamic module written in Rust that integrates [CrowdSe
 
 ### Build Requirements
 
-- Rust 1.98+ with Cargo
+- Rust 1.85+ with Cargo
 - NGINX source code (matching your target NGINX version)
 - Build tools: `gcc`, `make`, `clang`, `llvm`
 - Libraries: `libssl-dev`, `libpcre2-dev`, `zlib1g-dev`
@@ -32,6 +32,12 @@ A high-performance NGINX dynamic module written in Rust that integrates [CrowdSe
 - Registered bouncer API key
 
 ## Quick Start with Docker
+
+> [!IMPORTANT]
+> NGINX dynamic modules are ABI-specific. A downloaded `.so` must match the
+> NGINX version, platform, architecture, and configure arguments listed in its
+> release compatibility file. Use the published container image when those do
+> not match your host.
 
 The easiest way to try the module is using Docker:
 

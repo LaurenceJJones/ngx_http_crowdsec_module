@@ -1,5 +1,5 @@
 use crate::captcha::cookie::{build_clear_cookie, get_cookie};
-use crate::captcha::{self, send_captcha_page, CaptchaHandler};
+use crate::captcha::{self, CaptchaHandler, send_captcha_page};
 use crate::config::LocConfig;
 use crate::shm::{self, DecisionType};
 use crate::template::{BanTemplate, TemplateVariables};
@@ -41,9 +41,9 @@ impl From<HandlerResult> for Status {
 /// shouldn't receive full HTML ban/captcha pages.
 fn is_static_asset_request(request: &Request) -> bool {
     if let Ok(path) = request.path().to_str() {
-        let path_lower = path.to_lowercase();
-        // Check for favicon and other common browser-requested assets
-        path_lower.ends_with(".ico")
+        path.as_bytes()
+            .get(path.len().saturating_sub(4)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".ico"))
     } else {
         false
     }
@@ -152,7 +152,11 @@ pub fn handle_access(request: &mut Request, loc_conf: &LocConfig) -> HandlerResu
         }
         DecisionType::Unknown => {
             // Unknown decision type, fail-open
-            ngx_log_debug_http!(request, "crowdsec: unknown decision type for IP {}", client_ip);
+            ngx_log_debug_http!(
+                request,
+                "crowdsec: unknown decision type for IP {}",
+                client_ip
+            );
             HandlerResult::Declined
         }
     }
@@ -287,7 +291,11 @@ fn handle_captcha_post(
         HandlerResult::CaptchaPending
     } else if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx::ffi::ngx_int_t {
         // Error occurred
-        ngx_log_debug_http!(request, "crowdsec: body read initiation failed with rc={}", rc);
+        ngx_log_debug_http!(
+            request,
+            "crowdsec: body read initiation failed with rc={}",
+            rc
+        );
         HandlerResult::Error
     } else {
         // Body already handled (NGX_OK case - callback was called synchronously)
@@ -406,7 +414,10 @@ fn send_ban_response(
 
     // Set headers - content type auto-detected from template file extension
     request.add_header_out("Content-Type", template.content_type());
-    request.add_header_out("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    request.add_header_out(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate, max-age=0",
+    );
     request.add_header_out("Pragma", "no-cache");
 
     // Get pool and raw request pointer

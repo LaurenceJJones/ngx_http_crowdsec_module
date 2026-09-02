@@ -28,48 +28,31 @@ impl SameSite {
 /// # Safety
 /// Requires a valid NGINX request pointer
 pub unsafe fn get_cookie(request: *const ngx_http_request_t, name: &str) -> Option<String> {
-    if request.is_null() {
-        return None;
-    }
-
-    // Access the headers_in structure
-    let headers_in = &(*request).headers_in;
-
-    // Get the cookie header - it's stored as a table entry
-    // The cookies field in headers_in is actually ngx_table_elt_t* (linked list)
-    let cookie_header = headers_in.cookie;
-    if cookie_header.is_null() {
-        return None;
-    }
-
-    // Cookie header might be a linked list if there are multiple Cookie headers
-    let mut current = cookie_header;
-    while !current.is_null() {
-        let header = &*current;
-
-        // Skip if this header is marked as not valid
-        if header.hash == 0 {
-            // Move to next (headers_in.cookie is an array, check next element)
-            // Actually in NGINX, multiple cookies are typically in one header value
-            break;
+    unsafe {
+        if request.is_null() {
+            return None;
         }
 
-        if !header.value.data.is_null() && header.value.len > 0 {
-            let cookie_data =
-                std::slice::from_raw_parts(header.value.data, header.value.len);
+        // Access the headers_in structure
+        let headers_in = &(*request).headers_in;
+
+        // Get the cookie header - it's stored as a table entry
+        // The cookies field in headers_in is actually ngx_table_elt_t* (linked list)
+        let cookie_header = headers_in.cookie;
+        if cookie_header.is_null() {
+            return None;
+        }
+
+        let header = &*cookie_header;
+        if header.hash != 0 && !header.value.data.is_null() && header.value.len > 0 {
+            let cookie_data = std::slice::from_raw_parts(header.value.data, header.value.len);
             if let Ok(cookie_str) = std::str::from_utf8(cookie_data) {
-                // Parse cookie string: "name1=value1; name2=value2"
-                if let Some(value) = parse_cookie_value(cookie_str, name) {
-                    return Some(value);
-                }
+                return parse_cookie_value(cookie_str, name);
             }
         }
 
-        // In NGINX, cookies are typically all in one header value
-        break;
+        None
     }
-
-    None
 }
 
 /// Parse a cookie value from a cookie string
@@ -129,31 +112,33 @@ pub fn build_clear_cookie(name: &str, path: &str) -> String {
 /// # Safety
 /// Requires a valid NGINX request pointer
 pub unsafe fn is_https(request: *const ngx_http_request_t) -> bool {
-    if request.is_null() {
-        return false;
-    }
+    unsafe {
+        if request.is_null() {
+            return false;
+        }
 
-    // First check direct TLS connection
-    let connection = (*request).connection;
-    if !connection.is_null() && !(*connection).ssl.is_null() {
-        return true;
-    }
-
-    // Check X-Forwarded-Proto header (common when behind reverse proxy)
-    if let Some(proto) = get_header(request, "X-Forwarded-Proto") {
-        if proto.eq_ignore_ascii_case("https") {
+        // First check direct TLS connection
+        let connection = (*request).connection;
+        if !connection.is_null() && !(*connection).ssl.is_null() {
             return true;
         }
-    }
 
-    // Check X-Forwarded-Ssl header (alternative)
-    if let Some(ssl) = get_header(request, "X-Forwarded-Ssl") {
-        if ssl.eq_ignore_ascii_case("on") {
-            return true;
+        // Check X-Forwarded-Proto header (common when behind reverse proxy)
+        if let Some(proto) = get_header(request, "X-Forwarded-Proto") {
+            if proto.eq_ignore_ascii_case("https") {
+                return true;
+            }
         }
-    }
 
-    false
+        // Check X-Forwarded-Ssl header (alternative)
+        if let Some(ssl) = get_header(request, "X-Forwarded-Ssl") {
+            if ssl.eq_ignore_ascii_case("on") {
+                return true;
+            }
+        }
+
+        false
+    }
 }
 
 /// Determine if cookie should have Secure flag based on config and request
@@ -164,12 +149,14 @@ pub unsafe fn should_cookie_be_secure(
     request: *const ngx_http_request_t,
     cookie_secure: crate::captcha::config::CookieSecure,
 ) -> bool {
-    use crate::captcha::config::CookieSecure;
+    unsafe {
+        use crate::captcha::config::CookieSecure;
 
-    match cookie_secure {
-        CookieSecure::Auto => is_https(request),
-        CookieSecure::On => true,
-        CookieSecure::Off => false,
+        match cookie_secure {
+            CookieSecure::Auto => is_https(request),
+            CookieSecure::On => true,
+            CookieSecure::Off => false,
+        }
     }
 }
 
@@ -178,45 +165,47 @@ pub unsafe fn should_cookie_be_secure(
 /// # Safety
 /// Requires a valid NGINX request pointer
 unsafe fn get_header(request: *const ngx_http_request_t, name: &str) -> Option<String> {
-    if request.is_null() {
-        return None;
-    }
+    unsafe {
+        if request.is_null() {
+            return None;
+        }
 
-    let headers = &(*request).headers_in.headers;
-    let mut part = &headers.part;
+        let headers = &(*request).headers_in.headers;
+        let mut part = &headers.part;
 
-    loop {
-        let elements = part.elts as *const ngx::ffi::ngx_table_elt_t;
-        let nelts = part.nelts;
+        loop {
+            let elements = part.elts as *const ngx::ffi::ngx_table_elt_t;
+            let nelts = part.nelts;
 
-        for i in 0..nelts {
-            let header = &*elements.add(i);
+            for i in 0..nelts {
+                let header = &*elements.add(i);
 
-            if header.key.len == 0 || header.key.data.is_null() {
-                continue;
-            }
+                if header.key.len == 0 || header.key.data.is_null() {
+                    continue;
+                }
 
-            let key_data = std::slice::from_raw_parts(header.key.data, header.key.len);
-            if let Ok(key_str) = std::str::from_utf8(key_data) {
-                if key_str.eq_ignore_ascii_case(name) {
-                    if header.value.len > 0 && !header.value.data.is_null() {
-                        let value_data =
-                            std::slice::from_raw_parts(header.value.data, header.value.len);
-                        if let Ok(value_str) = std::str::from_utf8(value_data) {
-                            return Some(value_str.to_string());
+                let key_data = std::slice::from_raw_parts(header.key.data, header.key.len);
+                if let Ok(key_str) = std::str::from_utf8(key_data) {
+                    if key_str.eq_ignore_ascii_case(name) {
+                        if header.value.len > 0 && !header.value.data.is_null() {
+                            let value_data =
+                                std::slice::from_raw_parts(header.value.data, header.value.len);
+                            if let Ok(value_str) = std::str::from_utf8(value_data) {
+                                return Some(value_str.to_string());
+                            }
                         }
                     }
                 }
             }
+
+            if part.next.is_null() {
+                break;
+            }
+            part = &*part.next;
         }
 
-        if part.next.is_null() {
-            break;
-        }
-        part = &*part.next;
+        None
     }
-
-    None
 }
 
 #[cfg(test)]

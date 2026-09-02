@@ -6,8 +6,8 @@
 use crate::shm::{self, CidrDecisionInfo, DecisionInfo, DecisionType, Origin};
 use crate::types::StreamResponse;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -64,6 +64,7 @@ impl Default for StreamClientConfig {
 /// Client for polling the CrowdSec LAPI decisions stream
 pub struct StreamClient {
     config: StreamClientConfig,
+    agent: ureq::Agent,
     running: Arc<AtomicBool>,
 }
 
@@ -72,6 +73,7 @@ impl StreamClient {
     pub fn new(config: StreamClientConfig) -> Self {
         Self {
             config,
+            agent: ureq::Agent::new(),
             running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -89,7 +91,9 @@ impl StreamClient {
     pub fn poll(&self, startup: bool) -> Result<(usize, usize), StreamError> {
         let url = self.build_url(startup);
 
-        let response = ureq::get(&url)
+        let response = self
+            .agent
+            .get(&url)
             .set("X-Api-Key", &self.config.api_key)
             .timeout(Duration::from_secs(self.config.timeout_secs))
             .call()
@@ -99,8 +103,8 @@ impl StreamClient {
             .into_json()
             .map_err(|e| StreamError::Json(e.to_string()))?;
 
-        let new_decisions = stream_response.new_decisions();
-        let deleted_decisions = stream_response.deleted_decisions();
+        let new_decisions = stream_response.new.unwrap_or_default();
+        let deleted_decisions = stream_response.deleted.unwrap_or_default();
 
         let new_count = new_decisions.len();
         let deleted_count = deleted_decisions.len();
@@ -138,8 +142,7 @@ impl StreamClient {
                 else {
                     eprintln!(
                         "crowdsec: cannot parse decision value '{}' (scope: {:?})",
-                        value,
-                        decision.scope
+                        value, decision.scope
                     );
                 }
             }
@@ -183,9 +186,7 @@ impl StreamClient {
                 else {
                     eprintln!(
                         "crowdsec: cannot parse decision value '{}' (scope: {:?}, type: {})",
-                        value,
-                        decision.scope,
-                        decision.decision_type
+                        value, decision.scope, decision.decision_type
                     );
                 }
             }
@@ -315,28 +316,33 @@ fn parse_duration(s: &str) -> Option<i64> {
 
     // Handle Go-style durations like "1h30m" or simple ones like "3600s"
     let mut total_secs: i64 = 0;
-    let mut num_str = String::new();
+    let mut number = 0i64;
+    let mut has_number = false;
 
-    for c in s.chars() {
-        if c.is_ascii_digit() {
-            num_str.push(c);
+    for byte in s.bytes() {
+        if byte.is_ascii_digit() {
+            number = number.checked_mul(10)?.checked_add((byte - b'0') as i64)?;
+            has_number = true;
         } else {
-            let num: i64 = num_str.parse().ok()?;
-            num_str.clear();
-
-            match c {
-                'h' => total_secs += num * 3600,
-                'm' => total_secs += num * 60,
-                's' => total_secs += num,
-                _ => return None,
+            if !has_number {
+                return None;
             }
+
+            let multiplier = match byte {
+                b'h' => 3600,
+                b'm' => 60,
+                b's' => 1,
+                _ => return None,
+            };
+            total_secs = total_secs.checked_add(number.checked_mul(multiplier)?)?;
+            number = 0;
+            has_number = false;
         }
     }
 
     // Handle case where duration is just a number (assume seconds)
-    if !num_str.is_empty() {
-        let num: i64 = num_str.parse().ok()?;
-        total_secs += num;
+    if has_number {
+        total_secs = total_secs.checked_add(number)?;
     }
 
     if total_secs > 0 {

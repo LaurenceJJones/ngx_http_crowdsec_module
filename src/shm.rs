@@ -8,8 +8,8 @@
 //! - Dynamic capacity based on configured SHM size
 
 use ngx::ffi::{
-    ngx_atomic_t, ngx_int_t, ngx_rwlock_rlock, ngx_rwlock_unlock, ngx_rwlock_wlock,
-    ngx_shm_zone_t, ngx_slab_alloc_locked, ngx_slab_pool_t, ngx_str_t, NGX_OK,
+    NGX_OK, ngx_atomic_t, ngx_int_t, ngx_rwlock_rlock, ngx_rwlock_unlock, ngx_rwlock_wlock,
+    ngx_shm_zone_t, ngx_slab_alloc_locked, ngx_slab_pool_t, ngx_str_t,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
@@ -21,9 +21,6 @@ const MAX_SCENARIOS: usize = 256;
 
 /// Maximum length of a scenario string
 const MAX_SCENARIO_LEN: usize = 127;
-
-/// Hash table load factor (60% = good balance of speed and space)
-const LOAD_FACTOR_PERCENT: usize = 60;
 
 /// Percentage of SHM to use for entries (rest is overhead)
 const USABLE_MEMORY_PERCENT: usize = 70;
@@ -39,7 +36,6 @@ const HASH_TOMBSTONE: u32 = 1;
 
 /// Flag bits in the flags field
 const FLAG_TOMBSTONE: u8 = 0b0000_0001;
-const FLAG_ACCESSED: u8 = 0b0000_0010;
 const FLAG_IS_CIDR: u8 = 0b0000_0100;
 
 /// Decision types from CrowdSec
@@ -204,7 +200,7 @@ pub struct ShmHashEntry {
     pub decision_types: u8,
     /// Origin of the decision (most recent)
     pub origin: u8,
-    /// Flags: bit 0 = tombstone, bit 1 = accessed (LRU), bit 2 = is_cidr
+    /// Flags: bit 0 = tombstone, bit 2 = is_cidr
     pub flags: u8,
     /// CIDR prefix length (32 for IPv4 single IP, 128 for IPv6 single IP)
     pub prefix_len: u8,
@@ -259,20 +255,6 @@ impl ShmHashEntry {
     }
 
     #[inline]
-    pub fn is_accessed(&self) -> bool {
-        (self.flags & FLAG_ACCESSED) != 0
-    }
-
-    #[inline]
-    pub fn set_accessed(&mut self, accessed: bool) {
-        if accessed {
-            self.flags |= FLAG_ACCESSED;
-        } else {
-            self.flags &= !FLAG_ACCESSED;
-        }
-    }
-
-    #[inline]
     pub fn mark_tombstone(&mut self) {
         self.hash = HASH_TOMBSTONE;
         self.flags |= FLAG_TOMBSTONE;
@@ -309,12 +291,8 @@ impl ShmHashEntry {
             return false;
         }
         match ip {
-            IpAddr::V4(v4) => {
-                self.family == 4 && !self.is_cidr() && self.addr[..4] == v4.octets()
-            }
-            IpAddr::V6(v6) => {
-                self.family == 6 && !self.is_cidr() && self.addr == v6.octets()
-            }
+            IpAddr::V4(v4) => self.family == 4 && !self.is_cidr() && self.addr[..4] == v4.octets(),
+            IpAddr::V6(v6) => self.family == 6 && !self.is_cidr() && self.addr == v6.octets(),
         }
     }
 
@@ -344,14 +322,10 @@ impl ShmHashEntry {
         Origin::from_u8(self.origin)
     }
 
-    pub fn is_expired(&self) -> bool {
+    pub fn is_expired_at(&self, now: i64) -> bool {
         if self.expires == 0 {
             return false; // No expiry
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
         now > self.expires
     }
 }
@@ -397,10 +371,13 @@ pub struct ShmData {
     pub clock_hand: u32,
     /// Number of evictions performed (for monitoring)
     pub eviction_count: u32,
-    /// Pointer to hash table entries
-    entries_ptr: *mut ShmHashEntry,
-    /// Pointer to scenario table
-    scenarios_ptr: *mut ShmScenario,
+    /// Byte offset from this header to the hash table entries.
+    entries_offset: usize,
+    /// Byte offset from this header to the scenario table.
+    scenarios_offset: usize,
+    /// Prefix lengths that have been seen. Stale bits are harmless and avoid
+    /// maintaining counters on the update path.
+    cidr_prefixes: [u64; 3],
 }
 
 /// Global pointer to the shared memory zone
@@ -436,11 +413,7 @@ fn hash_ip(ip: &IpAddr) -> u32 {
     }
 
     // Ensure hash is >= 2 (0 = empty, 1 = tombstone)
-    if hash < 2 {
-        hash + 2
-    } else {
-        hash
-    }
+    if hash < 2 { hash + 2 } else { hash }
 }
 
 /// Hash function for CIDR entries (network address + prefix length)
@@ -464,11 +437,7 @@ fn hash_cidr(family: u8, prefix_len: u8, network: &[u8]) -> u32 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
 
-    if hash < 2 {
-        hash + 2
-    } else {
-        hash
-    }
+    if hash < 2 { hash + 2 } else { hash }
 }
 
 /// Apply netmask to IPv4 address, returning network address
@@ -523,25 +492,27 @@ pub unsafe fn init_shm_zone(
     name: &ngx_str_t,
     size: usize,
 ) -> Result<*mut ngx_shm_zone_t, ()> {
-    let shm_zone = ngx::ffi::ngx_shared_memory_add(
-        cf,
-        name as *const _ as *mut _,
-        size,
-        &raw const crate::ngx_http_crowdsec_module as *mut _,
-    );
+    unsafe {
+        let shm_zone = ngx::ffi::ngx_shared_memory_add(
+            cf,
+            name as *const _ as *mut _,
+            size,
+            &raw const crate::ngx_http_crowdsec_module as *mut _,
+        );
 
-    if shm_zone.is_null() {
-        return Err(());
+        if shm_zone.is_null() {
+            return Err(());
+        }
+
+        // Set the init callback
+        (*shm_zone).init = Some(shm_zone_init);
+        (*shm_zone).data = ptr::null_mut();
+
+        // Store globally for access from handlers
+        SHM_ZONE.store(shm_zone, Ordering::SeqCst);
+
+        Ok(shm_zone)
     }
-
-    // Set the init callback
-    (*shm_zone).init = Some(shm_zone_init);
-    (*shm_zone).data = ptr::null_mut();
-
-    // Store globally for access from handlers
-    SHM_ZONE.store(shm_zone, Ordering::SeqCst);
-
-    Ok(shm_zone)
 }
 
 /// Shared memory zone initialization callback
@@ -550,89 +521,96 @@ unsafe extern "C" fn shm_zone_init(
     shm_zone: *mut ngx_shm_zone_t,
     data: *mut std::ffi::c_void,
 ) -> ngx_int_t {
-    if !data.is_null() {
-        // Zone already exists (reload), reuse the data
-        (*shm_zone).data = data;
-        // The previous generation's poller exits after new workers start. Reset
-        // its claim now so one of the new workers can take over immediately.
-        let shm_data = data as *mut ShmData;
-        let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
-            as *const std::sync::atomic::AtomicIsize);
-        poller_atomic.store(0, Ordering::SeqCst);
-        return NGX_OK as ngx_int_t;
+    unsafe {
+        if !data.is_null() {
+            // Zone already exists (reload), reuse the data
+            (*shm_zone).data = data;
+            // The previous generation's poller exits after new workers start. Reset
+            // its claim now so one of the new workers can take over immediately.
+            let shm_data = data as *mut ShmData;
+            let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
+                as *const std::sync::atomic::AtomicIsize);
+            poller_atomic.store(0, Ordering::SeqCst);
+            return NGX_OK as ngx_int_t;
+        }
+
+        let shpool = (*shm_zone).shm.addr as *mut ngx_slab_pool_t;
+        if shpool.is_null() {
+            return ngx::ffi::NGX_ERROR as ngx_int_t;
+        }
+
+        // Calculate capacity based on zone size
+        let entry_size = std::mem::size_of::<ShmHashEntry>();
+        let scenario_size = std::mem::size_of::<ShmScenario>();
+        let header_size = std::mem::size_of::<ShmData>();
+
+        // Reserve memory for header and scenarios first
+        let scenario_memory = scenario_size * MAX_SCENARIOS;
+        let fixed_overhead = header_size + scenario_memory;
+
+        // Use remaining memory for hash table (with safety margin for slab allocator overhead)
+        let available_for_entries =
+            (*shm_zone).shm.size.saturating_sub(fixed_overhead) * USABLE_MEMORY_PERCENT / 100;
+
+        // Capacity is simply how many entries fit in available memory
+        // The load factor (60%) means we'll only store ~60% of capacity before evicting
+        let capacity = (available_for_entries / entry_size).max(MIN_CAPACITY as usize) as u32;
+
+        eprintln!(
+            "crowdsec: initializing shared memory - zone size: {} bytes, hash capacity: {} entries",
+            (*shm_zone).shm.size,
+            capacity
+        );
+
+        // Allocate header
+        let header_ptr = ngx_slab_alloc_locked(shpool, header_size);
+        if header_ptr.is_null() {
+            eprintln!("crowdsec: failed to allocate SHM header");
+            return ngx::ffi::NGX_ERROR as ngx_int_t;
+        }
+
+        // Allocate hash table
+        let entries_size = entry_size * capacity as usize;
+        let entries_ptr = ngx_slab_alloc_locked(shpool, entries_size);
+        if entries_ptr.is_null() {
+            eprintln!(
+                "crowdsec: failed to allocate SHM hash table ({} bytes)",
+                entries_size
+            );
+            return ngx::ffi::NGX_ERROR as ngx_int_t;
+        }
+
+        // Allocate scenario table
+        let scenarios_size = scenario_size * MAX_SCENARIOS;
+        let scenarios_ptr = ngx_slab_alloc_locked(shpool, scenarios_size);
+        if scenarios_ptr.is_null() {
+            eprintln!("crowdsec: failed to allocate SHM scenario table");
+            return ngx::ffi::NGX_ERROR as ngx_int_t;
+        }
+
+        // Initialize the data structure
+        let shm_data = header_ptr as *mut ShmData;
+        (*shm_data).lock = 0;
+        (*shm_data).poller_pid = 0;
+        (*shm_data).count = 0;
+        (*shm_data).capacity = capacity;
+        (*shm_data).scenario_count = 0;
+        (*shm_data)._reserved = 0;
+        (*shm_data).version = 0;
+        (*shm_data).clock_hand = 0;
+        (*shm_data).eviction_count = 0;
+        (*shm_data).entries_offset = (entries_ptr as usize).wrapping_sub(header_ptr as usize);
+        (*shm_data).scenarios_offset = (scenarios_ptr as usize).wrapping_sub(header_ptr as usize);
+        (*shm_data).cidr_prefixes = [0; 3];
+
+        // Zero out entries and scenarios
+        ptr::write_bytes(entries_ptr as *mut ShmHashEntry, 0, capacity as usize);
+        ptr::write_bytes(scenarios_ptr as *mut ShmScenario, 0, MAX_SCENARIOS);
+
+        (*shm_zone).data = header_ptr;
+
+        NGX_OK as ngx_int_t
     }
-
-    let shpool = (*shm_zone).shm.addr as *mut ngx_slab_pool_t;
-    if shpool.is_null() {
-        return ngx::ffi::NGX_ERROR as ngx_int_t;
-    }
-
-    // Calculate capacity based on zone size
-    let entry_size = std::mem::size_of::<ShmHashEntry>();
-    let scenario_size = std::mem::size_of::<ShmScenario>();
-    let header_size = std::mem::size_of::<ShmData>();
-
-    // Reserve memory for header and scenarios first
-    let scenario_memory = scenario_size * MAX_SCENARIOS;
-    let fixed_overhead = header_size + scenario_memory;
-
-    // Use remaining memory for hash table (with safety margin for slab allocator overhead)
-    let available_for_entries = (*shm_zone).shm.size.saturating_sub(fixed_overhead) * USABLE_MEMORY_PERCENT / 100;
-
-    // Capacity is simply how many entries fit in available memory
-    // The load factor (60%) means we'll only store ~60% of capacity before evicting
-    let capacity = (available_for_entries / entry_size).max(MIN_CAPACITY as usize) as u32;
-
-    eprintln!(
-        "crowdsec: initializing shared memory - zone size: {} bytes, hash capacity: {} entries",
-        (*shm_zone).shm.size,
-        capacity
-    );
-
-    // Allocate header
-    let header_ptr = ngx_slab_alloc_locked(shpool, header_size);
-    if header_ptr.is_null() {
-        eprintln!("crowdsec: failed to allocate SHM header");
-        return ngx::ffi::NGX_ERROR as ngx_int_t;
-    }
-
-    // Allocate hash table
-    let entries_size = entry_size * capacity as usize;
-    let entries_ptr = ngx_slab_alloc_locked(shpool, entries_size);
-    if entries_ptr.is_null() {
-        eprintln!("crowdsec: failed to allocate SHM hash table ({} bytes)", entries_size);
-        return ngx::ffi::NGX_ERROR as ngx_int_t;
-    }
-
-    // Allocate scenario table
-    let scenarios_size = scenario_size * MAX_SCENARIOS;
-    let scenarios_ptr = ngx_slab_alloc_locked(shpool, scenarios_size);
-    if scenarios_ptr.is_null() {
-        eprintln!("crowdsec: failed to allocate SHM scenario table");
-        return ngx::ffi::NGX_ERROR as ngx_int_t;
-    }
-
-    // Initialize the data structure
-    let shm_data = header_ptr as *mut ShmData;
-    (*shm_data).lock = 0;
-    (*shm_data).poller_pid = 0;
-    (*shm_data).count = 0;
-    (*shm_data).capacity = capacity;
-    (*shm_data).scenario_count = 0;
-    (*shm_data)._reserved = 0;
-    (*shm_data).version = 0;
-    (*shm_data).clock_hand = 0;
-    (*shm_data).eviction_count = 0;
-    (*shm_data).entries_ptr = entries_ptr as *mut ShmHashEntry;
-    (*shm_data).scenarios_ptr = scenarios_ptr as *mut ShmScenario;
-
-    // Zero out entries and scenarios
-    ptr::write_bytes(entries_ptr as *mut ShmHashEntry, 0, capacity as usize);
-    ptr::write_bytes(scenarios_ptr as *mut ShmScenario, 0, MAX_SCENARIOS);
-
-    (*shm_zone).data = header_ptr;
-
-    NGX_OK as ngx_int_t
 }
 
 /// Get the shared memory data pointer
@@ -643,51 +621,65 @@ fn get_shm_data() -> Option<*mut ShmData> {
     }
     unsafe {
         let data = (*zone).data as *mut ShmData;
-        if data.is_null() {
-            None
-        } else {
-            Some(data)
-        }
+        if data.is_null() { None } else { Some(data) }
     }
 }
 
 /// Get entries array from shared memory data
 #[inline]
 unsafe fn get_entries(shm_data: *mut ShmData) -> *mut ShmHashEntry {
-    (*shm_data).entries_ptr
+    unsafe { (shm_data as usize).wrapping_add((*shm_data).entries_offset) as *mut ShmHashEntry }
 }
 
 /// Get scenarios array from shared memory data
 #[inline]
 unsafe fn get_scenarios(shm_data: *mut ShmData) -> *mut ShmScenario {
-    (*shm_data).scenarios_ptr
+    unsafe { (shm_data as usize).wrapping_add((*shm_data).scenarios_offset) as *mut ShmScenario }
+}
+
+#[inline]
+unsafe fn prefix_is_present(shm_data: *mut ShmData, prefix: u8) -> bool {
+    unsafe {
+        let prefix = prefix as usize;
+        ((*shm_data).cidr_prefixes[prefix / 64] & (1u64 << (prefix % 64))) != 0
+    }
+}
+
+#[inline]
+unsafe fn mark_prefix_present(shm_data: *mut ShmData, prefix: u8) {
+    unsafe {
+        let prefix = prefix as usize;
+        (*shm_data).cidr_prefixes[prefix / 64] |= 1u64 << (prefix % 64);
+    }
 }
 
 /// Find or create a scenario ID for the given scenario string
 /// Must be called with write lock held
 /// Returns scenario_id (1-based), or 0 if table is full
 unsafe fn get_or_create_scenario_id(shm_data: *mut ShmData, scenario: &str) -> u16 {
-    let scenarios = get_scenarios(shm_data);
-    let count = (*shm_data).scenario_count as usize;
+    unsafe {
+        let scenarios = get_scenarios(shm_data);
+        let count = (*shm_data).scenario_count as usize;
 
-    // Search existing scenarios
-    for i in 0..count {
-        let entry = &*scenarios.add(i);
-        if entry.matches(scenario) {
-            return (i + 1) as u16; // 1-based ID
+        // Search existing scenarios
+        for i in 0..count {
+            let entry = &*scenarios.add(i);
+            if entry.matches(scenario) {
+                return (i + 1) as u16; // 1-based ID
+            }
         }
-    }
 
-    // Not found, add new if space available
-    if count < MAX_SCENARIOS {
-        let entry = &mut *scenarios.add(count);
-        *entry = ShmScenario::from_str(scenario);
-        (*shm_data).scenario_count += 1;
-        return (count + 1) as u16; // 1-based ID
-    }
+        // Not found, add new if space available
+        if count < MAX_SCENARIOS {
+            let entry = &mut *scenarios.add(count);
+            *entry = ShmScenario::from_str(scenario);
+            (*shm_data).scenario_count += 1;
+            return (count + 1) as u16; // 1-based ID
+        }
 
-    // Table full
-    0
+        // Table full
+        0
+    }
 }
 
 /// Get scenario string by ID
@@ -732,27 +724,29 @@ unsafe fn find_slot_ip(
     hash: u32,
     ip: &IpAddr,
 ) -> (u32, bool) {
-    let mut idx = hash % capacity;
-    let start_idx = idx;
+    unsafe {
+        let mut idx = hash % capacity;
+        let start_idx = idx;
 
-    loop {
-        let entry = &*entries.add(idx as usize);
+        loop {
+            let entry = &*entries.add(idx as usize);
 
-        if entry.is_empty() {
-            // Empty slot - entry not found
-            return (idx, false);
-        }
+            if entry.is_empty() {
+                // Empty slot - entry not found
+                return (idx, false);
+            }
 
-        if !entry.is_tombstone() && entry.hash == hash && entry.matches_ip(ip) {
-            // Found matching entry
-            return (idx, true);
-        }
+            if !entry.is_tombstone() && entry.hash == hash && entry.matches_ip(ip) {
+                // Found matching entry
+                return (idx, true);
+            }
 
-        // Linear probe to next slot
-        idx = (idx + 1) % capacity;
-        if idx == start_idx {
-            // Wrapped around - table is full
-            return (idx, false);
+            // Linear probe to next slot
+            idx = (idx + 1) % capacity;
+            if idx == start_idx {
+                // Wrapped around - table is full
+                return (idx, false);
+            }
         }
     }
 }
@@ -767,86 +761,68 @@ unsafe fn find_slot_cidr(
     prefix_len: u8,
     network: &[u8],
 ) -> (u32, bool) {
-    let mut idx = hash % capacity;
-    let start_idx = idx;
+    unsafe {
+        let mut idx = hash % capacity;
+        let start_idx = idx;
 
-    loop {
-        let entry = &*entries.add(idx as usize);
+        loop {
+            let entry = &*entries.add(idx as usize);
 
-        if entry.is_empty() {
-            return (idx, false);
-        }
+            if entry.is_empty() {
+                return (idx, false);
+            }
 
-        if !entry.is_tombstone()
-            && entry.hash == hash
-            && entry.matches_cidr(family, prefix_len, network)
-        {
-            return (idx, true);
-        }
+            if !entry.is_tombstone()
+                && entry.hash == hash
+                && entry.matches_cidr(family, prefix_len, network)
+            {
+                return (idx, true);
+            }
 
-        idx = (idx + 1) % capacity;
-        if idx == start_idx {
-            return (idx, false);
+            idx = (idx + 1) % capacity;
+            if idx == start_idx {
+                return (idx, false);
+            }
         }
     }
 }
 
 /// Find first vacant slot (empty or tombstone) for insertion
 #[inline]
-unsafe fn find_vacant_slot(
-    entries: *mut ShmHashEntry,
-    capacity: u32,
-    hash: u32,
-) -> Option<u32> {
-    let mut idx = hash % capacity;
-    let start_idx = idx;
+unsafe fn find_vacant_slot(entries: *mut ShmHashEntry, capacity: u32, hash: u32) -> Option<u32> {
+    unsafe {
+        let mut idx = hash % capacity;
+        let start_idx = idx;
 
-    loop {
-        let entry = &*entries.add(idx as usize);
+        loop {
+            let entry = &*entries.add(idx as usize);
 
-        if entry.is_vacant() {
-            return Some(idx);
-        }
+            if entry.is_vacant() {
+                return Some(idx);
+            }
 
-        idx = (idx + 1) % capacity;
-        if idx == start_idx {
-            return None; // Table is full
+            idx = (idx + 1) % capacity;
+            if idx == start_idx {
+                return None; // Table is full
+            }
         }
     }
 }
 
-/// Evict an entry using clock algorithm
+/// Evict an entry in round-robin order.
+/// ponytail: upgrade to sampled eviction only if full-zone churn is measured.
 /// Must be called with write lock held
 /// Returns the index of the evicted slot
 unsafe fn evict_clock(shm_data: *mut ShmData) -> Option<u32> {
-    let entries = get_entries(shm_data);
-    let capacity = (*shm_data).capacity;
-    let mut hand = (*shm_data).clock_hand;
-    let start_hand = hand;
+    unsafe {
+        let entries = get_entries(shm_data);
+        let capacity = (*shm_data).capacity;
+        let mut hand = (*shm_data).clock_hand;
+        let start = hand;
 
-    // First pass: try to find an entry with accessed=0
-    loop {
-        let entry = &mut *entries.add(hand as usize);
-
-        if !entry.is_vacant() {
-            if entry.is_accessed() {
-                // Clear accessed bit, give second chance
-                entry.set_accessed(false);
-            } else {
-                // Found victim - evict it
-                let evicted_idx = hand;
-                entry.mark_tombstone();
-                (*shm_data).count = (*shm_data).count.saturating_sub(1);
-                (*shm_data).eviction_count += 1;
-                (*shm_data).clock_hand = (hand + 1) % capacity;
-                return Some(evicted_idx);
-            }
-        }
-
-        hand = (hand + 1) % capacity;
-        if hand == start_hand {
-            // Wrapped around twice - just evict current position
+        loop {
             let entry = &mut *entries.add(hand as usize);
+
             if !entry.is_vacant() {
                 entry.mark_tombstone();
                 (*shm_data).count = (*shm_data).count.saturating_sub(1);
@@ -854,11 +830,15 @@ unsafe fn evict_clock(shm_data: *mut ShmData) -> Option<u32> {
                 (*shm_data).clock_hand = (hand + 1) % capacity;
                 return Some(hand);
             }
-            break;
-        }
-    }
 
-    None
+            hand = (hand + 1) % capacity;
+            if hand == start {
+                break;
+            }
+        }
+
+        None
+    }
 }
 
 /// Check if an IP has a decision and return details
@@ -874,7 +854,7 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
                 decision_type: DecisionType::Unknown,
                 origin: Origin::Unknown,
                 scenario_id: 0,
-            }
+            };
         }
     };
 
@@ -883,15 +863,18 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
 
         let entries = get_entries(shm_data);
         let capacity = (*shm_data).capacity;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         // 1. Check exact IP match first
         let hash = hash_ip(ip);
         let (idx, found) = find_slot_ip(entries, capacity, hash, ip);
 
         if found {
-            let entry = &mut *entries.add(idx as usize);
-            if !entry.is_expired() {
-                entry.set_accessed(true);
+            let entry = &*entries.add(idx as usize);
+            if !entry.is_expired_at(now) {
                 let result = LookupResult {
                     found: true,
                     decision_type: entry.decision_type(),
@@ -905,8 +888,8 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
 
         // 2. Check CIDR ranges from most specific to least specific
         let result = match ip {
-            IpAddr::V4(v4) => lookup_cidr_v4(entries, capacity, &v4.octets()),
-            IpAddr::V6(v6) => lookup_cidr_v6(entries, capacity, &v6.octets()),
+            IpAddr::V4(v4) => lookup_cidr_v4(shm_data, entries, capacity, &v4.octets(), now),
+            IpAddr::V6(v6) => lookup_cidr_v6(shm_data, entries, capacity, &v6.octets(), now),
         };
 
         ngx_rwlock_unlock(&mut (*shm_data).lock);
@@ -917,70 +900,80 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
 /// Lookup IPv4 address in CIDR entries (most specific to least specific)
 /// Must be called with read lock held
 unsafe fn lookup_cidr_v4(
+    shm_data: *mut ShmData,
     entries: *mut ShmHashEntry,
     capacity: u32,
     addr: &[u8; 4],
+    now: i64,
 ) -> LookupResult {
-    // Check from /31 down to /1 (skip /32 as that's an exact IP)
-    for prefix_len in (1..32).rev() {
-        let network = apply_ipv4_mask(addr, prefix_len);
-        let hash = hash_cidr(4, prefix_len, &network);
-        let (idx, found) = find_slot_cidr(entries, capacity, hash, 4, prefix_len, &network);
+    unsafe {
+        for prefix_len in (0..=32).rev() {
+            if !prefix_is_present(shm_data, prefix_len) {
+                continue;
+            }
+            let network = apply_ipv4_mask(addr, prefix_len);
+            let hash = hash_cidr(4, prefix_len, &network);
+            let (idx, found) = find_slot_cidr(entries, capacity, hash, 4, prefix_len, &network);
 
-        if found {
-            let entry = &mut *entries.add(idx as usize);
-            if !entry.is_expired() {
-                entry.set_accessed(true);
-                return LookupResult {
-                    found: true,
-                    decision_type: entry.decision_type(),
-                    origin: entry.origin(),
-                    scenario_id: entry.scenario_id,
-                };
+            if found {
+                let entry = &*entries.add(idx as usize);
+                if !entry.is_expired_at(now) {
+                    return LookupResult {
+                        found: true,
+                        decision_type: entry.decision_type(),
+                        origin: entry.origin(),
+                        scenario_id: entry.scenario_id,
+                    };
+                }
             }
         }
-    }
 
-    LookupResult {
-        found: false,
-        decision_type: DecisionType::Unknown,
-        origin: Origin::Unknown,
-        scenario_id: 0,
+        LookupResult {
+            found: false,
+            decision_type: DecisionType::Unknown,
+            origin: Origin::Unknown,
+            scenario_id: 0,
+        }
     }
 }
 
 /// Lookup IPv6 address in CIDR entries (most specific to least specific)
 /// Must be called with read lock held
 unsafe fn lookup_cidr_v6(
+    shm_data: *mut ShmData,
     entries: *mut ShmHashEntry,
     capacity: u32,
     addr: &[u8; 16],
+    now: i64,
 ) -> LookupResult {
-    // Check from /127 down to /1 (skip /128 as that's an exact IP)
-    for prefix_len in (1..128).rev() {
-        let network = apply_ipv6_mask(addr, prefix_len);
-        let hash = hash_cidr(6, prefix_len, &network);
-        let (idx, found) = find_slot_cidr(entries, capacity, hash, 6, prefix_len, &network);
+    unsafe {
+        for prefix_len in (0..=128).rev() {
+            if !prefix_is_present(shm_data, prefix_len) {
+                continue;
+            }
+            let network = apply_ipv6_mask(addr, prefix_len);
+            let hash = hash_cidr(6, prefix_len, &network);
+            let (idx, found) = find_slot_cidr(entries, capacity, hash, 6, prefix_len, &network);
 
-        if found {
-            let entry = &mut *entries.add(idx as usize);
-            if !entry.is_expired() {
-                entry.set_accessed(true);
-                return LookupResult {
-                    found: true,
-                    decision_type: entry.decision_type(),
-                    origin: entry.origin(),
-                    scenario_id: entry.scenario_id,
-                };
+            if found {
+                let entry = &*entries.add(idx as usize);
+                if !entry.is_expired_at(now) {
+                    return LookupResult {
+                        found: true,
+                        decision_type: entry.decision_type(),
+                        origin: entry.origin(),
+                        scenario_id: entry.scenario_id,
+                    };
+                }
             }
         }
-    }
 
-    LookupResult {
-        found: false,
-        decision_type: DecisionType::Unknown,
-        origin: Origin::Unknown,
-        scenario_id: 0,
+        LookupResult {
+            found: false,
+            decision_type: DecisionType::Unknown,
+            origin: Origin::Unknown,
+            scenario_id: 0,
+        }
     }
 }
 
@@ -1010,7 +1003,6 @@ pub fn add_decision(info: &DecisionInfo) {
 
     unsafe {
         ngx_rwlock_wlock(&mut (*shm_data).lock);
-
         // Get or create scenario ID
         let scenario_id = info
             .scenario
@@ -1031,7 +1023,6 @@ pub fn add_decision(info: &DecisionInfo) {
             let entry = &mut *entries.add(idx as usize);
             entry.decision_types |= decision_bit;
             entry.origin = info.origin as u8;
-            entry.flags |= FLAG_ACCESSED;
             // Keep the longer expiry
             if expires > entry.expires {
                 entry.expires = expires;
@@ -1052,7 +1043,7 @@ pub fn add_decision(info: &DecisionInfo) {
         new_entry.origin = info.origin as u8;
         new_entry.expires = expires;
         new_entry.scenario_id = scenario_id;
-        new_entry.flags = FLAG_ACCESSED;
+        new_entry.flags = 0;
 
         match info.ip {
             IpAddr::V4(v4) => {
@@ -1113,6 +1104,7 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
 
     unsafe {
         ngx_rwlock_wlock(&mut (*shm_data).lock);
+        mark_prefix_present(shm_data, info.prefix_len);
 
         // Get or create scenario ID
         let scenario_id = info
@@ -1127,15 +1119,20 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         let capacity = (*shm_data).capacity;
 
         // Check if already exists
-        let (idx, found) =
-            find_slot_cidr(entries, capacity, hash, info.family, info.prefix_len, info.network);
+        let (idx, found) = find_slot_cidr(
+            entries,
+            capacity,
+            hash,
+            info.family,
+            info.prefix_len,
+            info.network,
+        );
 
         if found {
             // Merge with existing entry - add decision type to bitmask
             let entry = &mut *entries.add(idx as usize);
             entry.decision_types |= decision_bit;
             entry.origin = info.origin as u8;
-            entry.flags |= FLAG_ACCESSED;
             if expires > entry.expires {
                 entry.expires = expires;
             }
@@ -1156,7 +1153,7 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         new_entry.origin = info.origin as u8;
         new_entry.expires = expires;
         new_entry.scenario_id = scenario_id;
-        new_entry.flags = FLAG_ACCESSED | FLAG_IS_CIDR;
+        new_entry.flags = FLAG_IS_CIDR;
 
         let len = if info.family == 4 { 4 } else { 16 };
         new_entry.addr[..len].copy_from_slice(&info.network[..len]);
@@ -1164,16 +1161,14 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         // Find vacant slot
         let slot = match find_vacant_slot(entries, capacity, hash) {
             Some(s) => s,
-            None => {
-                match evict_clock(shm_data) {
-                    Some(evicted) => evicted,
-                    None => {
-                        eprintln!("crowdsec: hash table full, cannot add CIDR entry");
-                        ngx_rwlock_unlock(&mut (*shm_data).lock);
-                        return;
-                    }
+            None => match evict_clock(shm_data) {
+                Some(evicted) => evicted,
+                None => {
+                    eprintln!("crowdsec: hash table full, cannot add CIDR entry");
+                    ngx_rwlock_unlock(&mut (*shm_data).lock);
+                    return;
                 }
-            }
+            },
         };
 
         let entry = &mut *entries.add(slot as usize);
@@ -1257,7 +1252,12 @@ pub fn remove_decision(ip: &IpAddr) {
 }
 
 /// Remove a specific decision type for a CIDR range from shared memory
-pub fn remove_cidr_decision_type(family: u8, prefix_len: u8, network: &[u8], decision_type: DecisionType) {
+pub fn remove_cidr_decision_type(
+    family: u8,
+    prefix_len: u8,
+    network: &[u8],
+    decision_type: DecisionType,
+) {
     let shm_data = match get_shm_data() {
         Some(data) => data,
         None => return,
@@ -1430,12 +1430,7 @@ pub fn release_poller() {
     unsafe {
         let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
             as *const std::sync::atomic::AtomicIsize);
-        let _ = poller_atomic.compare_exchange(
-            my_pid,
-            0,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        let _ = poller_atomic.compare_exchange(my_pid, 0, Ordering::SeqCst, Ordering::SeqCst);
     }
     IS_POLLER.store(false, Ordering::SeqCst);
 }
@@ -1522,6 +1517,23 @@ mod tests {
         let (_, family, prefix) = result.unwrap();
         assert_eq!(family, 6);
         assert_eq!(prefix, 32);
+
+        let (network, family, prefix) = parse_cidr("0.0.0.0/0").unwrap();
+        assert_eq!((family, prefix), (4, 0));
+        assert_eq!(&network[..4], &[0, 0, 0, 0]);
+
+        let (_, family, prefix) = parse_cidr("2001:db8::1/128").unwrap();
+        assert_eq!((family, prefix), (6, 128));
+    }
+
+    #[test]
+    fn test_expiration_uses_supplied_time() {
+        let mut entry = ShmHashEntry::empty();
+        entry.expires = 100;
+        assert!(!entry.is_expired_at(100));
+        assert!(entry.is_expired_at(101));
+        entry.expires = 0;
+        assert!(!entry.is_expired_at(i64::MAX));
     }
 
     #[test]
@@ -1538,8 +1550,14 @@ mod tests {
         assert_eq!(DecisionType::Unknown.to_bit(), 0);
 
         // Test priority: Ban > Captcha
-        assert_eq!(DecisionType::from_bitmask(DECISION_BIT_BAN), DecisionType::Ban);
-        assert_eq!(DecisionType::from_bitmask(DECISION_BIT_CAPTCHA), DecisionType::Captcha);
+        assert_eq!(
+            DecisionType::from_bitmask(DECISION_BIT_BAN),
+            DecisionType::Ban
+        );
+        assert_eq!(
+            DecisionType::from_bitmask(DECISION_BIT_CAPTCHA),
+            DecisionType::Captcha
+        );
 
         // Combined: Ban takes priority
         let combined = DECISION_BIT_BAN | DECISION_BIT_CAPTCHA;

@@ -50,18 +50,6 @@ pub struct StreamResponse {
     pub deleted: Option<Vec<Decision>>,
 }
 
-impl StreamResponse {
-    /// Get new decisions, returning empty vec if None
-    pub fn new_decisions(&self) -> Vec<Decision> {
-        self.new.clone().unwrap_or_default()
-    }
-
-    /// Get deleted decisions, returning empty vec if None
-    pub fn deleted_decisions(&self) -> Vec<Decision> {
-        self.deleted.clone().unwrap_or_default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,10 +91,7 @@ mod tests {
             simulated: None,
             uuid: None,
         };
-        assert_eq!(
-            decision.get_ip(),
-            Some("192.168.1.100".parse().unwrap())
-        );
+        assert_eq!(decision.get_ip(), Some("192.168.1.100".parse().unwrap()));
     }
 
     #[test]
@@ -116,15 +101,15 @@ mod tests {
             "deleted": [{"id": 2, "type": "ban", "scope": "ip", "value": "5.6.7.8"}]
         }"#;
         let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.new_decisions().len(), 1);
-        assert_eq!(response.deleted_decisions().len(), 1);
+        assert_eq!(response.new.unwrap().len(), 1);
+        assert_eq!(response.deleted.unwrap().len(), 1);
     }
 
     #[test]
     fn test_stream_response_empty() {
         let json = r#"{"new": null, "deleted": null}"#;
         let response: StreamResponse = serde_json::from_str(json).unwrap();
-        assert!(response.new_decisions().is_empty());
-        assert!(response.deleted_decisions().is_empty());
+        assert!(response.new.is_none());
+        assert!(response.deleted.is_none());
     }
 }
