@@ -11,9 +11,10 @@ use ngx::ffi::{
     NGX_OK, ngx_atomic_t, ngx_int_t, ngx_rwlock_rlock, ngx_rwlock_unlock, ngx_rwlock_wlock,
     ngx_shm_zone_t, ngx_slab_alloc_locked, ngx_slab_pool_t, ngx_str_t,
 };
+use ngx::ngx_string;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Maximum number of unique scenarios (most deployments have <100)
@@ -21,6 +22,13 @@ const MAX_SCENARIOS: usize = 256;
 
 /// Maximum length of a scenario string
 const MAX_SCENARIO_LEN: usize = 127;
+
+/// Magic at the start of [`ShmData`] (`b"CsD1"`).
+const SHM_MAGIC: u32 = u32::from_le_bytes(*b"CsD1");
+
+/// Increment when `ShmData` / `ShmHashEntry` / string table layout changes incompatibly.
+/// Reload reuses the zone pointer only when this matches; otherwise require a full restart.
+const SHM_LAYOUT_VERSION: u32 = 2;
 
 /// Percentage of SHM to use for entries (rest is overhead)
 const USABLE_MEMORY_PERCENT: usize = 70;
@@ -135,6 +143,18 @@ impl Origin {
             _ => Origin::Unknown,
         }
     }
+
+    /// Short label for logs and ban templates (`{{origin}}`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Crowdsec => "crowdsec",
+            Origin::Cscli => "cscli",
+            Origin::Capi => "capi",
+            Origin::Console => "console",
+            Origin::Lists => "lists",
+            Origin::Unknown => "unknown",
+        }
+    }
 }
 
 /// Scenario entry stored in the scenario table
@@ -184,6 +204,9 @@ impl ShmScenario {
     }
 }
 
+/// Ban `reason` strings use the same packed representation as scenarios.
+pub type ShmReason = ShmScenario;
+
 /// Hash table entry for IP decisions
 /// Stores both individual IPs and CIDR ranges in the same table
 /// Supports multiple decision types per IP via bitmask
@@ -213,8 +236,8 @@ pub struct ShmHashEntry {
     pub expires: i64,
     /// Scenario ID (index into scenario table), 0 = no scenario
     pub scenario_id: u16,
-    /// Padding for alignment to 40 bytes
-    pub _pad2: [u8; 2],
+    /// Ban reason ID (index into reason table), 0 = no reason stored
+    pub reason_id: u16,
 }
 
 impl ShmHashEntry {
@@ -230,7 +253,7 @@ impl ShmHashEntry {
             addr: [0; 16],
             expires: 0,
             scenario_id: 0,
-            _pad2: [0; 2],
+            reason_id: 0,
         }
     }
 
@@ -336,6 +359,7 @@ pub struct DecisionInfo<'a> {
     pub decision_type: DecisionType,
     pub origin: Origin,
     pub scenario: Option<&'a str>,
+    pub reason: Option<&'a str>,
     pub duration_secs: Option<i64>,
 }
 
@@ -347,12 +371,15 @@ pub struct CidrDecisionInfo<'a> {
     pub decision_type: DecisionType,
     pub origin: Origin,
     pub scenario: Option<&'a str>,
+    pub reason: Option<&'a str>,
     pub duration_secs: Option<i64>,
 }
 
 /// Shared memory data header
 #[repr(C)]
 pub struct ShmData {
+    pub magic: u32,
+    pub layout_version: u32,
     /// Read-write lock for synchronization
     pub lock: ngx_atomic_t,
     /// Atomic flag for poller election (0 = no poller, pid of poller worker)
@@ -363,8 +390,8 @@ pub struct ShmData {
     pub capacity: u32,
     /// Number of scenarios in the table
     pub scenario_count: u16,
-    /// Reserved for alignment
-    pub _reserved: u16,
+    /// Number of ban-reason strings in the table
+    pub reason_count: u16,
     /// Version counter (incremented on updates)
     pub version: u64,
     /// Clock hand for LRU eviction
@@ -375,6 +402,8 @@ pub struct ShmData {
     entries_offset: usize,
     /// Byte offset from this header to the scenario table.
     scenarios_offset: usize,
+    /// Byte offset from this header to the deduplicated ban-reason table.
+    reasons_offset: usize,
     /// Prefix lengths that have been seen. Stale bits are harmless and avoid
     /// maintaining counters on the update path.
     cidr_prefixes: [u64; 3],
@@ -382,6 +411,21 @@ pub struct ShmData {
 
 /// Global pointer to the shared memory zone
 static SHM_ZONE: AtomicPtr<ngx_shm_zone_t> = AtomicPtr::new(ptr::null_mut());
+
+/// Prometheus-style counters in a tiny separate zone (does not change `ShmData` layout).
+#[repr(C)]
+pub struct MetricsShm {
+    pub http_lookups: AtomicU64,
+    pub http_bans: AtomicU64,
+    pub http_captcha: AtomicU64,
+    pub http_bypass: AtomicU64,
+    pub lapi_poll_ok: AtomicU64,
+    pub lapi_poll_err: AtomicU64,
+    /// Unix seconds when the stream poller last completed a successful LAPI poll (`0` = never).
+    pub lapi_last_success_unix_secs: AtomicU64,
+}
+
+static METRICS_SHM_ZONE: AtomicPtr<ngx_shm_zone_t> = AtomicPtr::new(ptr::null_mut());
 
 /// Local cache of whether this worker is the poller (avoid repeated shm access)
 static IS_POLLER: AtomicBool = AtomicBool::new(false);
@@ -515,6 +559,13 @@ pub unsafe fn init_shm_zone(
     }
 }
 
+/// True if `data` points to a [`ShmData`] header written by this module layout.
+#[inline]
+unsafe fn decision_shm_layout_matches(data: *mut std::ffi::c_void) -> bool {
+    let hdr = data.cast::<ShmData>();
+    (*hdr).magic == SHM_MAGIC && (*hdr).layout_version == SHM_LAYOUT_VERSION
+}
+
 /// Shared memory zone initialization callback
 /// Called by NGINX after the zone is allocated
 unsafe extern "C" fn shm_zone_init(
@@ -523,15 +574,21 @@ unsafe extern "C" fn shm_zone_init(
 ) -> ngx_int_t {
     unsafe {
         if !data.is_null() {
-            // Zone already exists (reload), reuse the data
-            (*shm_zone).data = data;
-            // The previous generation's poller exits after new workers start. Reset
-            // its claim now so one of the new workers can take over immediately.
-            let shm_data = data as *mut ShmData;
-            let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
-                as *const std::sync::atomic::AtomicIsize);
-            poller_atomic.store(0, Ordering::SeqCst);
-            return NGX_OK as ngx_int_t;
+            if decision_shm_layout_matches(data) {
+                (*shm_zone).data = data;
+                // The previous generation's poller exits after new workers start. Reset
+                // its claim now so one of the new workers can take over immediately.
+                let shm_data = data as *mut ShmData;
+                let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
+                    as *const std::sync::atomic::AtomicIsize);
+                poller_atomic.store(0, Ordering::SeqCst);
+                return NGX_OK as ngx_int_t;
+            }
+            eprintln!(
+                "crowdsec: decision shared memory is incompatible with this module (layout changed). \
+                 Perform a full nginx restart after upgrading the module, not only `reload`."
+            );
+            return ngx::ffi::NGX_ERROR as ngx_int_t;
         }
 
         let shpool = (*shm_zone).shm.addr as *mut ngx_slab_pool_t;
@@ -544,16 +601,15 @@ unsafe extern "C" fn shm_zone_init(
         let scenario_size = std::mem::size_of::<ShmScenario>();
         let header_size = std::mem::size_of::<ShmData>();
 
-        // Reserve memory for header and scenarios first
-        let scenario_memory = scenario_size * MAX_SCENARIOS;
-        let fixed_overhead = header_size + scenario_memory;
+        // Reserve memory for header and two string tables (scenarios + ban reasons)
+        let string_table_bytes = scenario_size * MAX_SCENARIOS;
+        let fixed_overhead = header_size + string_table_bytes * 2;
 
         // Use remaining memory for hash table (with safety margin for slab allocator overhead)
         let available_for_entries =
             (*shm_zone).shm.size.saturating_sub(fixed_overhead) * USABLE_MEMORY_PERCENT / 100;
 
         // Capacity is simply how many entries fit in available memory
-        // The load factor (60%) means we'll only store ~60% of capacity before evicting
         let capacity = (available_for_entries / entry_size).max(MIN_CAPACITY as usize) as u32;
 
         eprintln!(
@@ -588,24 +644,36 @@ unsafe extern "C" fn shm_zone_init(
             return ngx::ffi::NGX_ERROR as ngx_int_t;
         }
 
+        // Allocate ban-reason table (same row size as scenarios)
+        let reasons_size = scenario_size * MAX_SCENARIOS;
+        let reasons_ptr = ngx_slab_alloc_locked(shpool, reasons_size);
+        if reasons_ptr.is_null() {
+            eprintln!("crowdsec: failed to allocate SHM reason table");
+            return ngx::ffi::NGX_ERROR as ngx_int_t;
+        }
+
         // Initialize the data structure
         let shm_data = header_ptr as *mut ShmData;
+        (*shm_data).magic = SHM_MAGIC;
+        (*shm_data).layout_version = SHM_LAYOUT_VERSION;
         (*shm_data).lock = 0;
         (*shm_data).poller_pid = 0;
         (*shm_data).count = 0;
         (*shm_data).capacity = capacity;
         (*shm_data).scenario_count = 0;
-        (*shm_data)._reserved = 0;
+        (*shm_data).reason_count = 0;
         (*shm_data).version = 0;
         (*shm_data).clock_hand = 0;
         (*shm_data).eviction_count = 0;
         (*shm_data).entries_offset = (entries_ptr as usize).wrapping_sub(header_ptr as usize);
         (*shm_data).scenarios_offset = (scenarios_ptr as usize).wrapping_sub(header_ptr as usize);
+        (*shm_data).reasons_offset = (reasons_ptr as usize).wrapping_sub(header_ptr as usize);
         (*shm_data).cidr_prefixes = [0; 3];
 
-        // Zero out entries and scenarios
+        // Zero out entries and string tables
         ptr::write_bytes(entries_ptr as *mut ShmHashEntry, 0, capacity as usize);
         ptr::write_bytes(scenarios_ptr as *mut ShmScenario, 0, MAX_SCENARIOS);
+        ptr::write_bytes(reasons_ptr as *mut ShmReason, 0, MAX_SCENARIOS);
 
         (*shm_zone).data = header_ptr;
 
@@ -651,6 +719,12 @@ unsafe fn mark_prefix_present(shm_data: *mut ShmData, prefix: u8) {
         let prefix = prefix as usize;
         (*shm_data).cidr_prefixes[prefix / 64] |= 1u64 << (prefix % 64);
     }
+}
+
+/// Get ban-reason strings array from shared memory data
+#[inline]
+unsafe fn get_reasons(shm_data: *mut ShmData) -> *mut ShmReason {
+    unsafe { (shm_data as usize).wrapping_add((*shm_data).reasons_offset) as *mut ShmReason }
 }
 
 /// Find or create a scenario ID for the given scenario string
@@ -707,12 +781,60 @@ pub fn get_scenario(scenario_id: u16) -> Option<String> {
     }
 }
 
+/// Find or create a reason ID for the given ban reason string.
+/// Must be called with write lock held. Returns 1-based ID, or 0 if the table is full.
+unsafe fn get_or_create_reason_id(shm_data: *mut ShmData, reason: &str) -> u16 {
+    let reasons = get_reasons(shm_data);
+    let count = (*shm_data).reason_count as usize;
+
+    for i in 0..count {
+        let entry = &*reasons.add(i);
+        if entry.matches(reason) {
+            return (i + 1) as u16;
+        }
+    }
+
+    if count < MAX_SCENARIOS {
+        let entry = &mut *reasons.add(count);
+        *entry = ShmScenario::from_str(reason);
+        (*shm_data).reason_count += 1;
+        return (count + 1) as u16;
+    }
+
+    0
+}
+
+/// Get ban reason text by ID (`0` = none).
+pub fn get_reason(reason_id: u16) -> Option<String> {
+    if reason_id == 0 {
+        return None;
+    }
+
+    let shm_data = get_shm_data()?;
+
+    unsafe {
+        ngx_rwlock_rlock(&mut (*shm_data).lock);
+
+        let result = if (reason_id as usize) <= (*shm_data).reason_count as usize {
+            let reasons = get_reasons(shm_data);
+            let entry = &*reasons.add(reason_id as usize - 1);
+            Some(entry.as_str().to_string())
+        } else {
+            None
+        };
+
+        ngx_rwlock_unlock(&mut (*shm_data).lock);
+        result
+    }
+}
+
 /// Result of looking up an IP in shared memory
 pub struct LookupResult {
     pub found: bool,
     pub decision_type: DecisionType,
     pub origin: Origin,
     pub scenario_id: u16,
+    pub reason_id: u16,
 }
 
 /// Find entry by hash using linear probing
@@ -854,6 +976,7 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
                 decision_type: DecisionType::Unknown,
                 origin: Origin::Unknown,
                 scenario_id: 0,
+                reason_id: 0,
             };
         }
     };
@@ -880,6 +1003,7 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
                     decision_type: entry.decision_type(),
                     origin: entry.origin(),
                     scenario_id: entry.scenario_id,
+                    reason_id: entry.reason_id,
                 };
                 ngx_rwlock_unlock(&mut (*shm_data).lock);
                 return result;
@@ -923,6 +1047,7 @@ unsafe fn lookup_cidr_v4(
                         decision_type: entry.decision_type(),
                         origin: entry.origin(),
                         scenario_id: entry.scenario_id,
+                        reason_id: entry.reason_id,
                     };
                 }
             }
@@ -933,6 +1058,7 @@ unsafe fn lookup_cidr_v4(
             decision_type: DecisionType::Unknown,
             origin: Origin::Unknown,
             scenario_id: 0,
+            reason_id: 0,
         }
     }
 }
@@ -963,6 +1089,7 @@ unsafe fn lookup_cidr_v6(
                         decision_type: entry.decision_type(),
                         origin: entry.origin(),
                         scenario_id: entry.scenario_id,
+                        reason_id: entry.reason_id,
                     };
                 }
             }
@@ -973,6 +1100,7 @@ unsafe fn lookup_cidr_v6(
             decision_type: DecisionType::Unknown,
             origin: Origin::Unknown,
             scenario_id: 0,
+            reason_id: 0,
         }
     }
 }
@@ -1009,6 +1137,11 @@ pub fn add_decision(info: &DecisionInfo) {
             .map(|s| get_or_create_scenario_id(shm_data, s))
             .unwrap_or(0);
 
+        let reason_id = info
+            .reason
+            .map(|r| get_or_create_reason_id(shm_data, r))
+            .unwrap_or(0);
+
         let hash = hash_ip(info.ip);
         let decision_bit = info.decision_type.to_bit();
 
@@ -1031,6 +1164,9 @@ pub fn add_decision(info: &DecisionInfo) {
             if scenario_id != 0 {
                 entry.scenario_id = scenario_id;
             }
+            if reason_id != 0 {
+                entry.reason_id = reason_id;
+            }
             (*shm_data).version += 1;
             ngx_rwlock_unlock(&mut (*shm_data).lock);
             return;
@@ -1043,6 +1179,7 @@ pub fn add_decision(info: &DecisionInfo) {
         new_entry.origin = info.origin as u8;
         new_entry.expires = expires;
         new_entry.scenario_id = scenario_id;
+        new_entry.reason_id = reason_id;
         new_entry.flags = 0;
 
         match info.ip {
@@ -1112,6 +1249,11 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
             .map(|s| get_or_create_scenario_id(shm_data, s))
             .unwrap_or(0);
 
+        let reason_id = info
+            .reason
+            .map(|r| get_or_create_reason_id(shm_data, r))
+            .unwrap_or(0);
+
         let hash = hash_cidr(info.family, info.prefix_len, info.network);
         let decision_bit = info.decision_type.to_bit();
 
@@ -1139,6 +1281,9 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
             if scenario_id != 0 {
                 entry.scenario_id = scenario_id;
             }
+            if reason_id != 0 {
+                entry.reason_id = reason_id;
+            }
             (*shm_data).version += 1;
             ngx_rwlock_unlock(&mut (*shm_data).lock);
             return;
@@ -1153,6 +1298,7 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         new_entry.origin = info.origin as u8;
         new_entry.expires = expires;
         new_entry.scenario_id = scenario_id;
+        new_entry.reason_id = reason_id;
         new_entry.flags = FLAG_IS_CIDR;
 
         let len = if info.family == 4 { 4 } else { 16 };
@@ -1187,6 +1333,7 @@ pub fn add_ban(ip: &IpAddr, duration_secs: Option<i64>) {
         decision_type: DecisionType::Ban,
         origin: Origin::Unknown,
         scenario: None,
+        reason: None,
         duration_secs,
     });
 }
@@ -1466,6 +1613,166 @@ pub fn parse_cidr(cidr: &str) -> Option<([u8; 16], u8, u8)> {
     }
 
     None
+}
+
+fn get_metrics_shm() -> Option<*mut MetricsShm> {
+    let zone = METRICS_SHM_ZONE.load(Ordering::SeqCst);
+    if zone.is_null() {
+        return None;
+    }
+    unsafe {
+        let data = (*zone).data.cast::<MetricsShm>();
+        if data.is_null() {
+            None
+        } else {
+            Some(data)
+        }
+    }
+}
+
+/// Second shared zone for counters (fixed size; safe across `ShmData` upgrades).
+///
+/// # Safety
+/// Valid `ngx_conf_t` from NGINX configuration.
+pub unsafe fn init_metrics_shm_zone(cf: *mut ngx::ffi::ngx_conf_t) -> Result<(), ()> {
+    let name: ngx_str_t = ngx_string!("crowdsec_metrics");
+    let shm_zone = ngx::ffi::ngx_shared_memory_add(
+        cf,
+        &name as *const _ as *mut _,
+        4096,
+        &raw const crate::ngx_http_crowdsec_module as *mut _,
+    );
+    if shm_zone.is_null() {
+        return Err(());
+    }
+    (*shm_zone).init = Some(metrics_zone_init);
+    (*shm_zone).data = ptr::null_mut();
+    METRICS_SHM_ZONE.store(shm_zone, Ordering::SeqCst);
+    Ok(())
+}
+
+unsafe extern "C" fn metrics_zone_init(
+    shm_zone: *mut ngx_shm_zone_t,
+    data: *mut std::ffi::c_void,
+) -> ngx_int_t {
+    if !data.is_null() {
+        (*shm_zone).data = data;
+        return NGX_OK as ngx_int_t;
+    }
+
+    let shpool = (*shm_zone).shm.addr as *mut ngx_slab_pool_t;
+    if shpool.is_null() {
+        return ngx::ffi::NGX_ERROR as ngx_int_t;
+    }
+
+    let sz = std::mem::size_of::<MetricsShm>();
+    let p = ngx_slab_alloc_locked(shpool, sz);
+    if p.is_null() {
+        eprintln!("crowdsec: failed to allocate metrics SHM");
+        return ngx::ffi::NGX_ERROR as ngx_int_t;
+    }
+
+    ptr::write(
+        p.cast::<MetricsShm>(),
+        MetricsShm {
+            http_lookups: AtomicU64::new(0),
+            http_bans: AtomicU64::new(0),
+            http_captcha: AtomicU64::new(0),
+            http_bypass: AtomicU64::new(0),
+            lapi_poll_ok: AtomicU64::new(0),
+            lapi_poll_err: AtomicU64::new(0),
+            lapi_last_success_unix_secs: AtomicU64::new(0),
+        },
+    );
+
+    (*shm_zone).data = p;
+    NGX_OK as ngx_int_t
+}
+
+#[inline]
+pub fn metrics_inc_http_lookup() {
+    let Some(p) = get_metrics_shm() else {
+        return;
+    };
+    unsafe {
+        (*p).http_lookups.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn metrics_inc_http_ban() {
+    let Some(p) = get_metrics_shm() else {
+        return;
+    };
+    unsafe {
+        (*p).http_bans.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn metrics_inc_http_captcha() {
+    let Some(p) = get_metrics_shm() else {
+        return;
+    };
+    unsafe {
+        (*p).http_captcha.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn metrics_inc_http_bypass() {
+    let Some(p) = get_metrics_shm() else {
+        return;
+    };
+    unsafe {
+        (*p).http_bypass.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn metrics_inc_lapi_poll_ok() {
+    let Some(p) = get_metrics_shm() else {
+        return;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    unsafe {
+        (*p).lapi_poll_ok.fetch_add(1, Ordering::Relaxed);
+        (*p)
+            .lapi_last_success_unix_secs
+            .store(now, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+pub fn metrics_inc_lapi_poll_err() {
+    let Some(p) = get_metrics_shm() else {
+        return;
+    };
+    unsafe {
+        (*p).lapi_poll_err.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot for Prometheus exposition (best-effort relaxed reads).
+pub fn metrics_prometheus_snapshot() -> (u64, u64, u64, u64, u64, u64, u64, u32) {
+    let Some(p) = get_metrics_shm() else {
+        return (0, 0, 0, 0, 0, 0, 0, get_count());
+    };
+    unsafe {
+        (
+            (*p).http_lookups.load(Ordering::Relaxed),
+            (*p).http_bans.load(Ordering::Relaxed),
+            (*p).http_captcha.load(Ordering::Relaxed),
+            (*p).http_bypass.load(Ordering::Relaxed),
+            (*p).lapi_poll_ok.load(Ordering::Relaxed),
+            (*p).lapi_poll_err.load(Ordering::Relaxed),
+            (*p).lapi_last_success_unix_secs.load(Ordering::Relaxed),
+            get_count(),
+        )
+    }
 }
 
 #[cfg(test)]

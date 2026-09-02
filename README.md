@@ -2,7 +2,7 @@
 
 A high-performance NGINX dynamic module written in Rust that integrates [CrowdSec](https://www.crowdsec.net/) security into your NGINX web server. This module enables real-time IP-based threat enforcement through seamless integration with the CrowdSec Local API (LAPI).
 
-> **Status**: Proof of Concept - This module implements IP-based ban and captcha remediation. See [Roadmap](#roadmap) for remaining work.
+> **Status**: **v0.2.0-rc1** release candidate — IP bans, captcha remediations, AppSec/bot challenge, trusted reverse-proxy client IP, IP bypass lists, ban redirects, and Prometheus metrics. See [CHANGELOG.md](CHANGELOG.md) and [Roadmap](#roadmap).
 
 ## Features
 
@@ -11,12 +11,13 @@ A high-performance NGINX dynamic module written in Rust that integrates [CrowdSe
 - **Fast lookups** - O(1) hash table for individual IPs with CIDR range support
 - **Multiple decision types** - Supports Ban and Captcha decisions
 - **Captcha verification** - Supports hCaptcha, reCAPTCHA, and Cloudflare Turnstile with signed session cookies
+- **Trusted reverse-proxy IP** — Optional `crowdsec_trusted_proxies` + forwarded header (default `X-Forwarded-For`) with safe recursive stripping
+- **Bypass by client IP** — Optional `crowdsec_bypass` CIDR list so probes and internal traffic skip enforcement without per-location `crowdsec off`
 - **Automatic expiration** - TTL-based cleanup of expired decisions
 - **LRU eviction** - Clock algorithm for memory management when cache fills
 - **Customizable responses** - Template-based ban pages (HTML, JSON, plain text)
+- **Prometheus metrics** — Optional `crowdsec_metrics on` location exposing counters, cache size, and last successful LAPI poll time (`crowdsec_metrics` SHM zone)
 - **Fail-open design** - Allows traffic if CrowdSec LAPI is unreachable
-
-## Requirements
 
 ### Build Requirements
 
@@ -28,6 +29,7 @@ A high-performance NGINX dynamic module written in Rust that integrates [CrowdSe
 ### Runtime Requirements
 
 - NGINX 1.30+ (compiled with dynamic module support)
+- Two small **shared-memory zones** are registered: `crowdsec_decisions` (size from `crowdsec_shm_size`) and `crowdsec_metrics` (4KB, for counters)
 - CrowdSec LAPI (v1.x)
 - Registered bouncer API key
 
@@ -147,9 +149,14 @@ All directives can be set at the `http`, `server`, or `location` level unless no
 | `crowdsec` | http, server, location | `off` | Enable/disable CrowdSec checking (`on`/`off`) |
 | `crowdsec_url` | http | - | CrowdSec LAPI URL (required) |
 | `crowdsec_api_key` | http | - | Bouncer API key (required) |
+| `crowdsec_trusted_proxies` | http, server | - | One or more CIDRs (or `off`). When the TCP client matches, the client IP is taken from `X-Forwarded-For` (or `crowdsec_real_ip_header`) using recursive trusted stripping (right-to-left). Repeat the directive to append more CIDRs. |
+| `crowdsec_real_ip_header` | http, server | `X-Forwarded-For` | Header to read when trusted proxies are configured (single token, case-insensitive match). |
+| `crowdsec_bypass` | http, server | - | One or more CIDRs (or `off`). If the **resolved** client IP (after trusted-proxy logic) matches, the request skips CrowdSec (no cache lookup). Repeat to append. Exposed as `crowdsec_http_bypass_total`. |
 | `crowdsec_shm_size` | http | `1m` | Shared memory zone size for decision cache |
 | `crowdsec_max_retries` | http | `3` | Max connection retries on startup |
 | `crowdsec_retry_interval` | http | `5` | Seconds between retry attempts |
+| `crowdsec_poll_interval` | http, server | `10` | Seconds to wait after each successful stream response before polling LAPI again |
+| `crowdsec_lapi_timeout` | http, server | `30` | Per-request HTTP timeout (seconds) when calling LAPI |
 | `crowdsec_ban_template` | http, server, location | built-in | Path to custom ban response template |
 | `crowdsec_captcha_provider` | http, server, location | `turnstile` | `hcaptcha`, `recaptcha`, or `turnstile` |
 | `crowdsec_captcha_site_key` | http, server, location | - | Captcha provider site key |
@@ -161,6 +168,10 @@ All directives can be set at the `http`, `server`, or `location` level unless no
 | `crowdsec_captcha_bind_ip` | http, server, location | `on` | Bind captcha sessions to client IP |
 | `crowdsec_captcha_cookie_secure` | http, server, location | `auto` | Secure cookie mode: `auto`, `on`, or `off` |
 | `crowdsec_captcha_template` | http, server, location | built-in | Path to custom captcha template |
+| `crowdsec_ban_action` | http, server, location | `block` | `block` → 403 (with template if set); `redirect` → redirect to `crowdsec_ban_redirect_url` |
+| `crowdsec_ban_redirect_url` | http, server, location | - | Absolute `http://` or `https://` URL (max 2048 chars). Required when `ban_action` is `redirect`. |
+| `crowdsec_ban_redirect_code` | http, server, location | `302` | Status for ban redirect: `301`, `302`, `303`, `307`, or `308`. |
+| `crowdsec_metrics` | http, server, location | `off` | `on` → this location serves Prometheus text metrics (use a dedicated URI; protect with `allow` / `internal` / auth). |
 
 ### Example Configuration
 
@@ -183,8 +194,23 @@ http {
     crowdsec_captcha_secret_key your-secret-key;
     crowdsec_captcha_signing_key your-64-character-hex-key;
 
+    # Optional: behind L7 reverse proxies / CDNs — list CIDRs of peers that terminate TCP for you.
+    # crowdsec_trusted_proxies 10.0.0.0/8 172.16.0.0/12;
+    # crowdsec_real_ip_header X-Forwarded-For;  # default; Cloudflare often uses CF-Connecting-IP instead
+
     # Default ban template for all servers
     crowdsec_ban_template /etc/nginx/templates/default.html;
+    # Optional: send banned users to an info page instead of 403 + template
+    # crowdsec_ban_action redirect;
+    # crowdsec_ban_redirect_url "https://www.example.com/blocked";
+    # crowdsec_ban_redirect_code 307;
+
+    # Internal Prometheus metrics (no CrowdSec enforcement on this URI)
+    # location /crowdsec-metrics {
+    #     internal;
+    #     crowdsec off;
+    #     crowdsec_metrics on;
+    # }
 
     server {
         listen 80;
@@ -223,7 +249,10 @@ The module supports customizable ban response templates with variable substituti
 | `{{client_ip}}` | The blocked client's IP address |
 | `{{request_method}}` | HTTP method (GET, POST, etc.) |
 | `{{request_uri}}` | Requested URI path |
-| `{{reason}}` | Ban reason from CrowdSec (if available) |
+| `{{reason}}` | CrowdSec ban `reason` from the LAPI stream when present (truncated to the same max length as scenarios, 127 bytes UTF-8) |
+| `{{scenario}}` | CrowdSec scenario name when stored on the decision (from LAPI stream) |
+| `{{origin}}` | Decision source: `crowdsec`, `cscli`, `capi`, `console`, `lists`, or `unknown` |
+| `{{host}}` | Value of the request `Host` header when present |
 
 ### Included Templates
 
@@ -301,18 +330,28 @@ cscli decisions add --range 10.0.0.0/24 --type ban --duration 24h
 - **Poller Election**: First worker to initialize becomes the dedicated poller
 - **Poll Thread**: Background thread streaming decisions from LAPI
 - **Access Phase Handler**: Checks each request against the decision cache
+- **Prometheus metrics**: Optional `crowdsec_metrics` SHM + `crowdsec_metrics on` location (includes `crowdsec_lapi_stream_last_success_unixtime` for alerting when polls stall)
 
 ## Roadmap
 
-Features planned for future releases (working towards feature parity with [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer)):
+**v0.2.0-rc1** completes the parity goals tracked against [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer):
 
-- [ ] X-Forwarded-For header support (extracting real client IP behind proxies)
+- [x] X-Forwarded-For style client IP when behind trusted proxies (`crowdsec_trusted_proxies`, `crowdsec_real_ip_header`)
 - [x] Captcha challenge flow (hCaptcha, reCAPTCHA, and Turnstile)
-- [ ] Prometheus metrics endpoint
-- [ ] AppSec/WAF integration (request body inspection)
-- [ ] Ban action customization (redirect vs block)
+- [x] Prometheus metrics endpoint (`crowdsec_metrics on` + `crowdsec_metrics` shared zone)
+- [x] AppSec/WAF integration (request body inspection) and CrowdSec 1.8 bot challenge
+- [x] Ban action customization (`crowdsec_ban_action block|redirect`, `crowdsec_ban_redirect_url`, `crowdsec_ban_redirect_code`)
+- [x] IP/CIDR bypass without disabling the module per location (`crowdsec_bypass`)
+
+Future work (post-0.2.0): async captcha provider verification, richer AppSec/bot-challenge stability as CrowdSec 1.8 matures, and additional lua-cs-bouncer edge cases as they are identified.
 
 ## Troubleshooting
+
+### Shared memory after module upgrade
+
+The `crowdsec_decisions` zone embeds a **layout version** and **magic** value. On `nginx -s reload`, the module reuses the existing zone only if those match.
+
+- If you upgrade to a build that changes the in-memory layout, reload may log an incompatibility message and **fail** until you perform a **full nginx stop/start** (or remove the old shared segment by restarting the host / changing the zone name in a fork).
 
 ### Module not loading
 

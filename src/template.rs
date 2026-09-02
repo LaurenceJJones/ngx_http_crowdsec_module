@@ -225,6 +225,12 @@ pub struct TemplateVariables {
     pub request_uri: Option<String>,
     /// Request method
     pub request_method: Option<String>,
+    /// CrowdSec scenario name when present on the cached decision (`{{scenario}}`)
+    pub scenario: Option<String>,
+    /// Decision origin label, e.g. `cscli` (`{{origin}}`)
+    pub origin: Option<String>,
+    /// HTTP `Host` header from the request (`{{host}}`)
+    pub host: Option<String>,
     /// Captcha site key (public key for widget)
     pub captcha_site_key: Option<String>,
     /// Captcha provider script URL
@@ -249,6 +255,9 @@ impl TemplateVariables {
             "reason" => self.reason.as_deref(),
             "request_uri" => self.request_uri.as_deref(),
             "request_method" => self.request_method.as_deref(),
+            "scenario" => self.scenario.as_deref(),
+            "origin" => self.origin.as_deref(),
+            "host" => self.host.as_deref(),
             "captcha_site_key" => self.captcha_site_key.as_deref(),
             "captcha_script_url" => self.captcha_script_url.as_deref(),
             "captcha_div_class" => self.captcha_div_class.as_deref(),
@@ -262,6 +271,16 @@ impl TemplateVariables {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_render_scenario_origin_host() {
+        let template = BanTemplate::parse("{{origin}}|{{scenario}}|{{host}}");
+        let mut vars = TemplateVariables::new();
+        vars.origin = Some("cscli".to_string());
+        vars.scenario = Some("ssh-bf".to_string());
+        vars.host = Some("example.com".to_string());
+        assert_eq!(template.render(&vars), "cscli|ssh-bf|example.com");
+    }
 
     #[test]
     fn test_parse_simple_text() {

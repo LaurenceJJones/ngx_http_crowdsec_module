@@ -7,6 +7,7 @@ use crate::captcha::config::CaptchaConfig;
 use crate::captcha::cookie::{SameSite, build_set_cookie, get_cookie, is_https};
 use crate::captcha::jwt::{CaptchaClaims, JwtManager};
 use crate::captcha::verifier::{VerifyError, VerifyResult, verify_captcha};
+use crate::shm;
 use crate::template::{BanTemplate, TemplateVariables};
 use ngx::core::{Buffer, Status};
 use ngx::ffi::ngx_http_request_t;
@@ -244,6 +245,7 @@ pub fn send_captcha_page(
         ngx::ffi::ngx_http_finalize_request(r, rc);
     }
 
+    shm::metrics_inc_http_captcha();
     Ok(())
 }
 

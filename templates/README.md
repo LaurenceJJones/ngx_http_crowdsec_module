@@ -16,7 +16,10 @@ All templates support the following variables using `{{variable_name}}` syntax:
 - `{{client_ip}}` - The client's IP address that was blocked
 - `{{request_method}}` - The HTTP method (GET, POST, etc.)
 - `{{request_uri}}` - The requested URI path
-- `{{reason}}` - The ban reason (if available from CrowdSec)
+- `{{reason}}` - Ban reason from CrowdSec when the stream includes it (stored in SHM; long reasons are truncated to 127 bytes)
+- `{{scenario}}` - CrowdSec scenario name when the stream provided one
+- `{{origin}}` - Where the decision came from (`crowdsec`, `cscli`, `capi`, `console`, `lists`, `unknown`)
+- `{{host}}` - The request's `Host` header (useful behind reverse proxies)
 
 ## Usage
 

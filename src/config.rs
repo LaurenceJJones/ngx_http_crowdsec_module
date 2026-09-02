@@ -1,4 +1,5 @@
 use crate::captcha::{CaptchaConfig, CaptchaProvider, CookieSecure};
+use crate::realip::TrustedCidr;
 use crate::template::BanTemplate;
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, NgxStr};
 use ngx::ffi::{
@@ -24,12 +25,23 @@ pub struct MainConfig {
     pub max_retries: Option<u32>,
     /// Retry interval in seconds between retry attempts (default: 5)
     pub retry_interval_secs: Option<u64>,
+    /// Seconds to wait after each successful stream poll before polling again (default: 10)
+    pub poll_interval_secs: Option<u64>,
+    /// Per-request HTTP timeout when calling LAPI (default: 30)
+    pub lapi_timeout_secs: Option<u64>,
     /// Shared memory size in bytes (default: 1MB)
     pub shm_size: Option<usize>,
     pub appsec_url: Option<String>,
     pub appsec_api_key: Option<String>,
     pub appsec_timeout_ms: Option<u64>,
     pub appsec_max_body_size: Option<usize>,
+    /// When the TCP peer matches one of these CIDRs, client IP is taken from `real_ip_header`
+    /// (default `X-Forwarded-For`) using recursive right-to-left trusted stripping.
+    pub trusted_proxies: Vec<TrustedCidr>,
+    /// Optional override for the forwarded client header (default: `X-Forwarded-For`).
+    pub real_ip_header: Option<String>,
+    /// Resolved client IPs in these CIDRs skip CrowdSec enforcement (health checks, internal probes).
+    pub bypass_cidrs: Vec<TrustedCidr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +49,17 @@ pub enum AppSecFailureAction {
     #[default]
     Passthrough,
     Deny,
+}
+
+/// How NGINX responds when CrowdSec has a **ban** decision for the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BanActionMode {
+    /// Return 403 (optionally with `crowdsec_ban_template` body)
+    #[default]
+    Block,
+    /// Redirect to `crowdsec_ban_redirect_url` (must be `http://` or `https://`). Status from
+    /// `crowdsec_ban_redirect_code` (default 302).
+    Redirect,
 }
 
 /// Location configuration for CrowdSec module
@@ -47,6 +70,14 @@ pub struct LocConfig {
     pub enabled: Option<bool>,
     /// Ban template for rendering 403 responses
     pub ban_template: Option<Arc<BanTemplate>>,
+    /// Ban remediation: `block` (403) or `redirect` (to `ban_redirect_url`)
+    pub ban_action: Option<BanActionMode>,
+    /// URL for ban redirect (only used when `ban_action` is `redirect`)
+    pub ban_redirect_url: Option<String>,
+    /// HTTP status for ban redirect: 301, 302, 303, 307, or 308 (default 302 if unset)
+    pub ban_redirect_code: Option<u16>,
+    /// When true, this location serves Prometheus text metrics (use a dedicated location).
+    pub metrics_enabled: Option<bool>,
     /// Captcha template for rendering captcha challenge pages
     pub captcha_template: Option<Arc<BanTemplate>>,
 
@@ -268,6 +299,80 @@ pub extern "C" fn ngx_http_crowdsec_set_retry_interval(
     NGX_CONF_OK
 }
 
+/// Directive handler for `crowdsec_poll_interval <seconds>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_poll_interval(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut MainConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                return NGX_CONF_ERROR;
+            }
+        };
+
+        match value_str.parse::<u64>() {
+            Ok(n) if n >= 1 && n <= 3600 => {
+                conf.poll_interval_secs = Some(n);
+            }
+            _ => {
+                eprintln!("crowdsec: poll_interval must be 1-3600 seconds");
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_lapi_timeout <seconds>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_lapi_timeout(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut MainConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                return NGX_CONF_ERROR;
+            }
+        };
+
+        match value_str.parse::<u64>() {
+            Ok(n) if n >= 1 && n <= 600 => {
+                conf.lapi_timeout_secs = Some(n);
+            }
+            _ => {
+                eprintln!("crowdsec: lapi_timeout must be 1-600 seconds");
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
+
+    NGX_CONF_OK
+}
+
 /// Directive handler for `crowdsec_shm_size <size>;`
 /// Size can be specified as bytes, or with k/m suffix (e.g., 1m, 512k)
 ///
@@ -304,6 +409,154 @@ pub extern "C" fn ngx_http_crowdsec_set_shm_size(
                 return NGX_CONF_ERROR;
             }
         }
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_trusted_proxies <cidr> ...;` or `crowdsec_trusted_proxies off;`
+///
+/// May be specified multiple times; each invocation appends networks (except `off`, which clears).
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_trusted_proxies(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut MainConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let nelts = (*(*cf).args).nelts as usize;
+        if nelts < 2 {
+            return NGX_CONF_ERROR;
+        }
+
+        if nelts == 2 {
+            let value = *args.add(1);
+            let value_str = match NgxStr::from_ngx_str(value).to_str() {
+                Ok(s) => s,
+                Err(_) => return NGX_CONF_ERROR,
+            };
+            if value_str.eq_ignore_ascii_case("off") {
+                conf.trusted_proxies.clear();
+                return NGX_CONF_OK;
+            }
+        }
+
+        for i in 1..nelts {
+            let token = *args.add(i);
+            let s = match NgxStr::from_ngx_str(token).to_str() {
+                Ok(s) => s,
+                Err(_) => return NGX_CONF_ERROR,
+            };
+            if s.eq_ignore_ascii_case("off") {
+                eprintln!(
+                    "crowdsec: 'off' cannot be combined with other trusted_proxies arguments"
+                );
+                return NGX_CONF_ERROR;
+            }
+            match TrustedCidr::parse(s) {
+                Ok(cidr) => conf.trusted_proxies.push(cidr),
+                Err(()) => {
+                    eprintln!("crowdsec: invalid trusted_proxies entry '{}'", s);
+                    return NGX_CONF_ERROR;
+                }
+            }
+        }
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_bypass <cidr> ...;` or `crowdsec_bypass off;`
+///
+/// May be specified multiple times; each invocation appends networks (except `off`, which clears).
+/// Matching uses the same resolved client IP as remediation (`crowdsec_trusted_proxies` applied first).
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_bypass(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut MainConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let nelts = (*(*cf).args).nelts as usize;
+        if nelts < 2 {
+            return NGX_CONF_ERROR;
+        }
+
+        if nelts == 2 {
+            let value = *args.add(1);
+            let value_str = match NgxStr::from_ngx_str(value).to_str() {
+                Ok(s) => s,
+                Err(_) => return NGX_CONF_ERROR,
+            };
+            if value_str.eq_ignore_ascii_case("off") {
+                conf.bypass_cidrs.clear();
+                return NGX_CONF_OK;
+            }
+        }
+
+        for i in 1..nelts {
+            let token = *args.add(i);
+            let s = match NgxStr::from_ngx_str(token).to_str() {
+                Ok(s) => s,
+                Err(_) => return NGX_CONF_ERROR,
+            };
+            if s.eq_ignore_ascii_case("off") {
+                eprintln!("crowdsec: 'off' cannot be combined with other bypass arguments");
+                return NGX_CONF_ERROR;
+            }
+            match TrustedCidr::parse(s) {
+                Ok(cidr) => conf.bypass_cidrs.push(cidr),
+                Err(()) => {
+                    eprintln!("crowdsec: invalid bypass entry '{}'", s);
+                    return NGX_CONF_ERROR;
+                }
+            }
+        }
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_real_ip_header <name>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_real_ip_header(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut MainConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        let trimmed = value_str.trim();
+        if trimmed.is_empty() || trimmed.chars().any(|c| c == ' ' || c == '\t') {
+            eprintln!("crowdsec: real_ip_header must be a single token");
+            return NGX_CONF_ERROR;
+        }
+
+        conf.real_ip_header = Some(trimmed.to_string());
     }
 
     NGX_CONF_OK
@@ -388,6 +641,167 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_template(
         };
 
         conf.ban_template = Some(template);
+    }
+
+    NGX_CONF_OK
+}
+
+/// `crowdsec_ban_redirect_url` must use `http://` or `https://` and fit in a single line.
+fn validate_ban_redirect_url(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.len() > 2048 {
+        return false;
+    }
+    if t.chars().any(|c| matches!(c, '\r' | '\n')) {
+        return false;
+    }
+    let b = t.as_bytes();
+    (b.len() >= 7 && b[..7].eq_ignore_ascii_case(b"http://"))
+        || (b.len() >= 8 && b[..8].eq_ignore_ascii_case(b"https://"))
+}
+
+/// Directive handler for `crowdsec_ban_action block|redirect;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_ban_action(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        let mode = if value_str.eq_ignore_ascii_case("block") {
+            BanActionMode::Block
+        } else if value_str.eq_ignore_ascii_case("redirect") {
+            BanActionMode::Redirect
+        } else {
+            eprintln!("crowdsec: ban_action must be block or redirect");
+            return NGX_CONF_ERROR;
+        };
+
+        conf.ban_action = Some(mode);
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_ban_redirect_url <url>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_ban_redirect_url(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        if !validate_ban_redirect_url(value_str) {
+            eprintln!(
+                "crowdsec: ban_redirect_url must be http:// or https:// and at most 2048 characters"
+            );
+            return NGX_CONF_ERROR;
+        }
+
+        conf.ban_redirect_url = Some(value_str.trim().to_string());
+    }
+
+    NGX_CONF_OK
+}
+
+/// Allowed values for `crowdsec_ban_redirect_code`.
+fn parse_ban_redirect_code(s: &str) -> Option<u16> {
+    let t = s.trim();
+    match t {
+        "301" => Some(301),
+        "302" => Some(302),
+        "303" => Some(303),
+        "307" => Some(307),
+        "308" => Some(308),
+        _ => None,
+    }
+}
+
+/// Directive handler for `crowdsec_ban_redirect_code <code>;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_ban_redirect_code(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        if let Some(code) = parse_ban_redirect_code(value_str) {
+            conf.ban_redirect_code = Some(code);
+        } else {
+            eprintln!(
+                "crowdsec: ban_redirect_code must be 301, 302, 303, 307, or 308 (got '{}')",
+                value_str.trim()
+            );
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_metrics on|off;`
+///
+/// # Safety
+/// This function is called by NGINX and must follow C calling conventions.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_metrics(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                return NGX_CONF_ERROR;
+            }
+        };
+
+        conf.metrics_enabled = Some(value_str.eq_ignore_ascii_case("on"));
     }
 
     NGX_CONF_OK
@@ -851,12 +1265,21 @@ appsec_setter!(
 /// Returns the static commands array for the module.
 /// The array is null-terminated with an empty command.
 #[rustfmt::skip]
-pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 25] = [
+pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 34] = [
     // crowdsec on|off; - enable/disable at location level
     ngx_command_t {
         name: ngx_string!("crowdsec"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_enable),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_metrics on|off; — Prometheus text (dedicated location; pair with crowdsec off;)
+    ngx_command_t {
+        name: ngx_string!("crowdsec_metrics"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_metrics),
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
         post: std::ptr::null_mut(),
@@ -879,6 +1302,33 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 25] = [
         offset: 0,
         post: std::ptr::null_mut(),
     },
+    // crowdsec_trusted_proxies <cidr> ... | off;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_trusted_proxies"),
+        type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF) as ngx_uint_t | 0x0000_2000) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_trusted_proxies),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_real_ip_header <header-name>;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_real_ip_header"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_real_ip_header),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_bypass <cidr> ... | off;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_bypass"),
+        type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF) as ngx_uint_t | 0x0000_2000) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_bypass),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
     // crowdsec_max_retries <number>; - Maximum retries for initial connection (default: 3)
     ngx_command_t {
         name: ngx_string!("crowdsec_max_retries"),
@@ -897,6 +1347,24 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 25] = [
         offset: 0,
         post: std::ptr::null_mut(),
     },
+    // crowdsec_poll_interval <seconds>; - delay between successful LAPI stream polls (default: 10)
+    ngx_command_t {
+        name: ngx_string!("crowdsec_poll_interval"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_poll_interval),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_lapi_timeout <seconds>; - HTTP timeout per LAPI request (default: 30)
+    ngx_command_t {
+        name: ngx_string!("crowdsec_lapi_timeout"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_lapi_timeout),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
     // crowdsec_shm_size <size>; - Shared memory size (default: 1m)
     ngx_command_t {
         name: ngx_string!("crowdsec_shm_size"),
@@ -911,6 +1379,33 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 25] = [
         name: ngx_string!("crowdsec_ban_template"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_ban_template),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_ban_action block|redirect;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_ban_action"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_ban_action),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_ban_redirect_url <url>;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_ban_redirect_url"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_ban_redirect_url),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_ban_redirect_code 301|302|303|307|308;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_ban_redirect_code"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_ban_redirect_code),
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
         post: std::ptr::null_mut(),

@@ -4,5 +4,8 @@
     "client_ip": "{{client_ip}}",
     "request_method": "{{request_method}}",
     "request_uri": "{{request_uri}}",
+    "scenario": "{{scenario}}",
+    "origin": "{{origin}}",
+    "host": "{{host}}",
     "reason": "{{reason}}"
 }

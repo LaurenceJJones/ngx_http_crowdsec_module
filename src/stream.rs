@@ -159,6 +159,11 @@ impl StreamClient {
                     .map(Origin::from_str)
                     .unwrap_or(Origin::Unknown);
                 let scenario = decision.scenario.as_deref();
+                let reason = decision
+                    .reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
 
                 // Try to parse as single IP first
                 if let Ok(ip) = value.parse::<IpAddr>() {
@@ -167,6 +172,7 @@ impl StreamClient {
                         decision_type,
                         origin,
                         scenario,
+                        reason,
                         duration_secs,
                     });
                 }
@@ -179,6 +185,7 @@ impl StreamClient {
                         decision_type,
                         origin,
                         scenario,
+                        reason,
                         duration_secs,
                     });
                 }
@@ -222,6 +229,7 @@ impl StreamClient {
         for attempt in 0..=self.config.max_retries {
             match self.poll(startup) {
                 Ok(result) => {
+                    shm::metrics_inc_lapi_poll_ok();
                     if attempt > 0 {
                         eprintln!(
                             "crowdsec: initial sync succeeded after {} retry attempt(s)",
@@ -247,6 +255,7 @@ impl StreamClient {
         }
 
         // All retries exhausted
+        shm::metrics_inc_lapi_poll_err();
         Err(last_error.expect("retry loop should have at least one error"))
     }
 
@@ -288,6 +297,7 @@ impl StreamClient {
 
             match self.poll(false) {
                 Ok((new, deleted)) => {
+                    shm::metrics_inc_lapi_poll_ok();
                     if new > 0 || deleted > 0 {
                         eprintln!(
                             "crowdsec: stream update - {} new, {} deleted, {} total banned IPs",
@@ -298,6 +308,7 @@ impl StreamClient {
                     }
                 }
                 Err(e) => {
+                    shm::metrics_inc_lapi_poll_err();
                     eprintln!("crowdsec: stream poll failed (fail-open): {}", e);
                 }
             }

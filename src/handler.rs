@@ -1,7 +1,8 @@
 use crate::captcha::cookie::{build_clear_cookie, get_cookie};
 use crate::captcha::{self, CaptchaHandler, send_captcha_page};
-use crate::config::LocConfig;
-use crate::shm::{self, DecisionType};
+use crate::config::{BanActionMode, LocConfig, MainConfig};
+use crate::realip;
+use crate::shm::{self, DecisionType, LookupResult};
 use crate::template::{BanTemplate, TemplateVariables};
 use ngx::core::{Buffer, Status};
 use ngx::ffi::ngx_http_request_t;
@@ -49,42 +50,13 @@ fn is_static_asset_request(request: &Request) -> bool {
     }
 }
 
-/// Extract the client IP address from the NGINX request
-pub fn get_client_ip(request: &Request) -> Option<IpAddr> {
-    // Get the connection from the request
-    let connection = request.connection();
-    if connection.is_null() {
-        return None;
-    }
-
-    // Get the sockaddr from the connection
-    let sockaddr = unsafe { (*connection).sockaddr };
-    if sockaddr.is_null() {
-        return None;
-    }
-
-    // Parse based on address family
-    let family = unsafe { (*sockaddr).sa_family };
-
-    #[cfg(target_family = "unix")]
-    {
-        use std::net::{Ipv4Addr, Ipv6Addr};
-
-        // AF_INET = 2, AF_INET6 = 10 on Linux
-        if family == 2 {
-            // IPv4
-            let addr_in = sockaddr as *const libc::sockaddr_in;
-            let ip_bytes = unsafe { (*addr_in).sin_addr.s_addr.to_ne_bytes() };
-            return Some(IpAddr::V4(Ipv4Addr::from(ip_bytes)));
-        } else if family == 10 {
-            // IPv6
-            let addr_in6 = sockaddr as *const libc::sockaddr_in6;
-            let ip_bytes = unsafe { (*addr_in6).sin6_addr.s6_addr };
-            return Some(IpAddr::V6(Ipv6Addr::from(ip_bytes)));
-        }
-    }
-
-    None
+/// Extract the client IP address from the NGINX request (socket peer, then trusted-proxy headers).
+pub fn get_client_ip(request: &Request, main_conf: &MainConfig) -> Option<std::net::IpAddr> {
+    crate::realip::get_effective_client_ip(
+        request,
+        &main_conf.trusted_proxies,
+        main_conf.real_ip_header.as_deref(),
+    )
 }
 
 /// Main access phase handler logic
@@ -101,7 +73,18 @@ pub fn get_client_ip(request: &Request) -> Option<IpAddr> {
 /// * `HandlerResult::Forbidden` - Block the request (IP is banned)
 /// * `HandlerResult::Done` - Response sent (ban page or captcha page)
 /// * `HandlerResult::Error` - Error occurred, fail-open
-pub fn handle_access(request: &mut Request, loc_conf: &LocConfig) -> HandlerResult {
+pub fn handle_access(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+    main_conf: &MainConfig,
+) -> HandlerResult {
+    if let Some(outcome) = crate::metrics::try_serve_metrics(request, loc_conf) {
+        return match outcome {
+            crate::metrics::MetricsServeOutcome::Served => HandlerResult::Done,
+            crate::metrics::MetricsServeOutcome::Failed => HandlerResult::Error,
+        };
+    }
+
     // Check if module is enabled
     match loc_conf.enabled {
         Some(true) => {
@@ -113,7 +96,7 @@ pub fn handle_access(request: &mut Request, loc_conf: &LocConfig) -> HandlerResu
     }
 
     // Extract client IP
-    let client_ip = match get_client_ip(request) {
+    let client_ip = match get_client_ip(request, main_conf) {
         Some(ip) => ip,
         None => {
             // Couldn't get IP, fail-open
@@ -121,11 +104,20 @@ pub fn handle_access(request: &mut Request, loc_conf: &LocConfig) -> HandlerResu
         }
     };
 
+    if !main_conf.bypass_cidrs.is_empty()
+        && crate::realip::ip_in_cidr_list(&client_ip, &main_conf.bypass_cidrs)
+    {
+        shm::metrics_inc_http_bypass();
+        return HandlerResult::Declined;
+    }
+
+    shm::metrics_inc_http_lookup();
+
     // Lookup IP in shared memory
     let lookup = shm::lookup_ip(&client_ip);
 
     if !lookup.found {
-        let appsec = crate::appsec::inspect(request, loc_conf);
+        let appsec = crate::appsec::inspect(request, loc_conf, main_conf);
         if !matches!(appsec, HandlerResult::Declined) {
             return appsec;
         }
@@ -137,17 +129,36 @@ pub fn handle_access(request: &mut Request, loc_conf: &LocConfig) -> HandlerResu
     // Route based on decision type (Ban has priority over Captcha)
     match lookup.decision_type {
         DecisionType::Ban => {
+            if loc_conf.ban_action == Some(BanActionMode::Redirect) {
+                if let Some(ref url) = loc_conf.ban_redirect_url {
+                    let code = loc_conf.ban_redirect_code.unwrap_or(302);
+                    if send_ban_redirect(request, url, ban_redirect_status(code)).is_ok() {
+                        shm::metrics_inc_http_ban();
+                        return HandlerResult::Done;
+                    }
+                } else {
+                    ngx_log_debug_http!(
+                        request,
+                        "crowdsec: ban_action redirect but ban_redirect_url not set; using block"
+                    );
+                }
+            }
             // For static assets like .ico, just return 403 without HTML body
             if is_static_asset_request(request) {
+                shm::metrics_inc_http_ban();
                 return HandlerResult::Forbidden;
             }
             // Handle ban - send 403 with template
             if let Some(ref template) = loc_conf.ban_template {
-                match send_ban_response(request, template, &client_ip) {
-                    Ok(_) => return HandlerResult::Done,
+                match send_ban_response(request, template, &client_ip, &lookup) {
+                    Ok(_) => {
+                        shm::metrics_inc_http_ban();
+                        return HandlerResult::Done;
+                    }
                     Err(_) => {}
                 }
             }
+            shm::metrics_inc_http_ban();
             HandlerResult::Forbidden
         }
         DecisionType::Captcha => {
@@ -176,6 +187,7 @@ pub(crate) fn handle_captcha_decision(
     // This allows favicon to display on captcha page without sending HTML
     if is_static_asset_request(request) {
         if send_empty_response(request, HTTPStatus::OK).is_ok() {
+            shm::metrics_inc_http_captcha();
             return HandlerResult::Done;
         }
         return HandlerResult::Error;
@@ -431,15 +443,95 @@ pub(crate) fn send_raw_response(
     Ok(())
 }
 
+fn ban_redirect_status(code: u16) -> HTTPStatus {
+    match code {
+        301 => HTTPStatus::MOVED_PERMANENTLY,
+        303 => HTTPStatus::SEE_OTHER,
+        307 => HTTPStatus::TEMPORARY_REDIRECT,
+        308 => HTTPStatus::PERMANENT_REDIRECT,
+        _ => HTTPStatus::MOVED_TEMPORARILY,
+    }
+}
+
+/// Redirect response for ban remediation (`crowdsec_ban_action redirect`).
+fn send_ban_redirect(
+    request: &mut Request,
+    location: &str,
+    status: HTTPStatus,
+) -> Result<(), ()> {
+    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
+
+    unsafe {
+        (*r).set_keepalive(0);
+    }
+
+    let body = b"\n";
+
+    request.set_status(status);
+    request.set_content_length_n(body.len());
+    request.discard_request_body();
+    request.add_header_out("Location", location);
+    request.add_header_out("Content-Type", "text/plain");
+    request.add_header_out(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate, max-age=0",
+    );
+    request.add_header_out("Pragma", "no-cache");
+
+    let pool = request.pool();
+
+    let mut buffer = match pool.create_buffer_from_str(std::str::from_utf8(body).unwrap()) {
+        Some(buf) => buf,
+        None => return Err(()),
+    };
+    buffer.set_last_buf(true);
+    buffer.set_last_in_chain(true);
+
+    let cl = unsafe {
+        let cl = ngx::ffi::ngx_alloc_chain_link(pool.as_ptr());
+        if cl.is_null() {
+            return Err(());
+        }
+        (*cl).buf = buffer.as_ngx_buf_mut();
+        (*cl).next = std::ptr::null_mut();
+        cl
+    };
+
+    let rc = request.send_header();
+    if rc != Status::NGX_OK {
+        unsafe {
+            ngx::ffi::ngx_http_finalize_request(r, rc.into());
+        }
+        return Ok(());
+    }
+
+    unsafe {
+        let rc = ngx::ffi::ngx_http_output_filter(r, cl);
+        ngx::ffi::ngx_http_finalize_request(r, rc);
+    }
+
+    Ok(())
+}
+
 /// Send a ban response with rendered template
 fn send_ban_response(
     request: &mut Request,
     template: &BanTemplate,
     client_ip: &IpAddr,
+    lookup: &LookupResult,
 ) -> Result<(), ()> {
     // Build template variables
     let mut vars = TemplateVariables::new();
     vars.client_ip = Some(client_ip.to_string());
+    vars.scenario = shm::get_scenario(lookup.scenario_id);
+    vars.reason = shm::get_reason(lookup.reason_id);
+    vars.origin = Some(lookup.origin.as_str().to_string());
+    if let Some(h) = realip::header_value_ci(request, "Host") {
+        let t = h.trim();
+        if !t.is_empty() {
+            vars.host = Some(t.to_string());
+        }
+    }
 
     // Get URI and method using Request API
     if let Ok(uri_str) = request.path().to_str() {

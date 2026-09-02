@@ -1,4 +1,4 @@
-use crate::config::{AppSecFailureAction, LocConfig};
+use crate::config::{AppSecFailureAction, LocConfig, MainConfig};
 use crate::handler::{HandlerResult, get_client_ip, handle_captcha_decision, send_raw_response};
 use ngx::http::{HTTPStatus, Method, Request};
 use serde::Deserialize;
@@ -41,7 +41,7 @@ fn failure(action: AppSecFailureAction) -> HandlerResult {
     }
 }
 
-pub fn inspect(request: &mut Request, loc: &LocConfig) -> HandlerResult {
+pub fn inspect(request: &mut Request, loc: &LocConfig, main_conf: &MainConfig) -> HandlerResult {
     let uri = request.unparsed_uri().to_str().unwrap_or("/");
     let internal_challenge = uri.starts_with("/crowdsec-internal/challenge/");
     if loc.appsec_enabled != Some(true) {
@@ -63,7 +63,7 @@ pub fn inspect(request: &mut Request, loc: &LocConfig) -> HandlerResult {
     let Some(config) = config else {
         return failure(failure_action);
     };
-    let Some(ip) = get_client_ip(request) else {
+    let Some(ip) = get_client_ip(request, main_conf) else {
         return failure(failure_action);
     };
     let content_length = request

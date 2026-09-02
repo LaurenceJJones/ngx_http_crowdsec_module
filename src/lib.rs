@@ -8,6 +8,8 @@ mod appsec;
 mod captcha;
 mod config;
 mod handler;
+mod metrics;
+mod realip;
 pub mod shm;
 mod stream;
 mod template;
@@ -56,6 +58,15 @@ impl Merge for LocConfig {
         if self.ban_template.is_none() {
             self.ban_template = prev.ban_template.clone();
         }
+        if self.ban_action.is_none() {
+            self.ban_action = prev.ban_action;
+        }
+        if self.ban_redirect_url.is_none() {
+            self.ban_redirect_url = prev.ban_redirect_url.clone();
+        }
+        if self.ban_redirect_code.is_none() {
+            self.ban_redirect_code = prev.ban_redirect_code;
+        }
         if self.captcha_template.is_none() {
             self.captcha_template = prev.captcha_template.clone();
         }
@@ -96,6 +107,9 @@ impl Merge for LocConfig {
         if self.bot_challenge_enabled.is_none() {
             self.bot_challenge_enabled = prev.bot_challenge_enabled;
         }
+        if self.metrics_enabled.is_none() {
+            self.metrics_enabled = prev.metrics_enabled;
+        }
         Ok(())
     }
 }
@@ -105,7 +119,8 @@ http_request_handler!(
     crowdsec_access_handler,
     |request: &mut ngx::http::Request| {
         let loc_conf = Module::location_conf(request).expect("module config is none");
-        let result = handle_access(request, loc_conf);
+        let main_conf = Module::main_conf(request).expect("crowdsec main conf missing");
+        let result = handle_access(request, loc_conf, main_conf);
         Status::from(result)
     }
 );
@@ -132,14 +147,20 @@ impl HttpModule for Module {
                 return Status::NGX_ERROR.into();
             }
 
+            if shm::init_metrics_shm_zone(cf).is_err() {
+                eprintln!(
+                    "crowdsec: warning: failed to init crowdsec_metrics shared zone; counters disabled"
+                );
+            }
+
             // Store configuration for worker init
             *GLOBAL_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) =
                 match (&conf.lapi_url, &conf.api_key) {
                     (Some(url), Some(key)) => Some(StreamClientConfig {
                         url: url.clone(),
                         api_key: key.clone(),
-                        poll_interval_secs: 10,
-                        timeout_secs: 30,
+                        poll_interval_secs: conf.poll_interval_secs.unwrap_or(10),
+                        timeout_secs: conf.lapi_timeout_secs.unwrap_or(30),
                         max_retries: conf.max_retries.unwrap_or(3),
                         retry_interval_secs: conf.retry_interval_secs.unwrap_or(5),
                     }),
