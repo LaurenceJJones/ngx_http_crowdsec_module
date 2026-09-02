@@ -20,8 +20,9 @@ jobs:
           token: ${{ github.token }}
       - name: Build and test module image
         run: docker build --pull --tag nginx-crowdsec:test --file docker/Dockerfile .
-      - name: Validate NGINX configuration
+      - name: Validate NGINX and decision enforcement
         run: |
+          set -euo pipefail
           docker network create crowdsec-ci
           docker run -d --name crowdsec --network crowdsec-ci \
             -e DISABLE_AGENT=true -e DISABLE_ONLINE_API=true \
@@ -38,3 +39,57 @@ jobs:
             nginx-crowdsec:test
           sleep 2
           docker exec nginx nginx -t
+
+          docker run -d --name client --network crowdsec-ci curlimages/curl:8.16.0 sleep 300
+          client_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' client)
+
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
+          docker exec crowdsec cscli decisions add --ip "$client_ip" --type ban --duration 2m
+          for i in {1..20}; do
+            code=$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)
+            [ "$code" = 403 ] && break
+            sleep 1
+          done
+          test "$code" = 403
+
+          docker exec crowdsec cscli decisions delete --ip "$client_ip"
+          for i in {1..20}; do
+            code=$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)
+            [ "$code" = 200 ] && break
+            sleep 1
+          done
+          test "$code" = 200
+
+          # Exercise poller hand-off and the CIDR boundary path after reload.
+          docker exec nginx nginx -s reload
+          sleep 2
+          docker exec crowdsec cscli decisions add --range "$client_ip/32" --type ban --duration 2m
+          for i in {1..20}; do
+            code=$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)
+            [ "$code" = 403 ] && break
+            sleep 1
+          done
+          test "$code" = 403
+          docker exec crowdsec cscli decisions delete --range "$client_ip/32"
+
+          for i in {1..20}; do
+            code=$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)
+            [ "$code" = 200 ] && break
+            sleep 1
+          done
+          test "$code" = 200
+
+          for i in {1..10}; do
+            docker exec nginx nginx -s reload
+            sleep 1
+            test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
+          done
+
+          # An unavailable LAPI must not block traffic when no cached decision exists.
+          docker stop crowdsec
+          sleep 11
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs nginx || true

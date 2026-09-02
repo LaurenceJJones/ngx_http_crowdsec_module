@@ -33,6 +33,12 @@ A high-performance NGINX dynamic module written in Rust that integrates [CrowdSe
 
 ## Quick Start with Docker
 
+> [!IMPORTANT]
+> NGINX dynamic modules are ABI-specific. A downloaded `.so` must match the
+> NGINX version, platform, architecture, and configure arguments listed in its
+> release compatibility file. Use the published container image when those do
+> not match your host.
+
 The easiest way to try the module is using Docker:
 
 ```bash

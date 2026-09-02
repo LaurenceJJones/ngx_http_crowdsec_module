@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/laurencejjones/ngx-http-crowdsec-module
+  NGINX_VERSION: 1.30.3
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image
+        run: |
+          docker build --pull \
+            --build-arg NGINX_VERSION="$NGINX_VERSION" \
+            --tag "$IMAGE:${GITHUB_REF_NAME}" \
+            --tag "$IMAGE:latest" \
+            --file docker/Dockerfile .
+      - name: Export module and compatibility information
+        run: |
+          container=$(docker create "$IMAGE:${GITHUB_REF_NAME}")
+          mkdir dist
+          docker cp "$container:/etc/nginx/modules/libngx_http_crowdsec_module.so" \
+            "dist/ngx_http_crowdsec_module-nginx-${NGINX_VERSION}-debian-bookworm-amd64.so"
+          docker rm "$container"
+          cat > dist/compatibility.txt <<EOF
+          NGINX_VERSION=${NGINX_VERSION}
+          DISTRIBUTION=debian-bookworm
+          ARCHITECTURE=amd64
+          RUST_VERSION=1.98
+          EOF
+          docker run --rm --entrypoint nginx "$IMAGE:${GITHUB_REF_NAME}" -V \
+            >> dist/compatibility.txt 2>&1
+          cd dist
+          sha256sum * > SHA256SUMS
+      - name: Publish container
+        run: docker push --all-tags "$IMAGE"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
