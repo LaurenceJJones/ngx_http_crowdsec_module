@@ -15,4 +15,4 @@ pub mod verifier;
 
 // Public API - only export what's used externally
 pub use config::{CaptchaConfig, CaptchaProvider, CookieSecure};
-pub use handler::{send_captcha_page, CaptchaHandler};
+pub use handler::{CaptchaHandler, send_captcha_page};

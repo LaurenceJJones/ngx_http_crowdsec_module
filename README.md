@@ -20,7 +20,7 @@ A high-performance NGINX dynamic module written in Rust that integrates [CrowdSe
 
 ### Build Requirements
 
-- Rust 1.98+ with Cargo
+- Rust 1.85+ with Cargo
 - NGINX source code (matching your target NGINX version)
 - Build tools: `gcc`, `make`, `clang`, `llvm`
 - Libraries: `libssl-dev`, `libpcre2-dev`, `zlib1g-dev`

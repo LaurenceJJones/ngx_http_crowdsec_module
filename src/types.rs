@@ -103,10 +103,7 @@ mod tests {
             simulated: None,
             uuid: None,
         };
-        assert_eq!(
-            decision.get_ip(),
-            Some("192.168.1.100".parse().unwrap())
-        );
+        assert_eq!(decision.get_ip(), Some("192.168.1.100".parse().unwrap()));
     }
 
     #[test]

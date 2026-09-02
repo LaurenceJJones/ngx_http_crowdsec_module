@@ -4,9 +4,9 @@
 //! captcha challenges and session management.
 
 use crate::captcha::config::CaptchaConfig;
-use crate::captcha::cookie::{build_set_cookie, get_cookie, is_https, SameSite};
+use crate::captcha::cookie::{SameSite, build_set_cookie, get_cookie, is_https};
 use crate::captcha::jwt::{CaptchaClaims, JwtManager};
-use crate::captcha::verifier::{verify_captcha, VerifyError, VerifyResult};
+use crate::captcha::verifier::{VerifyError, VerifyResult, verify_captcha};
 use crate::template::{BanTemplate, TemplateVariables};
 use ngx::core::{Buffer, Status};
 use ngx::ffi::ngx_http_request_t;
@@ -65,7 +65,10 @@ impl<'a> CaptchaHandler<'a> {
         };
 
         // Verify the JWT token
-        match self.jwt_manager.verify_and_validate(&token, ip_to_check.as_deref()) {
+        match self
+            .jwt_manager
+            .verify_and_validate(&token, ip_to_check.as_deref())
+        {
             Ok(_claims) => true,
             Err(e) => {
                 ngx_log_debug_http!(request, "crowdsec: invalid captcha session token: {}", e);
@@ -190,7 +193,10 @@ pub fn send_captcha_page(
 
     // Set headers
     request.add_header_out("Content-Type", "text/html; charset=utf-8");
-    request.add_header_out("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    request.add_header_out(
+        "Cache-Control",
+        "no-store, no-cache, must-revalidate, max-age=0",
+    );
     request.add_header_out("Pragma", "no-cache");
 
     // Get pool and raw request pointer
@@ -296,10 +302,7 @@ fn render_default_captcha_page(vars: &TemplateVariables, config: &CaptchaConfig)
         None => String::new(),
     };
 
-    let site_key = vars
-        .captcha_site_key
-        .as_deref()
-        .unwrap_or(&config.site_key);
+    let site_key = vars.captcha_site_key.as_deref().unwrap_or(&config.site_key);
     let script_url = vars
         .captcha_script_url
         .as_deref()

@@ -97,10 +97,7 @@ pub fn verify_captcha(
                     if verify_response.success {
                         VerifyResult::Success
                     } else {
-                        let errors = verify_response
-                            .error_codes
-                            .unwrap_or_default()
-                            .join(", ");
+                        let errors = verify_response.error_codes.unwrap_or_default().join(", ");
                         if errors.is_empty() {
                             VerifyResult::Failed("verification failed".to_string())
                         } else {

@@ -6,8 +6,8 @@
 use crate::shm::{self, CidrDecisionInfo, DecisionInfo, DecisionType, Origin};
 use crate::types::StreamResponse;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -138,8 +138,7 @@ impl StreamClient {
                 else {
                     eprintln!(
                         "crowdsec: cannot parse decision value '{}' (scope: {:?})",
-                        value,
-                        decision.scope
+                        value, decision.scope
                     );
                 }
             }
@@ -183,9 +182,7 @@ impl StreamClient {
                 else {
                     eprintln!(
                         "crowdsec: cannot parse decision value '{}' (scope: {:?}, type: {})",
-                        value,
-                        decision.scope,
-                        decision.decision_type
+                        value, decision.scope, decision.decision_type
                     );
                 }
             }

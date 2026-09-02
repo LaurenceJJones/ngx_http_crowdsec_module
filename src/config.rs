@@ -1,15 +1,14 @@
 use crate::captcha::{CaptchaConfig, CaptchaProvider, CookieSecure};
 use crate::template::BanTemplate;
-use ngx::core::{NgxStr, NGX_CONF_ERROR, NGX_CONF_OK};
+use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, NgxStr};
 use ngx::ffi::{
-    ngx_command_t, ngx_conf_t, ngx_str_t, ngx_uint_t, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF_OFFSET,
-    NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_SRV_CONF,
+    NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
+    NGX_HTTP_SRV_CONF, ngx_command_t, ngx_conf_t, ngx_str_t, ngx_uint_t,
 };
 use ngx::ngx_string;
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::os::raw::{c_char, c_void};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Default shared memory size (1MB)
 pub const DEFAULT_SHM_SIZE: usize = 1024 * 1024;
@@ -81,7 +80,10 @@ impl LocConfig {
             site_key,
             secret_key,
             signing_key,
-            cookie_name: self.captcha_cookie_name.clone().unwrap_or_else(|| "crowdsec_captcha".to_string()),
+            cookie_name: self
+                .captcha_cookie_name
+                .clone()
+                .unwrap_or_else(|| "crowdsec_captcha".to_string()),
             expiry_secs: self.captcha_expiry_secs.unwrap_or(3600),
             fail_open: self.captcha_fail_open.unwrap_or(true),
             bind_ip: self.captcha_bind_ip.unwrap_or(true),
@@ -94,7 +96,7 @@ impl LocConfig {
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_enable(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -126,7 +128,7 @@ pub extern "C" fn ngx_http_crowdsec_set_enable(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_url(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -155,7 +157,7 @@ pub extern "C" fn ngx_http_crowdsec_set_url(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_api_key(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -184,7 +186,7 @@ pub extern "C" fn ngx_http_crowdsec_set_api_key(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_max_retries(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -220,7 +222,7 @@ pub extern "C" fn ngx_http_crowdsec_set_max_retries(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_retry_interval(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -257,7 +259,7 @@ pub extern "C" fn ngx_http_crowdsec_set_retry_interval(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_shm_size(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -316,13 +318,14 @@ fn parse_size(s: &str) -> Option<usize> {
 /// Template cache to avoid re-parsing the same file multiple times
 /// Stores Arc<BanTemplate> so all locations using the same template file share one instance
 /// This is safe because configuration parsing happens in a single thread
-static TEMPLATE_CACHE: Lazy<Mutex<HashMap<String, Arc<BanTemplate>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<BanTemplate>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Directive handler for `crowdsec_ban_template <path>;`
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_ban_template(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -360,7 +363,10 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_template(
                     }
                     Err(e) => {
                         // Log error - in production would use ngx::log
-                        eprintln!("crowdsec: failed to load ban template from {}: {}", path_str, e);
+                        eprintln!(
+                            "crowdsec: failed to load ban template from {}: {}",
+                            path_str, e
+                        );
                         return NGX_CONF_ERROR;
                     }
                 }
@@ -377,7 +383,7 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_template(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_provider(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -415,7 +421,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_provider(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_site_key(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -442,7 +448,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_site_key(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_secret_key(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -470,7 +476,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_secret_key(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_signing_key(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -524,7 +530,7 @@ fn parse_hex_key(hex: &str) -> Option<[u8; 32]> {
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_cookie_name(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -551,7 +557,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_cookie_name(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_expiry(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -587,7 +593,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_expiry(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_fail_open(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -614,7 +620,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_fail_open(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_bind_ip(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -646,7 +652,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_bind_ip(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_cookie_secure(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -682,7 +688,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_cookie_secure(
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn ngx_http_crowdsec_set_captcha_template(
     cf: *mut ngx_conf_t,
     _cmd: *mut ngx_command_t,
@@ -704,22 +710,20 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_template(
 
         let template = match cache.get(path_str) {
             Some(cached_template) => Arc::clone(cached_template),
-            None => {
-                match BanTemplate::from_file(path_str) {
-                    Ok(template) => {
-                        let arc_template = Arc::new(template);
-                        cache.insert(path_str.to_string(), Arc::clone(&arc_template));
-                        arc_template
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "crowdsec: failed to load captcha template from {}: {}",
-                            path_str, e
-                        );
-                        return NGX_CONF_ERROR;
-                    }
+            None => match BanTemplate::from_file(path_str) {
+                Ok(template) => {
+                    let arc_template = Arc::new(template);
+                    cache.insert(path_str.to_string(), Arc::clone(&arc_template));
+                    arc_template
                 }
-            }
+                Err(e) => {
+                    eprintln!(
+                        "crowdsec: failed to load captcha template from {}: {}",
+                        path_str, e
+                    );
+                    return NGX_CONF_ERROR;
+                }
+            },
         };
 
         conf.captcha_template = Some(template);

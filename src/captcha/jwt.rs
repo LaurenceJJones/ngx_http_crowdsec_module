@@ -6,7 +6,7 @@
 //! - Expiration timestamp
 //! - Nonce for uniqueness
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
@@ -118,7 +118,7 @@ impl CaptchaClaims {
 /// Generate a random 16-byte nonce as hex string
 fn generate_nonce() -> String {
     let mut rng = rand::thread_rng();
-    let bytes: [u8; 16] = rng.gen();
+    let bytes: [u8; 16] = rng.r#gen();
     hex_encode(&bytes)
 }
 
@@ -306,8 +306,7 @@ impl JwtManager {
             std::str::from_utf8(&payload_bytes).map_err(|_| JwtError::InvalidPayload)?;
 
         // Parse claims
-        let claims =
-            CaptchaClaims::from_json(payload_str).ok_or(JwtError::InvalidPayload)?;
+        let claims = CaptchaClaims::from_json(payload_str).ok_or(JwtError::InvalidPayload)?;
 
         Ok(claims)
     }

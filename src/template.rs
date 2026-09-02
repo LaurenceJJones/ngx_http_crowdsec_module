@@ -175,8 +175,8 @@ impl BanTemplate {
     /// Content type is auto-detected from file extension
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path = path.as_ref();
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read template file: {}", e))?;
+        let content =
+            fs::read_to_string(path).map_err(|e| format!("Failed to read template file: {}", e))?;
         let content_type = Self::content_type_from_extension(path);
         Ok(Self::parse_with_content_type(&content, content_type))
     }
@@ -267,25 +267,46 @@ mod tests {
     fn test_parse_simple_text() {
         let template = BanTemplate::parse("Hello World");
         assert_eq!(template.segments.len(), 1);
-        assert_eq!(template.segments[0], TemplateSegment::Text("Hello World".to_string()));
+        assert_eq!(
+            template.segments[0],
+            TemplateSegment::Text("Hello World".to_string())
+        );
     }
 
     #[test]
     fn test_parse_with_variable() {
         let template = BanTemplate::parse("Your IP is {{client_ip}}");
         assert_eq!(template.segments.len(), 2);
-        assert_eq!(template.segments[0], TemplateSegment::Text("Your IP is ".to_string()));
-        assert_eq!(template.segments[1], TemplateSegment::Variable("client_ip".to_string()));
+        assert_eq!(
+            template.segments[0],
+            TemplateSegment::Text("Your IP is ".to_string())
+        );
+        assert_eq!(
+            template.segments[1],
+            TemplateSegment::Variable("client_ip".to_string())
+        );
     }
 
     #[test]
     fn test_parse_multiple_variables() {
         let template = BanTemplate::parse("IP: {{client_ip}}, Reason: {{reason}}");
         assert_eq!(template.segments.len(), 4);
-        assert_eq!(template.segments[0], TemplateSegment::Text("IP: ".to_string()));
-        assert_eq!(template.segments[1], TemplateSegment::Variable("client_ip".to_string()));
-        assert_eq!(template.segments[2], TemplateSegment::Text(", Reason: ".to_string()));
-        assert_eq!(template.segments[3], TemplateSegment::Variable("reason".to_string()));
+        assert_eq!(
+            template.segments[0],
+            TemplateSegment::Text("IP: ".to_string())
+        );
+        assert_eq!(
+            template.segments[1],
+            TemplateSegment::Variable("client_ip".to_string())
+        );
+        assert_eq!(
+            template.segments[2],
+            TemplateSegment::Text(", Reason: ".to_string())
+        );
+        assert_eq!(
+            template.segments[3],
+            TemplateSegment::Variable("reason".to_string())
+        );
     }
 
     #[test]
@@ -348,8 +369,10 @@ mod tests {
         assert_eq!(escape_html("\"quoted\""), "&quot;quoted&quot;");
         assert_eq!(escape_html("it's"), "it&#x27;s");
         assert_eq!(escape_html("normal text"), "normal text");
-        assert_eq!(escape_html("<script>alert('xss')</script>"),
-                   "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;");
+        assert_eq!(
+            escape_html("<script>alert('xss')</script>"),
+            "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;"
+        );
     }
 
     #[test]
@@ -368,7 +391,10 @@ mod tests {
         vars.request_uri = Some("/<script>alert('xss')</script>".to_string());
 
         let result = template.render(&vars);
-        assert_eq!(result, "<p>Path: /&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;</p>");
+        assert_eq!(
+            result,
+            "<p>Path: /&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;</p>"
+        );
         // Verify the script tag is NOT executable
         assert!(!result.contains("<script>"));
     }
@@ -377,7 +403,7 @@ mod tests {
     fn test_json_template_escapes() {
         let template = BanTemplate::parse_with_content_type(
             r#"{"uri": "{{request_uri}}"}"#,
-            "application/json"
+            "application/json",
         );
         let mut vars = TemplateVariables::new();
         vars.request_uri = Some("/path\"with\"quotes".to_string());
@@ -388,10 +414,7 @@ mod tests {
 
     #[test]
     fn test_plain_text_no_escape() {
-        let template = BanTemplate::parse_with_content_type(
-            "Path: {{request_uri}}",
-            "text/plain"
-        );
+        let template = BanTemplate::parse_with_content_type("Path: {{request_uri}}", "text/plain");
         let mut vars = TemplateVariables::new();
         vars.request_uri = Some("/<script>".to_string());
 
