@@ -6,7 +6,7 @@ This document provides guidance for AI assistants working on this codebase.
 
 **ngx_http_crowdsec_module** is a high-performance NGINX dynamic module written in Rust that integrates CrowdSec security into NGINX. It enables real-time IP-based threat enforcement through the CrowdSec Local API (LAPI).
 
-**Version**: `0.2.0-rc1` (see `Cargo.toml` and [CHANGELOG.md](CHANGELOG.md)).
+**Version**: `0.2.0-rc2` (see `Cargo.toml` and [CHANGELOG.md](CHANGELOG.md)).
 
 ### Current Status
 
@@ -14,7 +14,7 @@ This document provides guidance for AI assistants working on this codebase.
 - **Captcha flow**: Working (verification, JWT sessions, cookie handling, redirects)
 - **AppSec / bot challenge**: Working but experimental (`crowdsec_appsec`, `crowdsec_bot_challenge`; CrowdSec 1.8 protocol)
 - **Operational extras**: Trusted-proxy client IP (`realip.rs`), IP bypass lists, ban redirects, Prometheus metrics (`metrics.rs`), configurable `crowdsec_poll_interval` / `crowdsec_lapi_timeout`
-- **Goal**: Feature parity with [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer) — primary parity items landed in v0.2.0-rc1
+- **Goal**: Feature parity with [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer) — primary parity items landed in v0.2.0-rc2
 
 ### Supported Remediations
 

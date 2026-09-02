@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-rc2] - 2026-09-02
+
+Second release candidate: AppSec POST body inspection and metrics SHM reliability.
+
+### Added
+
+- **AppSec request body forwarding** — POST, PUT, PATCH, and DELETE bodies are buffered asynchronously and sent to the AppSec agent so form fields and JSON payloads are evaluated by the WAF (lua-cs-bouncer parity).
+- **`crowdsec_appsec_drop_unreadable_body`** — When `on`, reject requests whose body cannot be buffered in memory (e.g. spooled to disk) instead of calling AppSec without the body.
+- **Shared request body helpers** — `request_body.rs` centralizes async body reads for AppSec and captcha verification.
+
+### Fixed
+
+- **Metrics shared memory** — Zone size increased to 8KB so slab allocation succeeds on typical 4KB pages; init failure is non-fatal and disables counters instead of blocking module startup.
+
+### Changed
+
+- **CI** — AppSec integration test covers POST body forwarding via mock LAPI `check_body` matching.
+
 ## [0.2.0-rc1] - 2026-09-02
 
 Release candidate: major feature expansion since 0.1.0, combining upstream merges and local development work.
