@@ -4,6 +4,7 @@
 //! It uses the stream mode to efficiently sync decisions and checks incoming
 //! requests against a shared memory decision cache accessible by all workers.
 
+mod appsec;
 mod captcha;
 mod config;
 mod handler;
@@ -86,6 +87,15 @@ impl Merge for LocConfig {
         if self.captcha_cookie_secure.is_none() {
             self.captcha_cookie_secure = prev.captcha_cookie_secure;
         }
+        if self.appsec_enabled.is_none() {
+            self.appsec_enabled = prev.appsec_enabled;
+        }
+        if self.appsec_failure_action.is_none() {
+            self.appsec_failure_action = prev.appsec_failure_action;
+        }
+        if self.bot_challenge_enabled.is_none() {
+            self.bot_challenge_enabled = prev.bot_challenge_enabled;
+        }
         Ok(())
     }
 }
@@ -135,6 +145,18 @@ impl HttpModule for Module {
                     }),
                     _ => None,
                 };
+            appsec::configure(conf.appsec_url.as_ref().map(|url| {
+                appsec::AppSecConfig {
+                    url: url.clone(),
+                    api_key: conf
+                        .appsec_api_key
+                        .clone()
+                        .or_else(|| conf.api_key.clone())
+                        .unwrap_or_default(),
+                    timeout_ms: conf.appsec_timeout_ms.unwrap_or(1000),
+                    max_body_size: conf.appsec_max_body_size.unwrap_or(10 * 1024 * 1024),
+                }
+            }));
 
             // Register access phase handler
             let cf = &mut *cf;

@@ -26,6 +26,17 @@ pub struct MainConfig {
     pub retry_interval_secs: Option<u64>,
     /// Shared memory size in bytes (default: 1MB)
     pub shm_size: Option<usize>,
+    pub appsec_url: Option<String>,
+    pub appsec_api_key: Option<String>,
+    pub appsec_timeout_ms: Option<u64>,
+    pub appsec_max_body_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppSecFailureAction {
+    #[default]
+    Passthrough,
+    Deny,
 }
 
 /// Location configuration for CrowdSec module
@@ -58,6 +69,9 @@ pub struct LocConfig {
     pub captcha_bind_ip: Option<bool>,
     /// Cookie Secure flag setting (auto/on/off)
     pub captcha_cookie_secure: Option<CookieSecure>,
+    pub appsec_enabled: Option<bool>,
+    pub appsec_failure_action: Option<AppSecFailureAction>,
+    pub bot_challenge_enabled: Option<bool>,
 }
 
 impl LocConfig {
@@ -732,12 +746,112 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_template(
     NGX_CONF_OK
 }
 
+unsafe fn directive_value<'a>(cf: *mut ngx_conf_t) -> Option<&'a str> {
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        NgxStr::from_ngx_str(*args.add(1)).to_str().ok()
+    }
+}
+
+macro_rules! appsec_setter {
+    ($name:ident, $conf:ty, $body:expr) => {
+        pub extern "C" fn $name(
+            cf: *mut ngx_conf_t,
+            _cmd: *mut ngx_command_t,
+            conf: *mut c_void,
+        ) -> *mut c_char {
+            let Some(value) = (unsafe { directive_value(cf) }) else {
+                return NGX_CONF_ERROR;
+            };
+            let conf = unsafe { &mut *(conf as *mut $conf) };
+            if ($body)(conf, value) {
+                NGX_CONF_OK
+            } else {
+                NGX_CONF_ERROR
+            }
+        }
+    };
+}
+
+appsec_setter!(set_appsec_url, MainConfig, |c: &mut MainConfig, v: &str| {
+    if v.is_empty() {
+        return false;
+    }
+    c.appsec_url = Some(v.to_owned());
+    true
+});
+appsec_setter!(
+    set_appsec_api_key,
+    MainConfig,
+    |c: &mut MainConfig, v: &str| {
+        c.appsec_api_key = Some(v.to_owned());
+        !v.is_empty()
+    }
+);
+appsec_setter!(
+    set_appsec_timeout,
+    MainConfig,
+    |c: &mut MainConfig, v: &str| {
+        v.parse::<u64>()
+            .ok()
+            .filter(|n| (1..=30_000).contains(n))
+            .map(|n| c.appsec_timeout_ms = Some(n))
+            .is_some()
+    }
+);
+appsec_setter!(
+    set_appsec_max_body,
+    MainConfig,
+    |c: &mut MainConfig, v: &str| {
+        parse_size(v)
+            .filter(|n| *n > 0)
+            .map(|n| c.appsec_max_body_size = Some(n))
+            .is_some()
+    }
+);
+appsec_setter!(
+    set_appsec_enabled,
+    LocConfig,
+    |c: &mut LocConfig, v: &str| {
+        match v {
+            "on" => c.appsec_enabled = Some(true),
+            "off" => c.appsec_enabled = Some(false),
+            _ => return false,
+        };
+        true
+    }
+);
+appsec_setter!(
+    set_bot_challenge,
+    LocConfig,
+    |c: &mut LocConfig, v: &str| {
+        match v {
+            "on" => c.bot_challenge_enabled = Some(true),
+            "off" => c.bot_challenge_enabled = Some(false),
+            _ => return false,
+        };
+        true
+    }
+);
+appsec_setter!(
+    set_appsec_failure,
+    LocConfig,
+    |c: &mut LocConfig, v: &str| {
+        c.appsec_failure_action = match v {
+            "passthrough" => Some(AppSecFailureAction::Passthrough),
+            "deny" => Some(AppSecFailureAction::Deny),
+            _ => return false,
+        };
+        true
+    }
+);
+
 /// Generate the commands array for NGINX module registration
 ///
 /// Returns the static commands array for the module.
 /// The array is null-terminated with an empty command.
 #[rustfmt::skip]
-pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 18] = [
+pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 25] = [
     // crowdsec on|off; - enable/disable at location level
     ngx_command_t {
         name: ngx_string!("crowdsec"),
@@ -892,6 +1006,13 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 18] = [
         offset: 0,
         post: std::ptr::null_mut(),
     },
+    ngx_command_t { name: ngx_string!("crowdsec_appsec_url"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_url), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_appsec_api_key"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_api_key), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_appsec_timeout"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_timeout), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_appsec_max_body_size"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_max_body), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_appsec"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_enabled), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_appsec_failure_action"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_failure), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_bot_challenge"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_bot_challenge), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     // Null terminator
     ngx_command_t::empty(),
 ];

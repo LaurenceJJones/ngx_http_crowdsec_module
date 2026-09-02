@@ -26,6 +26,7 @@ jobs:
           docker network create crowdsec-ci
           mkdir -p "$RUNNER_TEMP/crowdsec-state"
           echo '{"new":[],"deleted":[]}' > "$RUNNER_TEMP/crowdsec-state/decisions.json"
+          echo '{"_status":200,"action":"allow"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
           docker run -d --name crowdsec --network crowdsec-ci \
             -v "$PWD/tests:/mock:ro" \
             -v "$RUNNER_TEMP/crowdsec-state:/state:ro" \
@@ -87,6 +88,18 @@ jobs:
             sleep 1
             test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
           done
+
+          echo '{"_status":403,"action":"ban","http_status":403}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 403
+
+          cat > "$RUNNER_TEMP/crowdsec-state/appsec.json" <<'EOF'
+          {"_status":403,"action":"challenge","http_status":200,"user_body_content":"<!doctype html><title>CrowdSec challenge</title>","user_headers":{"Content-Type":["text/html"],"Cache-Control":["no-store"]},"user_cookies":["__crowdsec_challenge=test; Path=/; HttpOnly; SameSite=Lax"]}
+          EOF
+          challenge=$(docker exec client curl -si http://nginx:8080/)
+          grep -q '200 OK' <<<"$challenge"
+          grep -qi 'Set-Cookie: __crowdsec_challenge=' <<<"$challenge"
+          grep -q 'CrowdSec challenge' <<<"$challenge"
+          echo '{"_status":200,"action":"allow"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
 
           # An unavailable LAPI must not block traffic when no cached decision exists.
           docker stop crowdsec
