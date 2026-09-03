@@ -116,6 +116,12 @@ impl Merge for LocConfig {
         if self.metrics_enabled.is_none() {
             self.metrics_enabled = prev.metrics_enabled;
         }
+
+        if let Err(msg) = self.validate_enforcement() {
+            eprintln!("crowdsec: {msg}");
+            return Err(MergeConfigError::NoValue);
+        }
+
         Ok(())
     }
 }
@@ -324,6 +330,7 @@ ngx_modules!(ngx_http_crowdsec_module);
 mod tests {
     use super::*;
     use crate::captcha::CookieSecure;
+    use crate::config::BanActionMode;
 
     #[test]
     fn location_merge_inherits_cookie_security() {
@@ -336,5 +343,29 @@ mod tests {
         child.merge(&parent).unwrap();
 
         assert_eq!(child.captcha_cookie_secure, Some(CookieSecure::On));
+    }
+
+    #[test]
+    fn merge_fails_when_crowdsec_on_without_ban_template() {
+        let parent = LocConfig::default();
+        let mut child = LocConfig {
+            enabled: Some(true),
+            ..Default::default()
+        };
+
+        assert!(child.merge(&parent).is_err());
+    }
+
+    #[test]
+    fn merge_allows_redirect_without_ban_template() {
+        let parent = LocConfig::default();
+        let mut child = LocConfig {
+            enabled: Some(true),
+            ban_action: Some(BanActionMode::Redirect),
+            ban_redirect_url: Some("https://example.com/blocked".to_string()),
+            ..Default::default()
+        };
+
+        assert!(child.merge(&parent).is_ok());
     }
 }

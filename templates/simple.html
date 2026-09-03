@@ -1,11 +1,36 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Access Denied</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access restricted</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #eef1f6;
+            color: #1c2b41;
+            margin: 0;
+            padding: 48px 24px;
+            line-height: 1.5;
+        }
+        main { max-width: 480px; margin: 0 auto; }
+        h1 { font-size: 1.25rem; font-weight: 600; margin-bottom: 8px; }
+        p { color: #5c6b7f; margin: 0 0 12px; font-size: 0.9375rem; }
+        code {
+            font-family: ui-monospace, Menlo, monospace;
+            font-size: 0.8125rem;
+            background: #fff;
+            border: 1px solid #d9e0ea;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+    </style>
 </head>
 <body>
-    <h1>Access Denied</h1>
-    <p>Your IP address ({{client_ip}}) has been blocked.</p>
-    <p>Request: {{request_method}} {{request_uri}}</p>
+    <main>
+        <h1>Access restricted</h1>
+        <p>Your IP address <code>{{client_ip}}</code> has been blocked.</p>
+        <p>Request: <code>{{request_method}} {{request_uri}}</code></p>
+    </main>
 </body>
 </html>

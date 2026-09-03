@@ -3,67 +3,125 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Access Denied</title>
+    <title>Access restricted</title>
     <style>
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            margin: 0;
-            padding: 0;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            color: #333;
+        :root {
+            --bg: #eef1f6;
+            --surface: #ffffff;
+            --border: #d9e0ea;
+            --text: #1c2b41;
+            --muted: #5c6b7f;
+            --accent: #1e4d8c;
+            --danger: #b42318;
+            --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         }
-        .container {
-            background: white;
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            line-height: 1.5;
+        }
+        .page { width: 100%; max-width: 520px; }
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(28, 43, 65, 0.06);
+            overflow: hidden;
+        }
+        .card-bar {
+            height: 4px;
+            background: linear-gradient(90deg, var(--danger), #d92d20);
+        }
+        .card-body { padding: 32px 28px 28px; }
+        .header {
+            display: flex;
+            gap: 14px;
+            align-items: flex-start;
+            margin-bottom: 16px;
+        }
+        .icon {
+            flex-shrink: 0;
+            width: 40px;
+            height: 40px;
             border-radius: 10px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            padding: 40px;
-            max-width: 500px;
-            text-align: center;
+            background: #fef3f2;
+            color: var(--danger);
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         h1 {
-            color: #e74c3c;
-            margin-top: 0;
-            font-size: 2.5em;
+            font-size: 1.375rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            margin-bottom: 4px;
         }
-        .info {
-            background: #f8f9fa;
-            border-left: 4px solid #e74c3c;
-            padding: 15px;
-            margin: 20px 0;
-            text-align: left;
-            border-radius: 4px;
+        .lead { color: var(--muted); font-size: 0.9375rem; }
+        .details {
+            margin-top: 24px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
         }
-        .info-item {
-            margin: 8px 0;
-            font-family: 'Courier New', monospace;
+        .row {
+            display: grid;
+            grid-template-columns: 9rem 1fr;
+            gap: 12px;
+            padding: 10px 14px;
+            font-size: 0.875rem;
+            border-top: 1px solid var(--border);
         }
-        .label {
-            font-weight: bold;
-            color: #555;
+        .row:first-child { border-top: 0; }
+        .row:nth-child(even) { background: #f8fafc; }
+        dt { color: var(--muted); font-weight: 500; }
+        dd { font-family: var(--mono); font-size: 0.8125rem; word-break: break-all; }
+        .footer {
+            margin-top: 20px;
+            font-size: 0.8125rem;
+            color: var(--muted);
+        }
+        @media (max-width: 480px) {
+            .row { grid-template-columns: 1fr; gap: 2px; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🚫 Access Denied</h1>
-        <p>Your access to this resource has been restricted.</p>
-        
-        <div class="info">
-            <div class="info-item">
-                <span class="label">IP Address:</span> {{client_ip}}
+    <main class="page">
+        <article class="card">
+            <div class="card-bar" aria-hidden="true"></div>
+            <div class="card-body">
+                <header class="header">
+                    <div class="icon" aria-hidden="true">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="12" cy="12" r="10"/>
+                            <line x1="12" y1="8" x2="12" y2="12"/>
+                            <line x1="12" y1="16" x2="12.01" y2="16"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h1>Access restricted</h1>
+                        <p class="lead">Your request was blocked by our security policy. If you believe this is an error, contact the site administrator.</p>
+                    </div>
+                </header>
+
+                <dl class="details">
+                    <div class="row"><dt>Client IP</dt><dd>{{client_ip}}</dd></div>
+                    <div class="row"><dt>Request</dt><dd>{{request_method}} {{request_uri}}</dd></div>
+                    <div class="row"><dt>Host</dt><dd>{{host}}</dd></div>
+                    <div class="row"><dt>Scenario</dt><dd>{{scenario}}</dd></div>
+                    <div class="row"><dt>Source</dt><dd>{{origin}}</dd></div>
+                </dl>
+
+                <p class="footer">Reference the details above when contacting support.</p>
             </div>
-            <div class="info-item">
-                <span class="label">Request:</span> {{request_method}} {{request_uri}}
-            </div>
-        </div>
-        
-        <p style="color: #666; font-size: 0.9em;">
-            If you believe this is an error, please contact the administrator.
-        </p>
-    </div>
+        </article>
+    </main>
 </body>
 </html>

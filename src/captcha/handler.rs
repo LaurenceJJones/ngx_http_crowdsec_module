@@ -8,7 +8,7 @@ use crate::captcha::cookie::{SameSite, build_set_cookie, get_cookie, is_https};
 use crate::captcha::jwt::{CaptchaClaims, JwtManager};
 use crate::captcha::verifier::{VerifyError, VerifyResult, verify_captcha};
 use crate::shm;
-use crate::template::{BanTemplate, TemplateVariables};
+use crate::template::{Template, TemplateVariables};
 use ngx::core::{Buffer, Status};
 use ngx::ffi::ngx_http_request_t;
 use ngx::http::{HTTPStatus, Request};
@@ -33,12 +33,12 @@ pub enum CaptchaHandlerResult {
 pub struct CaptchaHandler<'a> {
     config: &'a CaptchaConfig,
     jwt_manager: JwtManager,
-    template: Option<&'a Arc<BanTemplate>>,
+    template: Option<&'a Arc<Template>>,
 }
 
 impl<'a> CaptchaHandler<'a> {
     /// Create a new captcha handler
-    pub fn new(config: &'a CaptchaConfig, template: Option<&'a Arc<BanTemplate>>) -> Self {
+    pub fn new(config: &'a CaptchaConfig, template: Option<&'a Arc<Template>>) -> Self {
         Self {
             config,
             jwt_manager: JwtManager::new(config.signing_key),
@@ -151,7 +151,7 @@ impl<'a> CaptchaHandler<'a> {
 pub fn send_captcha_page(
     request: &mut Request,
     config: &CaptchaConfig,
-    template: Option<&Arc<BanTemplate>>,
+    template: Option<&Arc<Template>>,
     client_ip: &IpAddr,
     error_message: Option<&str>,
 ) -> Result<(), ()> {
@@ -171,17 +171,12 @@ pub fn send_captcha_page(
     vars.captcha_div_class = Some(config.provider.div_class().to_string());
     vars.captcha_error = error_message.map(|s| s.to_string());
 
-    // Form action is the current URI
-    if let Ok(uri_str) = request.path().to_str() {
-        vars.form_action = Some(uri_str.to_string());
-    }
+    // Form action is the current URI (include query string)
+    vars.form_action = Some(captcha_return_uri(request));
 
-    // Get body from template or use default
-    let body = if let Some(tpl) = template {
-        tpl.render(&vars)
-    } else {
-        render_default_captcha_page(&vars, config)
-    };
+    // Render captcha page from the configured template file (required at config time).
+    let tpl = template.ok_or(())?;
+    let body = tpl.render(&vars);
 
     // Set status code (200 for captcha page)
     request.set_status(HTTPStatus::OK);
@@ -249,6 +244,30 @@ pub fn send_captcha_page(
     Ok(())
 }
 
+/// URI the client should return to after captcha (path + query string).
+pub fn captcha_return_uri(request: &Request) -> String {
+    request
+        .unparsed_uri()
+        .to_str()
+        .unwrap_or("/")
+        .to_string()
+}
+
+/// 303 redirect so the client repeats the request as GET (for static origins that reject POST).
+pub fn send_see_other_redirect(request: &mut Request, redirect_uri: &str) -> Result<(), ()> {
+    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
+    request.set_status(HTTPStatus::SEE_OTHER);
+    request.set_content_length_n(0);
+    request.discard_request_body();
+    request.add_header_out("Location", redirect_uri);
+    request.add_header_out("Cache-Control", "no-store, no-cache, must-revalidate");
+    let header_status = request.send_header();
+    unsafe {
+        ngx::ffi::ngx_http_finalize_request(r, header_status.into());
+    }
+    Ok(())
+}
+
 /// Send a redirect response after successful captcha verification
 pub fn send_captcha_success_redirect(
     request: &mut Request,
@@ -272,10 +291,8 @@ pub fn send_captcha_success_redirect(
         SameSite::Lax,
     );
 
-    // Set redirect status (302 Found)
-    unsafe {
-        (*r).headers_out.status = 302;
-    }
+    // 303 See Other — follow-up must be GET (static sites often reject POST)
+    request.set_status(HTTPStatus::SEE_OTHER);
     request.set_content_length_n(0);
 
     // Discard request body
@@ -297,180 +314,34 @@ pub fn send_captcha_success_redirect(
     Ok(())
 }
 
-/// Render the default captcha page when no template is configured
-fn render_default_captcha_page(vars: &TemplateVariables, config: &CaptchaConfig) -> String {
-    let error_html = match &vars.captcha_error {
-        Some(err) => format!(r#"<div class="error">{}</div>"#, escape_html(err)),
-        None => String::new(),
-    };
-
-    let site_key = vars.captcha_site_key.as_deref().unwrap_or(&config.site_key);
-    let script_url = vars
-        .captcha_script_url
-        .as_deref()
-        .unwrap_or(config.provider.script_url());
-    let div_class = vars
-        .captcha_div_class
-        .as_deref()
-        .unwrap_or(config.provider.div_class());
-    let form_action = vars.form_action.as_deref().unwrap_or("/");
-
-    format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Security Check</title>
-    <script src="{script_url}" async defer></script>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }}
-        .container {{
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            padding: 40px;
-            max-width: 420px;
-            width: 100%;
-            text-align: center;
-        }}
-        .icon {{
-            font-size: 48px;
-            margin-bottom: 20px;
-        }}
-        h1 {{
-            color: #333;
-            font-size: 24px;
-            margin-bottom: 12px;
-        }}
-        p {{
-            color: #666;
-            margin-bottom: 24px;
-            line-height: 1.5;
-        }}
-        .error {{
-            background: #fee2e2;
-            border: 1px solid #fca5a5;
-            color: #dc2626;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            font-size: 14px;
-        }}
-        .captcha-wrapper {{
-            display: flex;
-            justify-content: center;
-            margin: 24px 0;
-        }}
-        button {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 14px 32px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 16px;
-            font-weight: 500;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }}
-        button:hover {{
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
-        }}
-        button:active {{
-            transform: translateY(0);
-        }}
-        .footer {{
-            margin-top: 24px;
-            font-size: 12px;
-            color: #999;
-        }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="icon">🛡️</div>
-        <h1>Security Check</h1>
-        <p>Please complete the challenge below to continue to the site.</p>
-        {error_html}
-        <form method="POST" action="{form_action}">
-            <div class="captcha-wrapper">
-                <div class="{div_class}" data-sitekey="{site_key}"></div>
-            </div>
-            <button type="submit">Continue</button>
-        </form>
-        <div class="footer">Protected by CrowdSec</div>
-    </div>
-</body>
-</html>"#,
-        script_url = script_url,
-        error_html = error_html,
-        form_action = escape_html(form_action),
-        div_class = div_class,
-        site_key = escape_html(site_key),
-    )
-}
-
-/// Escape HTML special characters
-fn escape_html(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => result.push_str("&amp;"),
-            '<' => result.push_str("&lt;"),
-            '>' => result.push_str("&gt;"),
-            '"' => result.push_str("&quot;"),
-            '\'' => result.push_str("&#x27;"),
-            _ => result.push(c),
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_escape_html() {
-        assert_eq!(escape_html("<script>"), "&lt;script&gt;");
-        assert_eq!(escape_html("a & b"), "a &amp; b");
-        assert_eq!(escape_html("\"quoted\""), "&quot;quoted&quot;");
-    }
-
-    #[test]
-    fn test_default_captcha_page_contains_elements() {
-        let config = CaptchaConfig::default();
+    fn test_captcha_template_renders_site_key() {
+        let tpl = Template::parse(
+            r#"<form action="{{form_action}}"><div class="{{captcha_div_class}}" data-sitekey="{{captcha_site_key}}"></div></form>"#,
+        );
         let mut vars = TemplateVariables::new();
         vars.captcha_site_key = Some("test-site-key".to_string());
+        vars.captcha_div_class = Some("h-captcha".to_string());
         vars.form_action = Some("/test".to_string());
 
-        let page = render_default_captcha_page(&vars, &config);
+        let page = tpl.render(&vars);
 
-        assert!(page.contains("Security Check"));
         assert!(page.contains("test-site-key"));
         assert!(page.contains("/test"));
-        assert!(page.contains("CrowdSec"));
     }
 
     #[test]
-    fn test_default_captcha_page_with_error() {
-        let config = CaptchaConfig::default();
+    fn test_captcha_template_renders_error_variable() {
+        let tpl = Template::parse(r#"{{captcha_error}}"#);
         let mut vars = TemplateVariables::new();
         vars.captcha_error = Some("Verification failed".to_string());
 
-        let page = render_default_captcha_page(&vars, &config);
+        let page = tpl.render(&vars);
 
         assert!(page.contains("Verification failed"));
-        assert!(page.contains("class=\"error\""));
     }
 }

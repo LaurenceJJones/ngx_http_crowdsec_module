@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-03
+
+Patch release: required ban/captcha templates, captcha static-site fix, and template cleanup validated in production.
+
+### Added
+
+- **Template deploy helper** — `scripts/deploy-templates.example.sh` (copy to a gitignored `*.local.sh` with your host).
+- **Config validation** — `nginx -t` fails when `crowdsec on` has no `crowdsec_ban_template` (unless redirect mode), or captcha keys are set without `crowdsec_captcha_template`.
+
+### Changed
+
+- **Ban/captcha templates** — Redesigned `default.html`, `simple.html`, `captcha.html`, and `api.json`; no built-in HTML fallback in the module.
+- **Template variables** — Dropped `{{reason}}`; use `{{scenario}}` only (CrowdSec stores cscli `--reason` and scenario names in `scenario`).
+- **Captcha POST handling** — 303 See Other after successful verification so POST is not forwarded to static backends.
+- **Shared memory** — Layout v3 (reason table removed); **full nginx restart** required after upgrade, not `reload` only.
+
 ## [0.2.0] - 2026-09-03
 
 First stable 0.2 release. Combines the rc1–rc3 feature set (AppSec with POST body inspection, captcha, Prometheus metrics, bypass lists, ban redirects, trusted-proxy client IP) with rc3 stability fixes validated in production.

@@ -2,10 +2,27 @@
 
 This directory contains example ban templates that can be used with the `crowdsec_ban_template` directive.
 
+## Template files (required)
+
+There are **no built-in HTML pages** in the module. `nginx -t` fails if:
+
+- `crowdsec on` is set without `crowdsec_ban_template` (unless `crowdsec_ban_action redirect` with a redirect URL), or
+- Captcha provider keys are configured without `crowdsec_captcha_template`.
+
+Copy and customize the examples in this directory, then point nginx at them:
+
+```nginx
+crowdsec_ban_template /etc/nginx/templates/default.html;
+crowdsec_captcha_template /etc/nginx/templates/captcha.html;  # when using captcha
+```
+
+To upload templates to a remote host for testing, copy `scripts/deploy-templates.example.sh` to `scripts/deploy-templates.local.sh` (gitignored), set your host, and run it.
+
 ## Available Templates
 
-- **default.html** - A modern, styled HTML page with gradient background and card layout
-- **simple.html** - A basic HTML template with minimal styling
+- **default.html** - Corporate ban page (light card layout, structured request details)
+- **captcha.html** - Corporate captcha challenge page (matches built-in fallback styling)
+- **simple.html** - Lightweight corporate HTML for quick overrides
 - **minimal.html** - The simplest possible template
 - **api.json** - A JSON response template (useful for API endpoints)
 
@@ -16,8 +33,7 @@ All templates support the following variables using `{{variable_name}}` syntax:
 - `{{client_ip}}` - The client's IP address that was blocked
 - `{{request_method}}` - The HTTP method (GET, POST, etc.)
 - `{{request_uri}}` - The requested URI path
-- `{{reason}}` - Ban reason from CrowdSec when the stream includes it (stored in SHM; long reasons are truncated to 127 bytes)
-- `{{scenario}}` - CrowdSec scenario name when the stream provided one
+- `{{scenario}}` - CrowdSec scenario (includes cscli `--reason` text; stored in SHM, truncated to 127 bytes)
 - `{{origin}}` - Where the decision came from (`crowdsec`, `cscli`, `capi`, `console`, `lists`, `unknown`)
 - `{{host}}` - The request's `Host` header (useful behind reverse proxies)
 

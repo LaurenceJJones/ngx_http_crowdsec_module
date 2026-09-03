@@ -28,7 +28,7 @@ const SHM_MAGIC: u32 = u32::from_le_bytes(*b"CsD1");
 
 /// Increment when `ShmData` / `ShmHashEntry` / string table layout changes incompatibly.
 /// Reload reuses the zone pointer only when this matches; otherwise require a full restart.
-const SHM_LAYOUT_VERSION: u32 = 2;
+const SHM_LAYOUT_VERSION: u32 = 3;
 
 /// Percentage of SHM to use for entries (rest is overhead)
 const USABLE_MEMORY_PERCENT: usize = 70;
@@ -204,9 +204,6 @@ impl ShmScenario {
     }
 }
 
-/// Ban `reason` strings use the same packed representation as scenarios.
-pub type ShmReason = ShmScenario;
-
 /// Hash table entry for IP decisions
 /// Stores both individual IPs and CIDR ranges in the same table
 /// Supports multiple decision types per IP via bitmask
@@ -236,8 +233,6 @@ pub struct ShmHashEntry {
     pub expires: i64,
     /// Scenario ID (index into scenario table), 0 = no scenario
     pub scenario_id: u16,
-    /// Ban reason ID (index into reason table), 0 = no reason stored
-    pub reason_id: u16,
 }
 
 impl ShmHashEntry {
@@ -253,7 +248,6 @@ impl ShmHashEntry {
             addr: [0; 16],
             expires: 0,
             scenario_id: 0,
-            reason_id: 0,
         }
     }
 
@@ -359,7 +353,6 @@ pub struct DecisionInfo<'a> {
     pub decision_type: DecisionType,
     pub origin: Origin,
     pub scenario: Option<&'a str>,
-    pub reason: Option<&'a str>,
     pub duration_secs: Option<i64>,
 }
 
@@ -371,7 +364,6 @@ pub struct CidrDecisionInfo<'a> {
     pub decision_type: DecisionType,
     pub origin: Origin,
     pub scenario: Option<&'a str>,
-    pub reason: Option<&'a str>,
     pub duration_secs: Option<i64>,
 }
 
@@ -390,8 +382,6 @@ pub struct ShmData {
     pub capacity: u32,
     /// Number of scenarios in the table
     pub scenario_count: u16,
-    /// Number of ban-reason strings in the table
-    pub reason_count: u16,
     /// Version counter (incremented on updates)
     pub version: u64,
     /// Clock hand for LRU eviction
@@ -402,8 +392,6 @@ pub struct ShmData {
     entries_offset: usize,
     /// Byte offset from this header to the scenario table.
     scenarios_offset: usize,
-    /// Byte offset from this header to the deduplicated ban-reason table.
-    reasons_offset: usize,
     /// Prefix lengths that have been seen. Stale bits are harmless and avoid
     /// maintaining counters on the update path.
     cidr_prefixes: [u64; 3],
@@ -601,9 +589,9 @@ unsafe extern "C" fn shm_zone_init(
         let scenario_size = std::mem::size_of::<ShmScenario>();
         let header_size = std::mem::size_of::<ShmData>();
 
-        // Reserve memory for header and two string tables (scenarios + ban reasons)
+        // Reserve memory for header and scenario string table
         let string_table_bytes = scenario_size * MAX_SCENARIOS;
-        let fixed_overhead = header_size + string_table_bytes * 2;
+        let fixed_overhead = header_size + string_table_bytes;
 
         // Use remaining memory for hash table (with safety margin for slab allocator overhead)
         let available_for_entries =
@@ -644,14 +632,6 @@ unsafe extern "C" fn shm_zone_init(
             return ngx::ffi::NGX_ERROR as ngx_int_t;
         }
 
-        // Allocate ban-reason table (same row size as scenarios)
-        let reasons_size = scenario_size * MAX_SCENARIOS;
-        let reasons_ptr = ngx_slab_alloc_locked(shpool, reasons_size);
-        if reasons_ptr.is_null() {
-            eprintln!("crowdsec: failed to allocate SHM reason table");
-            return ngx::ffi::NGX_ERROR as ngx_int_t;
-        }
-
         // Initialize the data structure
         let shm_data = header_ptr as *mut ShmData;
         (*shm_data).magic = SHM_MAGIC;
@@ -661,19 +641,16 @@ unsafe extern "C" fn shm_zone_init(
         (*shm_data).count = 0;
         (*shm_data).capacity = capacity;
         (*shm_data).scenario_count = 0;
-        (*shm_data).reason_count = 0;
         (*shm_data).version = 0;
         (*shm_data).clock_hand = 0;
         (*shm_data).eviction_count = 0;
         (*shm_data).entries_offset = (entries_ptr as usize).wrapping_sub(header_ptr as usize);
         (*shm_data).scenarios_offset = (scenarios_ptr as usize).wrapping_sub(header_ptr as usize);
-        (*shm_data).reasons_offset = (reasons_ptr as usize).wrapping_sub(header_ptr as usize);
         (*shm_data).cidr_prefixes = [0; 3];
 
-        // Zero out entries and string tables
+        // Zero out entries and scenario table
         ptr::write_bytes(entries_ptr as *mut ShmHashEntry, 0, capacity as usize);
         ptr::write_bytes(scenarios_ptr as *mut ShmScenario, 0, MAX_SCENARIOS);
-        ptr::write_bytes(reasons_ptr as *mut ShmReason, 0, MAX_SCENARIOS);
 
         (*shm_zone).data = header_ptr;
 
@@ -719,12 +696,6 @@ unsafe fn mark_prefix_present(shm_data: *mut ShmData, prefix: u8) {
         let prefix = prefix as usize;
         (*shm_data).cidr_prefixes[prefix / 64] |= 1u64 << (prefix % 64);
     }
-}
-
-/// Get ban-reason strings array from shared memory data
-#[inline]
-unsafe fn get_reasons(shm_data: *mut ShmData) -> *mut ShmReason {
-    unsafe { (shm_data as usize).wrapping_add((*shm_data).reasons_offset) as *mut ShmReason }
 }
 
 /// Find or create a scenario ID for the given scenario string
@@ -781,60 +752,12 @@ pub fn get_scenario(scenario_id: u16) -> Option<String> {
     }
 }
 
-/// Find or create a reason ID for the given ban reason string.
-/// Must be called with write lock held. Returns 1-based ID, or 0 if the table is full.
-unsafe fn get_or_create_reason_id(shm_data: *mut ShmData, reason: &str) -> u16 {
-    let reasons = get_reasons(shm_data);
-    let count = (*shm_data).reason_count as usize;
-
-    for i in 0..count {
-        let entry = &*reasons.add(i);
-        if entry.matches(reason) {
-            return (i + 1) as u16;
-        }
-    }
-
-    if count < MAX_SCENARIOS {
-        let entry = &mut *reasons.add(count);
-        *entry = ShmScenario::from_str(reason);
-        (*shm_data).reason_count += 1;
-        return (count + 1) as u16;
-    }
-
-    0
-}
-
-/// Get ban reason text by ID (`0` = none).
-pub fn get_reason(reason_id: u16) -> Option<String> {
-    if reason_id == 0 {
-        return None;
-    }
-
-    let shm_data = get_shm_data()?;
-
-    unsafe {
-        ngx_rwlock_rlock(&mut (*shm_data).lock);
-
-        let result = if (reason_id as usize) <= (*shm_data).reason_count as usize {
-            let reasons = get_reasons(shm_data);
-            let entry = &*reasons.add(reason_id as usize - 1);
-            Some(entry.as_str().to_string())
-        } else {
-            None
-        };
-
-        ngx_rwlock_unlock(&mut (*shm_data).lock);
-        result
-    }
-}
-
 /// Result of looking up an IP in shared memory
 pub struct LookupResult {
     pub found: bool,
     pub decision_type: DecisionType,
     pub origin: Origin,
     pub scenario_id: u16,
-    pub reason_id: u16,
 }
 
 /// Find entry by hash using linear probing
@@ -976,7 +899,6 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
                 decision_type: DecisionType::Unknown,
                 origin: Origin::Unknown,
                 scenario_id: 0,
-                reason_id: 0,
             };
         }
     };
@@ -1003,7 +925,6 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
                     decision_type: entry.decision_type(),
                     origin: entry.origin(),
                     scenario_id: entry.scenario_id,
-                    reason_id: entry.reason_id,
                 };
                 ngx_rwlock_unlock(&mut (*shm_data).lock);
                 return result;
@@ -1047,7 +968,6 @@ unsafe fn lookup_cidr_v4(
                         decision_type: entry.decision_type(),
                         origin: entry.origin(),
                         scenario_id: entry.scenario_id,
-                        reason_id: entry.reason_id,
                     };
                 }
             }
@@ -1058,7 +978,6 @@ unsafe fn lookup_cidr_v4(
             decision_type: DecisionType::Unknown,
             origin: Origin::Unknown,
             scenario_id: 0,
-            reason_id: 0,
         }
     }
 }
@@ -1089,7 +1008,6 @@ unsafe fn lookup_cidr_v6(
                         decision_type: entry.decision_type(),
                         origin: entry.origin(),
                         scenario_id: entry.scenario_id,
-                        reason_id: entry.reason_id,
                     };
                 }
             }
@@ -1100,7 +1018,6 @@ unsafe fn lookup_cidr_v6(
             decision_type: DecisionType::Unknown,
             origin: Origin::Unknown,
             scenario_id: 0,
-            reason_id: 0,
         }
     }
 }
@@ -1137,11 +1054,6 @@ pub fn add_decision(info: &DecisionInfo) {
             .map(|s| get_or_create_scenario_id(shm_data, s))
             .unwrap_or(0);
 
-        let reason_id = info
-            .reason
-            .map(|r| get_or_create_reason_id(shm_data, r))
-            .unwrap_or(0);
-
         let hash = hash_ip(info.ip);
         let decision_bit = info.decision_type.to_bit();
 
@@ -1164,9 +1076,6 @@ pub fn add_decision(info: &DecisionInfo) {
             if scenario_id != 0 {
                 entry.scenario_id = scenario_id;
             }
-            if reason_id != 0 {
-                entry.reason_id = reason_id;
-            }
             (*shm_data).version += 1;
             ngx_rwlock_unlock(&mut (*shm_data).lock);
             return;
@@ -1179,7 +1088,6 @@ pub fn add_decision(info: &DecisionInfo) {
         new_entry.origin = info.origin as u8;
         new_entry.expires = expires;
         new_entry.scenario_id = scenario_id;
-        new_entry.reason_id = reason_id;
         new_entry.flags = 0;
 
         match info.ip {
@@ -1249,11 +1157,6 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
             .map(|s| get_or_create_scenario_id(shm_data, s))
             .unwrap_or(0);
 
-        let reason_id = info
-            .reason
-            .map(|r| get_or_create_reason_id(shm_data, r))
-            .unwrap_or(0);
-
         let hash = hash_cidr(info.family, info.prefix_len, info.network);
         let decision_bit = info.decision_type.to_bit();
 
@@ -1281,9 +1184,6 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
             if scenario_id != 0 {
                 entry.scenario_id = scenario_id;
             }
-            if reason_id != 0 {
-                entry.reason_id = reason_id;
-            }
             (*shm_data).version += 1;
             ngx_rwlock_unlock(&mut (*shm_data).lock);
             return;
@@ -1298,7 +1198,6 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         new_entry.origin = info.origin as u8;
         new_entry.expires = expires;
         new_entry.scenario_id = scenario_id;
-        new_entry.reason_id = reason_id;
         new_entry.flags = FLAG_IS_CIDR;
 
         let len = if info.family == 4 { 4 } else { 16 };
@@ -1333,7 +1232,6 @@ pub fn add_ban(ip: &IpAddr, duration_secs: Option<i64>) {
         decision_type: DecisionType::Ban,
         origin: Origin::Unknown,
         scenario: None,
-        reason: None,
         duration_secs,
     });
 }

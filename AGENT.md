@@ -18,7 +18,7 @@ This document provides guidance for AI assistants working on this codebase.
 
 ### Supported Remediations
 
-- **Ban**: 403 with customizable template, or HTTP redirect via `crowdsec_ban_action redirect` (template variables include `{{reason}}`, `{{scenario}}`, `{{origin}}`, `{{host}}`, plus `client_ip` / request fields)
+- **Ban**: 403 with customizable template, or HTTP redirect via `crowdsec_ban_action redirect` (template variables include `{{scenario}}`, `{{origin}}`, `{{host}}`, plus `client_ip` / request fields)
 - **Captcha**: Challenges user with hCaptcha, reCAPTCHA, or Cloudflare Turnstile
 - **AppSec**: Request inspection against CrowdSec AppSec component; may allow, ban, or emit bot challenge responses
 
@@ -101,7 +101,7 @@ src/
 ├── handler.rs          # Main access phase handler (ban/captcha/appsec routing)
 ├── metrics.rs          # Prometheus text metrics location
 ├── realip.rs           # Trusted-proxy client IP (X-Forwarded-For, etc.)
-├── template.rs         # Ban page template rendering (incl. {{reason}})
+├── template.rs         # Ban page template rendering (incl. {{scenario}})
 ├── shm.rs              # Shared memory (decision cache, metrics zone, layout magic/version)
 ├── store.rs            # Decision storage (hash table + CIDR)
 ├── stream.rs           # CrowdSec LAPI streaming client (background thread)

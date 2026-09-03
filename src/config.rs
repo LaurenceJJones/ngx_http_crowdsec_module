@@ -1,6 +1,6 @@
 use crate::captcha::{CaptchaConfig, CaptchaProvider, CookieSecure};
 use crate::realip::TrustedCidr;
-use crate::template::BanTemplate;
+use crate::template::Template;
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, NgxStr};
 use ngx::ffi::{
     NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
@@ -69,7 +69,7 @@ pub struct LocConfig {
     /// Whether CrowdSec checking is enabled for this location
     pub enabled: Option<bool>,
     /// Ban template for rendering 403 responses
-    pub ban_template: Option<Arc<BanTemplate>>,
+    pub ban_template: Option<Arc<Template>>,
     /// Ban remediation: `block` (403) or `redirect` (to `ban_redirect_url`)
     pub ban_action: Option<BanActionMode>,
     /// URL for ban redirect (only used when `ban_action` is `redirect`)
@@ -79,7 +79,7 @@ pub struct LocConfig {
     /// When true, this location serves Prometheus text metrics (use a dedicated location).
     pub metrics_enabled: Option<bool>,
     /// Captcha template for rendering captcha challenge pages
-    pub captcha_template: Option<Arc<BanTemplate>>,
+    pub captcha_template: Option<Arc<Template>>,
 
     // === Captcha configuration (inheritable at server/location level) ===
     /// Captcha provider (hcaptcha, turnstile, recaptcha)
@@ -134,6 +134,29 @@ impl LocConfig {
             bind_ip: self.captcha_bind_ip.unwrap_or(true),
             cookie_secure: self.captcha_cookie_secure.unwrap_or(CookieSecure::Auto),
         })
+    }
+
+    /// Validate location config when `crowdsec on`. Called after merge inheritance.
+    pub fn validate_enforcement(&self) -> Result<(), &'static str> {
+        if self.enabled != Some(true) {
+            return Ok(());
+        }
+
+        if self.ban_action != Some(BanActionMode::Redirect) && self.ban_template.is_none() {
+            return Err(
+                "crowdsec on requires crowdsec_ban_template (or crowdsec_ban_action redirect with crowdsec_ban_redirect_url)",
+            );
+        }
+
+        if self.ban_action == Some(BanActionMode::Redirect) && self.ban_redirect_url.is_none() {
+            return Err("crowdsec_ban_action redirect requires crowdsec_ban_redirect_url");
+        }
+
+        if self.captcha_config().is_some() && self.captcha_template.is_none() {
+            return Err("captcha settings require crowdsec_captcha_template");
+        }
+
+        Ok(())
     }
 }
 
@@ -583,9 +606,9 @@ fn parse_size(s: &str) -> Option<usize> {
 }
 
 /// Template cache to avoid re-parsing the same file multiple times
-/// Stores Arc<BanTemplate> so all locations using the same template file share one instance
+/// Stores Arc<Template> so all locations using the same template file share one instance
 /// This is safe because configuration parsing happens in a single thread
-static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<BanTemplate>>>> =
+static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<Template>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Directive handler for `crowdsec_ban_template <path>;`
@@ -621,7 +644,7 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_template(
             }
             None => {
                 // Load and parse the template file
-                match BanTemplate::from_file(path_str) {
+                match Template::from_file(path_str) {
                     Ok(template) => {
                         // Wrap in Arc and cache for future use
                         let arc_template = Arc::new(template);
@@ -1138,7 +1161,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_template(
 
         let template = match cache.get(path_str) {
             Some(cached_template) => Arc::clone(cached_template),
-            None => match BanTemplate::from_file(path_str) {
+            None => match Template::from_file(path_str) {
                 Ok(template) => {
                     let arc_template = Arc::new(template);
                     cache.insert(path_str.to_string(), Arc::clone(&arc_template));

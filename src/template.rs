@@ -64,13 +64,13 @@ pub enum EscapeMode {
 pub enum TemplateSegment {
     /// Static text content
     Text(String),
-    /// Variable placeholder (e.g., "client_ip", "reason")
+    /// Variable placeholder (e.g., "client_ip", "scenario")
     Variable(String),
 }
 
-/// Parsed template with segments and content type
+/// Parsed response template with `{{variable}}` substitution (ban pages, captcha pages, JSON APIs).
 #[derive(Debug, Clone)]
-pub struct BanTemplate {
+pub struct Template {
     segments: Vec<TemplateSegment>,
     /// Content-Type header value (auto-detected from file extension)
     content_type: String,
@@ -78,7 +78,7 @@ pub struct BanTemplate {
     escape_mode: EscapeMode,
 }
 
-impl BanTemplate {
+impl Template {
     /// Parse a template string into segments with default HTML content type
     /// Supports variables in the format {{variable_name}}
     pub fn parse(content: &str) -> Self {
@@ -219,8 +219,6 @@ impl BanTemplate {
 pub struct TemplateVariables {
     /// Client IP address
     pub client_ip: Option<String>,
-    /// Ban reason (if available)
-    pub reason: Option<String>,
     /// Request URI
     pub request_uri: Option<String>,
     /// Request method
@@ -252,7 +250,6 @@ impl TemplateVariables {
     pub fn get(&self, name: &str) -> Option<&str> {
         match name {
             "client_ip" => self.client_ip.as_deref(),
-            "reason" => self.reason.as_deref(),
             "request_uri" => self.request_uri.as_deref(),
             "request_method" => self.request_method.as_deref(),
             "scenario" => self.scenario.as_deref(),
@@ -274,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_render_scenario_origin_host() {
-        let template = BanTemplate::parse("{{origin}}|{{scenario}}|{{host}}");
+        let template = Template::parse("{{origin}}|{{scenario}}|{{host}}");
         let mut vars = TemplateVariables::new();
         vars.origin = Some("cscli".to_string());
         vars.scenario = Some("ssh-bf".to_string());
@@ -284,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_parse_simple_text() {
-        let template = BanTemplate::parse("Hello World");
+        let template = Template::parse("Hello World");
         assert_eq!(template.segments.len(), 1);
         assert_eq!(
             template.segments[0],
@@ -294,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_parse_with_variable() {
-        let template = BanTemplate::parse("Your IP is {{client_ip}}");
+        let template = Template::parse("Your IP is {{client_ip}}");
         assert_eq!(template.segments.len(), 2);
         assert_eq!(
             template.segments[0],
@@ -308,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_parse_multiple_variables() {
-        let template = BanTemplate::parse("IP: {{client_ip}}, Reason: {{reason}}");
+        let template = Template::parse("IP: {{client_ip}}, Scenario: {{scenario}}");
         assert_eq!(template.segments.len(), 4);
         assert_eq!(
             template.segments[0],
@@ -320,17 +317,17 @@ mod tests {
         );
         assert_eq!(
             template.segments[2],
-            TemplateSegment::Text(", Reason: ".to_string())
+            TemplateSegment::Text(", Scenario: ".to_string())
         );
         assert_eq!(
             template.segments[3],
-            TemplateSegment::Variable("reason".to_string())
+            TemplateSegment::Variable("scenario".to_string())
         );
     }
 
     #[test]
     fn test_render() {
-        let template = BanTemplate::parse("IP: {{client_ip}}");
+        let template = Template::parse("IP: {{client_ip}}");
         let mut vars = TemplateVariables::new();
         vars.client_ip = Some("192.168.1.1".to_string());
 
@@ -340,7 +337,7 @@ mod tests {
 
     #[test]
     fn test_render_unknown_variable() {
-        let template = BanTemplate::parse("IP: {{client_ip}}, Unknown: {{unknown}}");
+        let template = Template::parse("IP: {{client_ip}}, Unknown: {{unknown}}");
         let mut vars = TemplateVariables::new();
         vars.client_ip = Some("192.168.1.1".to_string());
 
@@ -353,31 +350,31 @@ mod tests {
         use std::path::Path;
 
         assert_eq!(
-            BanTemplate::content_type_from_extension(Path::new("/etc/nginx/ban.html")),
+            Template::content_type_from_extension(Path::new("/etc/nginx/ban.html")),
             "text/html; charset=utf-8"
         );
         assert_eq!(
-            BanTemplate::content_type_from_extension(Path::new("/etc/nginx/ban.json")),
+            Template::content_type_from_extension(Path::new("/etc/nginx/ban.json")),
             "application/json; charset=utf-8"
         );
         assert_eq!(
-            BanTemplate::content_type_from_extension(Path::new("/etc/nginx/ban.xml")),
+            Template::content_type_from_extension(Path::new("/etc/nginx/ban.xml")),
             "application/xml; charset=utf-8"
         );
         assert_eq!(
-            BanTemplate::content_type_from_extension(Path::new("/etc/nginx/ban.txt")),
+            Template::content_type_from_extension(Path::new("/etc/nginx/ban.txt")),
             "text/plain; charset=utf-8"
         );
         // Unknown extension defaults to HTML
         assert_eq!(
-            BanTemplate::content_type_from_extension(Path::new("/etc/nginx/ban.foo")),
+            Template::content_type_from_extension(Path::new("/etc/nginx/ban.foo")),
             "text/html; charset=utf-8"
         );
     }
 
     #[test]
     fn test_default_content_type() {
-        let template = BanTemplate::parse("test");
+        let template = Template::parse("test");
         assert_eq!(template.content_type(), "text/html; charset=utf-8");
     }
 
@@ -405,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_html_template_escapes_xss() {
-        let template = BanTemplate::parse("<p>Path: {{request_uri}}</p>");
+        let template = Template::parse("<p>Path: {{request_uri}}</p>");
         let mut vars = TemplateVariables::new();
         vars.request_uri = Some("/<script>alert('xss')</script>".to_string());
 
@@ -420,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_json_template_escapes() {
-        let template = BanTemplate::parse_with_content_type(
+        let template = Template::parse_with_content_type(
             r#"{"uri": "{{request_uri}}"}"#,
             "application/json",
         );
@@ -433,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_plain_text_no_escape() {
-        let template = BanTemplate::parse_with_content_type("Path: {{request_uri}}", "text/plain");
+        let template = Template::parse_with_content_type("Path: {{request_uri}}", "text/plain");
         let mut vars = TemplateVariables::new();
         vars.request_uri = Some("/<script>".to_string());
 
@@ -445,24 +442,24 @@ mod tests {
     #[test]
     fn test_escape_mode_detection() {
         assert_eq!(
-            BanTemplate::escape_mode_from_content_type("text/html; charset=utf-8"),
+            Template::escape_mode_from_content_type("text/html; charset=utf-8"),
             EscapeMode::Html
         );
         assert_eq!(
-            BanTemplate::escape_mode_from_content_type("application/json"),
+            Template::escape_mode_from_content_type("application/json"),
             EscapeMode::Json
         );
         assert_eq!(
-            BanTemplate::escape_mode_from_content_type("application/xml"),
+            Template::escape_mode_from_content_type("application/xml"),
             EscapeMode::Xml
         );
         assert_eq!(
-            BanTemplate::escape_mode_from_content_type("text/plain"),
+            Template::escape_mode_from_content_type("text/plain"),
             EscapeMode::None
         );
         // Unknown defaults to HTML for safety
         assert_eq!(
-            BanTemplate::escape_mode_from_content_type("application/octet-stream"),
+            Template::escape_mode_from_content_type("application/octet-stream"),
             EscapeMode::Html
         );
     }

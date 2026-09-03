@@ -11,7 +11,7 @@ use crate::request_body::{
     BodyExtractResult, extract_request_body_limited, get_content_length,
     get_request_log, initiate_body_read as start_body_read,
 };
-use crate::template::BanTemplate;
+use crate::template::{Template, TemplateVariables};
 use ngx::ffi::{
     NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_buf_t, ngx_http_finalize_request, ngx_http_request_t,
     ngx_int_t, ngx_palloc,
@@ -49,7 +49,7 @@ pub struct CaptchaPostContext {
     /// Cookie Secure flag setting
     pub cookie_secure: crate::captcha::config::CookieSecure,
     /// Custom template (null if using default)
-    pub template: *const BanTemplate,
+    pub template: *const Template,
 }
 
 impl CaptchaPostContext {
@@ -57,7 +57,7 @@ impl CaptchaPostContext {
     pub fn from_config(
         config: &CaptchaConfig,
         client_ip: &IpAddr,
-        template: Option<&Arc<BanTemplate>>,
+        template: Option<&Arc<Template>>,
     ) -> Self {
         let ip_str = client_ip.to_string();
         let ip_bytes = ip_str.as_bytes();
@@ -142,9 +142,17 @@ pub unsafe fn initiate_body_read(
     r: *mut ngx_http_request_t,
     config: &CaptchaConfig,
     client_ip: &IpAddr,
-    template: Option<&Arc<BanTemplate>>,
+    template: Option<&Arc<Template>>,
 ) -> ngx_int_t {
     unsafe {
+        if template.is_none() {
+            ngx_log_debug!(
+                get_request_log(r),
+                "crowdsec: captcha POST requires crowdsec_captcha_template"
+            );
+            return NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t;
+        }
+
         // Allocate context from request pool
         let ctx = ngx_palloc((*r).pool, std::mem::size_of::<CaptchaPostContext>())
             as *mut CaptchaPostContext;
@@ -219,6 +227,7 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
             _ => {
                 send_captcha_error_page(
                     r,
+                    context,
                     &config,
                     &client_ip,
                     "Request too large or unreadable.",
@@ -232,6 +241,7 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
             // No body - show error
             send_captcha_error_page(
                 r,
+                context,
                 &config,
                 &client_ip,
                 "No form data received. Please try again.",
@@ -245,6 +255,7 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
             None => {
                 send_captcha_error_page(
                     r,
+                    context,
                     &config,
                     &client_ip,
                     "Captcha response not found. Please complete the challenge.",
@@ -298,6 +309,7 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
                         ngx_log_debug!(log, "crowdsec: failed to create session token: {}", e);
                         send_captcha_error_page(
                             r,
+                            context,
                             &config,
                             &client_ip,
                             "Internal error. Please try again.",
@@ -308,7 +320,7 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
             VerifyResult::Failed(reason) => {
                 ngx_log_debug!(log, "crowdsec: captcha verification failed: {}", reason);
                 let error_msg = format!("Verification failed: {}. Please try again.", reason);
-                send_captcha_error_page(r, &config, &client_ip, &error_msg);
+                send_captcha_error_page(r, context, &config, &client_ip, &error_msg);
             }
             VerifyResult::Error(err) => {
                 if config.fail_open {
@@ -332,6 +344,7 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
                 }
                 send_captcha_error_page(
                     r,
+                    context,
                     &config,
                     &client_ip,
                     "Verification service unavailable. Please try again.",
@@ -373,8 +386,8 @@ unsafe fn send_success_redirect(
         // Minimal redirect body - browsers follow Location header regardless
         let body = b"Redirecting...";
 
-        // Set 302 redirect status with body
-        (*r).headers_out.status = 302;
+        // Set 303 redirect status with body
+        (*r).headers_out.status = 303;
         (*r).headers_out.content_length_n = body.len() as i64;
 
         add_header(r, "Location", redirect_uri);
@@ -428,14 +441,20 @@ unsafe fn send_success_redirect(
 /// Send a captcha error page using raw FFI
 unsafe fn send_captcha_error_page(
     r: *mut ngx_http_request_t,
+    context: &CaptchaPostContext,
     config: &CaptchaConfig,
     client_ip: &IpAddr,
     error_message: &str,
 ) {
     unsafe {
-        // Build the captcha page HTML
+        if context.template.is_null() {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+            return;
+        }
+
         let uri = get_request_uri(r);
-        let body = render_captcha_page(config, client_ip, &uri, Some(error_message));
+        let template = &*context.template;
+        let body = render_captcha_page(template, config, client_ip, &uri, Some(error_message));
 
         // Set status code (200 for captcha challenge)
         (*r).headers_out.status = 200;
@@ -493,117 +512,22 @@ unsafe fn send_captcha_error_page(
     }
 }
 
-/// Render a captcha page HTML
+/// Render a captcha page from a configured template file.
 fn render_captcha_page(
+    template: &Template,
     config: &CaptchaConfig,
     client_ip: &IpAddr,
     form_action: &str,
     error_message: Option<&str>,
 ) -> Vec<u8> {
-    let error_html = match error_message {
-        Some(err) => format!(r#"<div class="error">{}</div>"#, escape_html(err)),
-        None => String::new(),
-    };
-
-    let html = format!(
-        r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Security Check</title>
-    <script src="{script_url}" async defer></script>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }}
-        .container {{
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
-            padding: 40px;
-            max-width: 420px;
-            width: 100%;
-            text-align: center;
-        }}
-        .icon {{ font-size: 48px; margin-bottom: 20px; }}
-        h1 {{ color: #333; font-size: 24px; margin-bottom: 12px; }}
-        p {{ color: #666; margin-bottom: 24px; line-height: 1.5; }}
-        .error {{
-            background: #fee2e2;
-            border: 1px solid #fca5a5;
-            color: #dc2626;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            font-size: 14px;
-        }}
-        .captcha-wrapper {{ display: flex; justify-content: center; margin: 24px 0; }}
-        button {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 14px 32px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 16px;
-            font-weight: 500;
-            transition: transform 0.2s, box-shadow 0.2s;
-        }}
-        button:hover {{ transform: translateY(-2px); box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4); }}
-        .footer {{ margin-top: 24px; font-size: 12px; color: #999; }}
-        .ip-info {{ font-size: 11px; color: #bbb; margin-top: 12px; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="icon">🛡️</div>
-        <h1>Security Check</h1>
-        <p>Please complete the challenge below to continue.</p>
-        {error_html}
-        <form method="POST" action="{form_action}">
-            <div class="captcha-wrapper">
-                <div class="{div_class}" data-sitekey="{site_key}"></div>
-            </div>
-            <button type="submit">Continue</button>
-        </form>
-        <div class="footer">Protected by CrowdSec</div>
-        <div class="ip-info">Your IP: {client_ip}</div>
-    </div>
-</body>
-</html>"#,
-        script_url = config.provider.script_url(),
-        error_html = error_html,
-        form_action = escape_html(form_action),
-        div_class = config.provider.div_class(),
-        site_key = escape_html(&config.site_key),
-        client_ip = client_ip,
-    );
-
-    html.into_bytes()
-}
-
-/// Escape HTML special characters
-fn escape_html(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => result.push_str("&amp;"),
-            '<' => result.push_str("&lt;"),
-            '>' => result.push_str("&gt;"),
-            '"' => result.push_str("&quot;"),
-            '\'' => result.push_str("&#x27;"),
-            _ => result.push(c),
-        }
-    }
-    result
+    let mut vars = TemplateVariables::new();
+    vars.client_ip = Some(client_ip.to_string());
+    vars.captcha_site_key = Some(config.site_key.clone());
+    vars.captcha_script_url = Some(config.provider.script_url().to_string());
+    vars.captcha_div_class = Some(config.provider.div_class().to_string());
+    vars.captcha_error = error_message.map(|s| s.to_string());
+    vars.form_action = Some(form_action.to_string());
+    template.render(&vars).into_bytes()
 }
 
 /// Add a header to the response
@@ -635,15 +559,14 @@ unsafe fn add_header(r: *mut ngx_http_request_t, name: &str, value: &str) {
     }
 }
 
-/// Get the request URI as a string
+/// Get the request URI as a string (path + query args).
 unsafe fn get_request_uri(r: *mut ngx_http_request_t) -> String {
     unsafe {
-        let uri = &(*r).uri;
-        if uri.data.is_null() || uri.len == 0 {
+        let unparsed = &(*r).unparsed_uri;
+        if unparsed.data.is_null() || unparsed.len == 0 {
             return "/".to_string();
         }
-
-        let data = std::slice::from_raw_parts(uri.data, uri.len);
+        let data = std::slice::from_raw_parts(unparsed.data, unparsed.len);
         std::str::from_utf8(data).unwrap_or("/").to_string()
     }
 }

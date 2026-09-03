@@ -30,3 +30,4 @@ PLAN.md
 .env
 .env.*
 !.env.example
+scripts/*.local.sh

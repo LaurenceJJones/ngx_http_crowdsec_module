@@ -1,9 +1,10 @@
 use crate::captcha::cookie::{build_clear_cookie, get_cookie};
-use crate::captcha::{self, CaptchaHandler, send_captcha_page};
+use crate::captcha::handler::{captcha_return_uri, send_captcha_page, send_see_other_redirect};
+use crate::captcha::{self, CaptchaHandler};
 use crate::config::{BanActionMode, LocConfig, MainConfig};
 use crate::realip;
 use crate::shm::{self, DecisionType, LookupResult};
-use crate::template::{BanTemplate, TemplateVariables};
+use crate::template::{Template, TemplateVariables};
 use ngx::core::{Buffer, Status};
 use ngx::ffi::ngx_http_request_t;
 use ngx::http::{HTTPStatus, Method, Request};
@@ -247,7 +248,19 @@ pub(crate) fn handle_captcha_decision(
 
     // Check for existing valid session cookie
     if handler.has_valid_session(request, client_ip) {
-        return HandlerResult::Declined; // Valid session, allow through
+        // Static origins often only allow GET — never pass captcha POST through.
+        if matches!(
+            request.method(),
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        ) {
+            let uri = captcha_return_uri(request);
+            return if send_see_other_redirect(request, &uri).is_ok() {
+                HandlerResult::Done
+            } else {
+                HandlerResult::Forbidden
+            };
+        }
+        return HandlerResult::Declined; // Valid session, allow GET/HEAD through
     }
 
     // Handle based on request method
@@ -265,7 +278,7 @@ pub(crate) fn handle_captcha_decision(
             {
                 HandlerResult::Done
             } else {
-                HandlerResult::Error
+                HandlerResult::Forbidden
             }
         }
         Method::POST => {
@@ -285,7 +298,7 @@ pub(crate) fn handle_captcha_decision(
             {
                 HandlerResult::Done
             } else {
-                HandlerResult::Error
+                HandlerResult::Forbidden
             }
         }
     }
@@ -547,7 +560,7 @@ fn send_ban_redirect(request: &mut Request, location: &str, status: HTTPStatus) 
 /// Send a ban response with rendered template
 fn send_ban_response(
     request: &mut Request,
-    template: &BanTemplate,
+    template: &Template,
     client_ip: &IpAddr,
     lookup: &LookupResult,
 ) -> Result<(), ()> {
@@ -555,7 +568,6 @@ fn send_ban_response(
     let mut vars = TemplateVariables::new();
     vars.client_ip = Some(client_ip.to_string());
     vars.scenario = shm::get_scenario(lookup.scenario_id);
-    vars.reason = shm::get_reason(lookup.reason_id);
     vars.origin = Some(lookup.origin.as_str().to_string());
     if let Some(h) = realip::header_value_ci(request, "Host") {
         let t = h.trim();

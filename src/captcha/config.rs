@@ -1,6 +1,6 @@
 //! Captcha configuration types and provider definitions
 
-use crate::template::BanTemplate;
+use crate::template::Template;
 use std::sync::Arc;
 
 /// Cookie secure flag setting
@@ -146,7 +146,7 @@ impl CaptchaConfig {
 #[derive(Debug, Default, Clone)]
 pub struct CaptchaLocConfig {
     /// Custom captcha template for this location
-    pub template: Option<Arc<BanTemplate>>,
+    pub template: Option<Arc<Template>>,
 }
 
 #[cfg(test)]

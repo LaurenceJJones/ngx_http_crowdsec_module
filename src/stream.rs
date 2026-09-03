@@ -159,11 +159,6 @@ impl StreamClient {
                     .map(Origin::from_str)
                     .unwrap_or(Origin::Unknown);
                 let scenario = decision.scenario.as_deref();
-                let reason = decision
-                    .reason
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
 
                 // Try to parse as single IP first
                 if let Ok(ip) = value.parse::<IpAddr>() {
@@ -172,7 +167,6 @@ impl StreamClient {
                         decision_type,
                         origin,
                         scenario,
-                        reason,
                         duration_secs,
                     });
                 }
@@ -185,7 +179,6 @@ impl StreamClient {
                         decision_type,
                         origin,
                         scenario,
-                        reason,
                         duration_secs,
                     });
                 }

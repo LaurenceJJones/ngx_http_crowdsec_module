@@ -25,7 +25,7 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_retry_interval` | http | `5` | Seconds between retries |
 | `crowdsec_poll_interval` | http, server | `10` | Seconds between successful LAPI stream polls |
 | `crowdsec_lapi_timeout` | http, server | `30` | LAPI HTTP timeout (seconds) |
-| `crowdsec_ban_template` | http, server, location | built-in | Custom ban response template path |
+| `crowdsec_ban_template` | http, server, location | - | **Required** when `crowdsec on` and `ban_action` is `block` |
 | `crowdsec_ban_action` | http, server, location | `block` | `block` (403) or `redirect` |
 | `crowdsec_ban_redirect_url` | http, server, location | - | Redirect target when `ban_action` is `redirect` |
 | `crowdsec_ban_redirect_code` | http, server, location | `302` | Redirect status: `301`–`308` |
@@ -38,7 +38,7 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_captcha_fail_open` | http, server, location | `on` | Allow on operational verification failure |
 | `crowdsec_captcha_bind_ip` | http, server, location | `on` | Bind sessions to client IP |
 | `crowdsec_captcha_cookie_secure` | http, server, location | `auto` | `auto`, `on`, or `off` |
-| `crowdsec_captcha_template` | http, server, location | built-in | Custom captcha page template |
+| `crowdsec_captcha_template` | http, server, location | - | **Required** when captcha provider keys are configured |
 | `crowdsec_appsec_url` | http, server | - | AppSec agent base URL |
 | `crowdsec_appsec` | http, server, location | `off` | Enable AppSec inspection |
 | `crowdsec_appsec_api_key` | http, server | - | Defaults to `crowdsec_api_key` |
@@ -62,6 +62,9 @@ http {
     crowdsec_url http://127.0.0.1:8080;
     crowdsec_api_key your-bouncer-api-key;
     crowdsec_shm_size 16m;
+
+    # Required when crowdsec on (examples in templates/)
+    crowdsec_ban_template /etc/nginx/templates/default.html;
 
     # Optional captcha (generate signing key: openssl rand -hex 32)
     # crowdsec_captcha_provider turnstile;
@@ -149,7 +152,7 @@ Do not configure both nginx `real_ip` and `crowdsec_trusted_proxies` for the sam
 
 ## Ban templates
 
-Template variables: `{{client_ip}}`, `{{request_method}}`, `{{request_uri}}`, `{{reason}}`, `{{scenario}}`, `{{origin}}`, `{{host}}`.
+Template variables: `{{client_ip}}`, `{{request_method}}`, `{{request_uri}}`, `{{scenario}}`, `{{origin}}`, `{{host}}`.
 
 Built-in examples live in [`templates/`](../templates/). See [`templates/README.md`](../templates/README.md).
 

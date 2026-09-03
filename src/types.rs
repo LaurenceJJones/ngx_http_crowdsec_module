@@ -12,8 +12,6 @@ pub struct Decision {
     pub value: Option<String>,
     pub duration: Option<String>,
     pub scenario: Option<String>,
-    #[serde(default)]
-    pub reason: Option<String>,
     pub until: Option<String>,
     pub simulated: Option<bool>,
     pub uuid: Option<String>,
@@ -66,7 +64,6 @@ mod tests {
             value: Some("192.168.1.1".to_string()),
             duration: Some("1h".to_string()),
             scenario: Some("test".to_string()),
-            reason: None,
             until: None,
             simulated: Some(false),
             uuid: None,
@@ -75,7 +72,6 @@ mod tests {
 
         let captcha = Decision {
             decision_type: "captcha".to_string(),
-            reason: None,
             ..decision.clone()
         };
         assert!(!captcha.is_ban());
@@ -91,7 +87,6 @@ mod tests {
             value: Some("192.168.1.100".to_string()),
             duration: None,
             scenario: None,
-            reason: None,
             until: None,
             simulated: None,
             uuid: None,
@@ -110,12 +105,4 @@ mod tests {
         assert_eq!(response.deleted.unwrap().len(), 1);
     }
 
-    #[test]
-    fn test_stream_response_with_reason() {
-        let json =
-            r#"{"new":[{"type":"ban","scope":"ip","value":"1.2.3.4","reason":"manual test"}]}"#;
-        let response: StreamResponse = serde_json::from_str(json).unwrap();
-        let d = response.new.unwrap().into_iter().next().unwrap();
-        assert_eq!(d.reason.as_deref(), Some("manual test"));
-    }
 }

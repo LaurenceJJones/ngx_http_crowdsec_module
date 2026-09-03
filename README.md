@@ -64,6 +64,7 @@ More detail: [docker/README.md](docker/README.md).
        crowdsec_url http://127.0.0.1:8080;
        crowdsec_api_key YOUR_BOUNCER_KEY;
        crowdsec_shm_size 16m;
+       crowdsec_ban_template /etc/nginx/templates/default.html;
 
        server {
            listen 80;
@@ -87,7 +88,7 @@ More detail: [docker/README.md](docker/README.md).
    nginx -t && systemctl reload nginx
    ```
 
-Behind Cloudflare or another L7 proxy, ensure nginx sees the real client IP — either with the standard [`real_ip`](docs/configuration.md#client-ip-behind-a-reverse-proxy) module (no CrowdSec IP directives needed if already configured) or with `crowdsec_trusted_proxies` + `crowdsec_real_ip_header`. AppSec, captcha, metrics, and ban templates: [docs/configuration.md](docs/configuration.md).
+Behind Cloudflare or another L7 proxy, ensure nginx sees the real client IP — either with the standard [`real_ip`](docs/configuration.md#client-ip-behind-a-reverse-proxy) module (no CrowdSec IP directives needed if already configured) or with `crowdsec_trusted_proxies` + `crowdsec_real_ip_header`. Ban and captcha pages require template files (`crowdsec_ban_template`, and `crowdsec_captcha_template` when captcha is configured) — see [`templates/`](templates/) and [docs/configuration.md](docs/configuration.md).
 
 ## Documentation
 

@@ -13,7 +13,7 @@ def main() -> None:
             "scope": "ip",
             "value": f"203.0.{i // 256}.{i % 256}",
             "duration": "24h",
-            "reason": "bench",
+            "scenario": "bench",
         }
         for i in range(count)
     ]

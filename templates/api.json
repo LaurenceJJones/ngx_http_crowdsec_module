@@ -6,6 +6,5 @@
     "request_uri": "{{request_uri}}",
     "scenario": "{{scenario}}",
     "origin": "{{origin}}",
-    "host": "{{host}}",
-    "reason": "{{reason}}"
+    "host": "{{host}}"
 }
