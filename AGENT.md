@@ -6,7 +6,7 @@ This document provides guidance for AI assistants working on this codebase.
 
 **ngx_http_crowdsec_module** is a high-performance NGINX dynamic module written in Rust that integrates CrowdSec security into NGINX. It enables real-time IP-based threat enforcement through the CrowdSec Local API (LAPI).
 
-**Version**: `0.2.0-rc2` (see `Cargo.toml` and [CHANGELOG.md](CHANGELOG.md)).
+**Version**: `0.2.0-rc3` (see `Cargo.toml` and [CHANGELOG.md](CHANGELOG.md)).
 
 ### Current Status
 
@@ -127,7 +127,8 @@ templates/              # Customizable ban/captcha page templates
 
 ### NGINX Module Architecture
 
-- **Access phase handler**: Runs on every request, checks decision cache
+- **Access phase handler**: SHM ban/captcha + AppSec for bodyless requests
+- **PRECONTENT phase handler**: AppSec for POST/PUT/PATCH/DELETE bodies
 - **Shared memory**: All workers share decision cache via `shm.rs`
 - **Poller thread**: Background thread polls CrowdSec LAPI for decision updates
 - **Callback-based body reading**: Captcha POST handling uses `ngx_http_read_client_request_body`

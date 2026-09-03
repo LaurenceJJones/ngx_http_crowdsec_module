@@ -1546,19 +1546,38 @@ pub fn try_become_poller() -> bool {
     let my_pid = std::process::id() as isize;
 
     unsafe {
-        // Cast the poller_pid field to an atomic for CAS operation
         let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
             as *const std::sync::atomic::AtomicIsize);
 
-        // Try to claim: only succeed if currently 0
+        let current = poller_atomic.load(Ordering::SeqCst);
+        if current != 0 && current != my_pid && !process_alive(current as i32) {
+            let _ = poller_atomic.compare_exchange(
+                current,
+                0,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+        }
+
         match poller_atomic.compare_exchange(0, my_pid, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => {
+                IS_POLLER.store(true, Ordering::SeqCst);
+                true
+            }
+            Err(existing) if existing == my_pid => {
                 IS_POLLER.store(true, Ordering::SeqCst);
                 true
             }
             Err(_) => false,
         }
     }
+}
+
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
 /// Check if this worker is the designated poller

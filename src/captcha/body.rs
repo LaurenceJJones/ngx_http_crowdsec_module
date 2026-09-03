@@ -8,8 +8,8 @@ use crate::captcha::cookie::{SameSite, build_set_cookie, should_cookie_be_secure
 use crate::captcha::jwt::JwtManager;
 use crate::captcha::verifier::{VerifyResult, parse_captcha_response, verify_captcha};
 use crate::request_body::{
-    extract_request_body, get_content_length, get_request_log,
-    initiate_body_read as start_body_read,
+    BodyExtractResult, extract_request_body_limited, get_content_length,
+    get_request_log, initiate_body_read as start_body_read,
 };
 use crate::template::BanTemplate;
 use ngx::ffi::{
@@ -161,7 +161,14 @@ pub unsafe fn initiate_body_read(
         let context = CaptchaPostContext::from_config(config, client_ip, template);
         std::ptr::write(ctx, context);
 
-        start_body_read(r, ctx.cast(), captcha_body_handler)
+        let rc = start_body_read(r, ctx.cast(), captcha_body_handler);
+        if rc == ngx::ffi::NGX_AGAIN as ngx_int_t {
+            ngx::ffi::NGX_DONE as ngx_int_t
+        } else if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx_int_t {
+            rc
+        } else {
+            ngx::ffi::NGX_DONE as ngx_int_t
+        }
     }
 }
 
@@ -188,10 +195,6 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
 
         let context = &*ctx;
 
-        // Extract body
-        let body = extract_request_body(r);
-        ngx_log_debug!(log, "crowdsec: extracted body, {} bytes", body.len());
-
         // Reconstruct config from context
         let config = context.to_config();
         let client_ip_str = context.client_ip_str();
@@ -205,6 +208,25 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
                 return;
             }
         };
+
+        // Extract body (bounded; chunked uploads without Content-Length are rejected)
+        let body = match extract_request_body_limited(
+            r,
+            MAX_CAPTCHA_BODY_SIZE as usize,
+            false,
+        ) {
+            BodyExtractResult::Ok(body) => body,
+            _ => {
+                send_captcha_error_page(
+                    r,
+                    &config,
+                    &client_ip,
+                    "Request too large or unreadable.",
+                );
+                return;
+            }
+        };
+        ngx_log_debug!(log, "crowdsec: extracted body, {} bytes", body.len());
 
         if body.is_empty() {
             // No body - show error
@@ -668,9 +690,9 @@ pub unsafe fn is_body_size_acceptable(r: *const ngx_http_request_t) -> bool {
     unsafe {
         let content_length = get_content_length(r);
 
-        // If no content length, we'll accept it (could be chunked)
+        // Chunked uploads are not buffered in memory for captcha verification.
         if content_length < 0 {
-            return true;
+            return false;
         }
 
         // Check against maximum

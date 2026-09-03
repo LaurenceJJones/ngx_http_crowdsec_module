@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,9 +21,15 @@ jobs:
           token: ${{ github.token }}
       - name: Build and test module image
         run: docker build --pull --tag nginx-crowdsec:test --file docker/Dockerfile .
+      - name: Run unit tests in builder image
+        run: |
+          docker build --pull --target rust-builder -t nginx-crowdsec:builder --file docker/Dockerfile .
+          docker run --rm nginx-crowdsec:builder cargo check --tests --locked
       - name: Validate NGINX and decision enforcement
         run: |
           set -euo pipefail
+          docker network rm crowdsec-ci 2>/dev/null || true
+          docker rm -f crowdsec nginx client 2>/dev/null || true
           docker network create crowdsec-ci
           mkdir -p "$RUNNER_TEMP/crowdsec-state"
           echo '{"new":[],"deleted":[]}' > "$RUNNER_TEMP/crowdsec-state/decisions.json"
@@ -43,6 +50,19 @@ jobs:
           client_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' client)
 
           test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
+
+          # AppSec enforcement (before reload stress) — catches ureq 403-as-error regressions early.
+          echo '{"_status":403,"action":"ban","http_status":403}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 403
+          echo '{"_status":200,"action":"allow"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
+
+          # POST body inspection: evil payload banned; clean payload must not 403 (405 is ok for try_files-only locations).
+          echo '{"_status":403,"action":"ban","http_status":403,"check_body":"evil"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'clean' http://nginx:8080/)" != 403
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'evil-payload' http://nginx:8080/)" = 403
+          echo '{"_status":200,"action":"allow"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
+
           printf '{"new":[{"type":"ban","scope":"ip","value":"%s","duration":"2m"}],"deleted":[]}' \
             "$client_ip" > "$RUNNER_TEMP/crowdsec-state/decisions.json"
           for i in {1..20}; do
@@ -62,7 +82,6 @@ jobs:
           test "$code" = 200
           echo '{"new":[],"deleted":[]}' > "$RUNNER_TEMP/crowdsec-state/decisions.json"
 
-          # Exercise poller hand-off and the CIDR boundary path after reload.
           docker exec nginx nginx -s reload
           sleep 2
           printf '{"new":[{"type":"ban","scope":"range","value":"%s/32","duration":"2m"}],"deleted":[]}' \
@@ -89,13 +108,6 @@ jobs:
             test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
           done
 
-          echo '{"_status":403,"action":"ban","http_status":403}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
-          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 403
-
-          echo '{"_status":403,"action":"ban","http_status":403,"check_body":"evil"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
-          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'clean' http://nginx:8080/)" = 200
-          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'evil-payload' http://nginx:8080/)" = 403
-
           cat > "$RUNNER_TEMP/crowdsec-state/appsec.json" <<'EOF'
           {"_status":403,"action":"challenge","http_status":200,"user_body_content":"<!doctype html><title>CrowdSec challenge</title>","user_headers":{"Content-Type":["text/html"],"Cache-Control":["no-store"]},"user_cookies":["__crowdsec_challenge=test; Path=/; HttpOnly; SameSite=Lax"]}
           EOF
@@ -105,11 +117,12 @@ jobs:
           grep -q 'CrowdSec challenge' <<<"$challenge"
           echo '{"_status":200,"action":"allow"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
 
-          # An unavailable LAPI must not block traffic when no cached decision exists.
           docker stop crowdsec
           sleep 11
           test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' http://nginx:8080/)" = 200
 
       - name: Show container logs on failure
         if: failure()
-        run: docker logs nginx || true
+        run: |
+          docker logs nginx || true
+          docker logs crowdsec || true

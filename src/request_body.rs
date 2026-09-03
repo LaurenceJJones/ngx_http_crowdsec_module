@@ -1,7 +1,7 @@
 //! Shared helpers for reading client request bodies before the upstream handler runs.
 //!
-//! NGINX's access phase executes before the body is buffered. Callers use
-//! [`initiate_body_read`] and handle the result in a post-read callback.
+//! NGINX's access phase executes before the body is buffered. PRECONTENT handlers
+//! (AppSec POST bodies) and captcha verification use [`initiate_body_read`].
 
 use ngx::ffi::{
     NGX_AGAIN, NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_buf_t, ngx_chain_t, ngx_http_finalize_request,
@@ -136,17 +136,19 @@ pub unsafe fn initiate_body_read(
         let ctx_ptr = (*main_r).ctx.wrapping_add((*module).ctx_index as usize);
         *ctx_ptr = ctx;
 
-        let rc = ngx_http_read_client_request_body(r, Some(callback));
+        ngx_http_read_client_request_body(r, Some(callback))
+    }
+}
 
-        if rc == NGX_AGAIN as ngx_int_t {
-            return ngx::ffi::NGX_DONE as ngx_int_t;
+/// # Safety
+/// Valid NGINX request pointer.
+pub unsafe fn request_body_buffered(r: *const ngx_http_request_t) -> bool {
+    unsafe {
+        let body = (*r).request_body;
+        if body.is_null() {
+            return false;
         }
-
-        if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx_int_t {
-            return rc;
-        }
-
-        ngx::ffi::NGX_DONE as ngx_int_t
+        !(*body).bufs.is_null() || !(*body).temp_file.is_null()
     }
 }
 

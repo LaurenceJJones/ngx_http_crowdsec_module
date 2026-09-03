@@ -2,7 +2,7 @@
 
 A high-performance NGINX dynamic module written in Rust that integrates [CrowdSec](https://www.crowdsec.net/) security into your NGINX web server. This module enables real-time IP-based threat enforcement through seamless integration with the CrowdSec Local API (LAPI).
 
-> **Status**: **v0.2.0-rc2** release candidate — IP bans, captcha remediations, AppSec/bot challenge (including POST body inspection), trusted reverse-proxy client IP, IP bypass lists, ban redirects, and Prometheus metrics. See [CHANGELOG.md](CHANGELOG.md) and [Roadmap](#roadmap).
+> **Status**: **v0.2.0-rc3** release candidate — IP bans, captcha remediations, AppSec/bot challenge (POST bodies in PRECONTENT phase), trusted reverse-proxy client IP, IP bypass lists, ban redirects, and Prometheus metrics. See [CHANGELOG.md](CHANGELOG.md) and [Roadmap](#roadmap).
 
 ## Features
 
@@ -334,7 +334,7 @@ cscli decisions add --range 10.0.0.0/24 --type ban --duration 24h
 
 ## Roadmap
 
-**v0.2.0-rc2** completes the parity goals tracked against [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer):
+**v0.2.0-rc3** completes the core parity goals tracked against [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer):
 
 - [x] X-Forwarded-For style client IP when behind trusted proxies (`crowdsec_trusted_proxies`, `crowdsec_real_ip_header`)
 - [x] Captcha challenge flow (hCaptcha, reCAPTCHA, and Turnstile)

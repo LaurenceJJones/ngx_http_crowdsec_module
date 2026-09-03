@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0-rc3] - 2026-09-03
+
+Third release candidate: PRECONTENT AppSec body inspection, AppSec 403 fix, poller hardening.
+
+### Added
+
+- **PRECONTENT phase AppSec handler** — POST/PUT/PATCH/DELETE bodies are read in `NGX_HTTP_PRECONTENT_PHASE` instead of stalling the access phase; GET/HEAD AppSec remains in access.
+- **Unit test compile gate in CI** — `cargo check --tests` runs in the Docker `rust-builder` stage (ngx module tests cannot link outside the NGINX host binary).
+
+### Fixed
+
+- **AppSec HTTP 403 handling** — Restore parsing when ureq returns `Error::Status(403, …)` so ban/challenge envelopes work again (regression from rc2).
+- **AppSec PRECONTENT re-entry** — Skip body inspection when the request body is already buffered, avoiding a double callback after `finalize_allow()` resumes phases (worker SIGSEGV on POST allow).
+- **AppSec captcha on POST** — Show captcha page directly instead of re-initiating body read (avoids double-finalize crashes).
+- **Stale poller PID** — Re-elect stream poller when the recorded worker PID is dead (e.g. after SIGSEGV).
+- **Captcha POST bodies** — Reject chunked/unbounded uploads; cap extraction at 64KB.
+
+### Changed
+
+- **CI** — AppSec integration tests run before the reload stress loop; release workflow requires green CI and marks `-rc` tags as prerelease.
+- **Access handler** — Fail open gracefully when module config pointers are missing instead of panicking.
+
 ## [0.2.0-rc2] - 2026-09-02
 
 Second release candidate: AppSec POST body inspection and metrics SHM reliability.

@@ -24,6 +24,8 @@ pub enum HandlerResult {
     CaptchaPending,
     /// AppSec is waiting for the request body before calling the WAF
     AppSecPending,
+    /// Body callback ran synchronously and already continued the request
+    BodyHandled,
 }
 
 impl From<HandlerResult> for Status {
@@ -36,6 +38,7 @@ impl From<HandlerResult> for Status {
             HandlerResult::CaptchaPending | HandlerResult::AppSecPending => {
                 Status::NGX_DONE // Body read in progress
             }
+            HandlerResult::BodyHandled => Status::NGX_OK,
         }
     }
 }
@@ -121,7 +124,7 @@ pub fn handle_access(
     let lookup = shm::lookup_ip(&client_ip);
 
     if !lookup.found {
-        let appsec = crate::appsec::inspect(request, loc_conf, main_conf);
+        let appsec = crate::appsec::inspect_access(request, loc_conf, main_conf);
         if !matches!(appsec, HandlerResult::Declined) {
             return appsec;
         }
@@ -179,6 +182,34 @@ pub fn handle_access(
             HandlerResult::Declined
         }
     }
+}
+
+/// PRECONTENT phase: AppSec inspection for requests that carry a body.
+pub fn handle_precontent(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+    main_conf: &MainConfig,
+) -> HandlerResult {
+    if loc_conf.enabled != Some(true) {
+        return HandlerResult::Declined;
+    }
+
+    let client_ip = match get_client_ip(request, main_conf) {
+        Some(ip) => ip,
+        None => return HandlerResult::Error,
+    };
+
+    if !main_conf.bypass_cidrs.is_empty()
+        && crate::realip::ip_in_cidr_list(&client_ip, &main_conf.bypass_cidrs)
+    {
+        return HandlerResult::Declined;
+    }
+
+    if shm::lookup_ip(&client_ip).found {
+        return HandlerResult::Declined;
+    }
+
+    crate::appsec::inspect_precontent(request, loc_conf, main_conf)
 }
 
 /// Handle a captcha decision for a client
