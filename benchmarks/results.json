@@ -1,0 +1,63 @@
+{
+  "date_utc": "2026-09-03 08:52 UTC",
+  "host": "Linux 7.0.9-105.fc43.x86_64\n12th Gen Intel(R) Core(TM) i7-12700H",
+  "wrk_threads": 2,
+  "wrk_connections": 64,
+  "wrk_duration": "10s",
+  "rows": [
+    {
+      "scenario": "stream-empty",
+      "bouncer": "Rust module",
+      "rps": 437893.37,
+      "latency_avg_ms": 0.11525,
+      "p99_ms": 0.342,
+      "mem_cpu_idle": "6.707MiB / 31.07GiB | 0.10%",
+      "mem_cpu_loaded": "8.559MiB / 31.07GiB | 0.00%"
+    },
+    {
+      "scenario": "stream-empty",
+      "bouncer": "OpenResty Lua",
+      "rps": 244710.97,
+      "latency_avg_ms": 0.2611,
+      "p99_ms": 0.339,
+      "mem_cpu_idle": "6.02MiB / 31.07GiB | 0.00%",
+      "mem_cpu_loaded": "7.336MiB / 31.07GiB | 0.00%"
+    },
+    {
+      "scenario": "stream-5k-miss",
+      "bouncer": "Rust module",
+      "rps": 423074.88,
+      "latency_avg_ms": 0.11629,
+      "p99_ms": 0.318,
+      "mem_cpu_idle": "9.418MiB / 31.07GiB | 0.63%",
+      "mem_cpu_loaded": "10.92MiB / 31.07GiB | 0.00%"
+    },
+    {
+      "scenario": "stream-5k-miss",
+      "bouncer": "OpenResty Lua",
+      "rps": 248654.08,
+      "latency_avg_ms": 0.25579,
+      "p99_ms": 0.343,
+      "mem_cpu_idle": "8.031MiB / 31.07GiB | 0.00%",
+      "mem_cpu_loaded": "9.629MiB / 31.07GiB | 0.00%"
+    },
+    {
+      "scenario": "appsec-get-allow",
+      "bouncer": "Rust module",
+      "rps": 412779.58,
+      "latency_avg_ms": 0.12179999999999999,
+      "p99_ms": 0.315,
+      "mem_cpu_idle": "6.715MiB / 31.07GiB | 0.12%",
+      "mem_cpu_loaded": "8.258MiB / 31.07GiB | 0.00%"
+    },
+    {
+      "scenario": "appsec-get-allow",
+      "bouncer": "OpenResty Lua",
+      "rps": 246533.68,
+      "latency_avg_ms": 0.25923,
+      "p99_ms": 0.352,
+      "mem_cpu_idle": "6.207MiB / 31.07GiB | 0.00%",
+      "mem_cpu_loaded": "7.555MiB / 31.07GiB | 0.01%"
+    }
+  ]
+}

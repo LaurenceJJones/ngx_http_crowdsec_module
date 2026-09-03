@@ -95,12 +95,6 @@ impl CaptchaProvider {
     }
 }
 
-impl Default for CaptchaProvider {
-    fn default() -> Self {
-        Self::Turnstile
-    }
-}
-
 /// Captcha configuration stored at main config level
 #[derive(Debug, Clone)]
 pub struct CaptchaConfig {
@@ -127,7 +121,8 @@ pub struct CaptchaConfig {
 impl Default for CaptchaConfig {
     fn default() -> Self {
         Self {
-            provider: CaptchaProvider::default(),
+            // Tests only — nginx config must set crowdsec_captcha_provider explicitly.
+            provider: CaptchaProvider::HCaptcha,
             site_key: String::new(),
             secret_key: String::new(),
             signing_key: [0u8; 32],

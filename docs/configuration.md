@@ -1,0 +1,142 @@
+# Configuration reference
+
+## Loading the module
+
+```nginx
+load_module /etc/nginx/modules/libngx_http_crowdsec_module.so;
+```
+
+NGINX dynamic modules are **ABI-specific**. The `.so` must match your NGINX version, platform, and build flags. See release compatibility files on [GitHub Releases](https://github.com/LaurenceJJones/ngx_http_crowdsec_module/releases).
+
+## Directives
+
+All directives can be set at `http`, `server`, or `location` unless noted.
+
+| Directive | Context | Default | Description |
+|-----------|---------|---------|-------------|
+| `crowdsec` | http, server, location | `off` | Enable/disable CrowdSec checking |
+| `crowdsec_url` | http | - | CrowdSec LAPI URL (required) |
+| `crowdsec_api_key` | http | - | Bouncer API key (required) |
+| `crowdsec_trusted_proxies` | http, server | - | CIDRs of reverse proxies; client IP from forwarded header with safe stripping |
+| `crowdsec_real_ip_header` | http, server | `X-Forwarded-For` | Header when trusted proxies are set |
+| `crowdsec_bypass` | http, server | - | CIDRs that skip enforcement (resolved client IP) |
+| `crowdsec_shm_size` | http | `1m` | Shared memory for decision cache |
+| `crowdsec_max_retries` | http | `3` | Startup connection retries |
+| `crowdsec_retry_interval` | http | `5` | Seconds between retries |
+| `crowdsec_poll_interval` | http, server | `10` | Seconds between successful LAPI stream polls |
+| `crowdsec_lapi_timeout` | http, server | `30` | LAPI HTTP timeout (seconds) |
+| `crowdsec_ban_template` | http, server, location | built-in | Custom ban response template path |
+| `crowdsec_ban_action` | http, server, location | `block` | `block` (403) or `redirect` |
+| `crowdsec_ban_redirect_url` | http, server, location | - | Redirect target when `ban_action` is `redirect` |
+| `crowdsec_ban_redirect_code` | http, server, location | `302` | Redirect status: `301`–`308` |
+| `crowdsec_captcha_provider` | http, server, location | - | **Required for captcha.** `hcaptcha`, `recaptcha`, or `turnstile` |
+| `crowdsec_captcha_site_key` | http, server, location | - | Provider site key |
+| `crowdsec_captcha_secret_key` | http, server, location | - | Provider secret key |
+| `crowdsec_captcha_signing_key` | http, server, location | - | 64-char hex key (`openssl rand -hex 32`) |
+| `crowdsec_captcha_cookie_name` | http, server, location | `crowdsec_captcha` | Session cookie name |
+| `crowdsec_captcha_expiry` | http, server, location | `3600` | Session lifetime (seconds) |
+| `crowdsec_captcha_fail_open` | http, server, location | `on` | Allow on operational verification failure |
+| `crowdsec_captcha_bind_ip` | http, server, location | `on` | Bind sessions to client IP |
+| `crowdsec_captcha_cookie_secure` | http, server, location | `auto` | `auto`, `on`, or `off` |
+| `crowdsec_captcha_template` | http, server, location | built-in | Custom captcha page template |
+| `crowdsec_appsec_url` | http, server | - | AppSec agent base URL |
+| `crowdsec_appsec` | http, server, location | `off` | Enable AppSec inspection |
+| `crowdsec_appsec_api_key` | http, server | - | Defaults to `crowdsec_api_key` |
+| `crowdsec_appsec_timeout` | http, server, location | `1000` | AppSec timeout (ms) |
+| `crowdsec_appsec_max_body_size` | http, server, location | `10m` | Max body forwarded to AppSec |
+| `crowdsec_appsec_failure_action` | http, server, location | `passthrough` | Action when AppSec is unreachable |
+| `crowdsec_appsec_drop_unreadable_body` | http, server, location | `off` | Reject bodies that cannot be buffered |
+| `crowdsec_bot_challenge` | http, server, location | `off` | CrowdSec 1.8 bot challenge (experimental) |
+| `crowdsec_metrics` | http, server, location | `off` | Expose Prometheus metrics at this location |
+
+## Full example
+
+```nginx
+load_module /etc/nginx/modules/libngx_http_crowdsec_module.so;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    crowdsec_url http://127.0.0.1:8080;
+    crowdsec_api_key your-bouncer-api-key;
+    crowdsec_shm_size 16m;
+
+    # Optional captcha (generate signing key: openssl rand -hex 32)
+    # crowdsec_captcha_provider turnstile;
+    # crowdsec_captcha_site_key ...;
+    # crowdsec_captcha_secret_key ...;
+    # crowdsec_captcha_signing_key ...;
+
+    # Optional: behind CDN / reverse proxy
+    # crowdsec_trusted_proxies 10.0.0.0/8;
+    # crowdsec_real_ip_header CF-Connecting-IP;
+
+    # Optional AppSec
+    # crowdsec_appsec_url http://127.0.0.1:7422/;
+    # crowdsec_appsec on;
+
+    server {
+        listen 80;
+        crowdsec on;
+
+        location / {
+            proxy_pass http://backend;
+        }
+
+        location /health {
+            crowdsec off;
+            return 200 "OK";
+        }
+    }
+}
+```
+
+## AppSec and bot challenge
+
+AppSec and bot challenge are **off by default**. Enable explicitly:
+
+```nginx
+crowdsec_appsec_url http://127.0.0.1:7422/;
+crowdsec_appsec on;
+crowdsec_appsec_timeout 1000;
+crowdsec_appsec_max_body_size 10m;
+crowdsec_appsec_failure_action passthrough;
+crowdsec_bot_challenge on;  # experimental — CrowdSec 1.8
+```
+
+POST/PUT/PATCH/DELETE bodies are inspected in the **PRECONTENT** phase; GET/HEAD use the access phase. Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin.
+
+## Ban templates
+
+Template variables: `{{client_ip}}`, `{{request_method}}`, `{{request_uri}}`, `{{reason}}`, `{{scenario}}`, `{{origin}}`, `{{host}}`.
+
+Built-in examples live in [`templates/`](../templates/). See [`templates/README.md`](../templates/README.md).
+
+## CrowdSec setup
+
+```bash
+cscli bouncers add nginx-bouncer   # copy API key into nginx.conf
+cscli decisions add --ip 1.2.3.4 --type ban --duration 1h --reason "test"
+```
+
+## Architecture
+
+```
+NGINX master
+  └── shared memory (decision cache, metrics)
+        ▲
+  workers ──► one elected poller streams LAPI /v1/decisions/stream
+        └── access / precontent handlers check each request
+```
+
+After a module upgrade that changes the SHM layout, a full **stop/start** (not reload) may be required. See troubleshooting in the main README.
+
+## Troubleshooting
+
+**Module not loading** — check `error_log`; confirm `nginx -V` matches the release you built against.
+
+**LAPI connectivity** — `curl -H "X-Api-Key: KEY" http://127.0.0.1:8080/v1/decisions/stream?startup=true` and `cscli bouncers list`.
+
+**Debug** — `error_log ... debug;` in `nginx.conf`.

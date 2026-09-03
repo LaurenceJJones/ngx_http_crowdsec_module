@@ -15,6 +15,7 @@ Thumbs.db
 
 # Test artifacts
 *.log
+benchmarks/.state/
 
 # NGINX build artifacts
 *.o

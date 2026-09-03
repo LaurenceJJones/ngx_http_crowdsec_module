@@ -1,0 +1,46 @@
+# Benchmark stack — see benchmarks/run.sh
+
+services:
+  mock:
+    image: python:3.13-alpine
+    container_name: bench-mock
+    hostname: mock
+    command: python /mock/mock_lapi.py
+    volumes:
+      - ../tests/mock_lapi.py:/mock/mock_lapi.py:ro,Z
+      - ${BENCH_STATE:-./.state}:/state:Z
+
+  nginx-rust:
+    image: nginx-crowdsec:bench
+    container_name: bench-nginx-rust-1
+    hostname: nginx-rust
+    volumes:
+      - ./rust/nginx.conf:/etc/nginx/nginx.conf:ro,Z
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    depends_on:
+      - mock
+
+  openresty:
+    image: crowdsecurity/openresty:latest
+    container_name: bench-openresty-1
+    hostname: openresty
+    environment:
+      API_URL: http://mock:8080
+      API_KEY: bench-bouncer-key
+      MODE: stream
+      UPDATE_FREQUENCY: 5
+      BOUNCING_ON_TYPE: ban
+      APPSEC_URL: ${APPSEC_URL:-}
+    depends_on:
+      - mock
+    volumes:
+      - ./openresty/default.conf:/etc/nginx/conf.d/default.conf:ro,Z
+
+  wrk:
+    image: alpine:3.20
+    container_name: bench-wrk-1
+    entrypoint: ["sleep", "infinity"]
+
+networks:
+  default:
+    name: bench_bench
