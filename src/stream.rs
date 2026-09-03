@@ -16,7 +16,6 @@ use std::time::Duration;
 pub enum StreamError {
     Http(String),
     Json(String),
-    Io(String),
 }
 
 impl std::fmt::Display for StreamError {
@@ -24,7 +23,6 @@ impl std::fmt::Display for StreamError {
         match self {
             StreamError::Http(msg) => write!(f, "HTTP error: {}", msg),
             StreamError::Json(msg) => write!(f, "JSON parse error: {}", msg),
-            StreamError::Io(msg) => write!(f, "IO error: {}", msg),
         }
     }
 }
@@ -194,11 +192,13 @@ impl StreamClient {
     }
 
     /// Check if the polling thread is running
+    #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
 
     /// Signal the polling thread to stop
+    #[cfg(test)]
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }

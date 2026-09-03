@@ -1,4 +1,7 @@
-use crate::captcha::cookie::{build_clear_cookie, get_cookie};
+use crate::captcha::cookie::{
+    SameSite, build_clear_cookie_with_attrs, get_cookie, response_has_set_cookie,
+    should_cookie_be_secure,
+};
 use crate::captcha::handler::{captcha_return_uri, send_captcha_page, send_see_other_redirect};
 use crate::captcha::{self, CaptchaHandler};
 use crate::config::{BanActionMode, LocConfig, MainConfig};
@@ -44,18 +47,20 @@ impl From<HandlerResult> for Status {
     }
 }
 
-/// Check if the request is for a static asset that shouldn't receive HTML pages
-///
-/// These are typically browser-initiated requests (like favicon.ico) that
-/// shouldn't receive full HTML ban/captcha pages.
-fn is_static_asset_request(request: &Request) -> bool {
-    if let Ok(path) = request.path().to_str() {
-        path.as_bytes()
-            .get(path.len().saturating_sub(4)..)
-            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".ico"))
-    } else {
-        false
-    }
+/// Check if the request is for a static asset that shouldn't receive HTML pages.
+fn is_static_asset_request(request: &Request, loc_conf: &LocConfig) -> bool {
+    request
+        .path()
+        .to_str()
+        .is_ok_and(|path| loc_conf.is_static_asset_path(path))
+}
+
+fn should_run_appsec_access(loc_conf: &LocConfig, lookup: &LookupResult) -> bool {
+    loc_conf.appsec_enabled == Some(true) && (!lookup.found || loc_conf.appsec_always == Some(true))
+}
+
+fn should_run_appsec_precontent(loc_conf: &LocConfig, lookup: &LookupResult) -> bool {
+    loc_conf.appsec_enabled == Some(true) && (!lookup.found || loc_conf.appsec_always == Some(true))
 }
 
 /// Extract the client IP address from the NGINX request (socket peer, then trusted-proxy headers).
@@ -124,11 +129,14 @@ pub fn handle_access(
     // Lookup IP in shared memory
     let lookup = shm::lookup_ip(&client_ip);
 
-    if !lookup.found {
+    if should_run_appsec_access(loc_conf, &lookup) {
         let appsec = crate::appsec::inspect_access(request, loc_conf, main_conf);
         if !matches!(appsec, HandlerResult::Declined) {
             return appsec;
         }
+    }
+
+    if !lookup.found {
         // No remediation - but check if client has a stale captcha cookie to clear
         maybe_clear_stale_captcha_cookie(request, loc_conf);
         return HandlerResult::Declined;
@@ -152,7 +160,7 @@ pub fn handle_access(
                 }
             }
             // For static assets like .ico, just return 403 without HTML body
-            if is_static_asset_request(request) {
+            if is_static_asset_request(request, loc_conf) {
                 shm::metrics_inc_http_ban();
                 return HandlerResult::Forbidden;
             }
@@ -206,7 +214,8 @@ pub fn handle_precontent(
         return HandlerResult::Declined;
     }
 
-    if shm::lookup_ip(&client_ip).found {
+    let lookup = shm::lookup_ip(&client_ip);
+    if !should_run_appsec_precontent(loc_conf, &lookup) {
         return HandlerResult::Declined;
     }
 
@@ -221,7 +230,7 @@ pub(crate) fn handle_captcha_decision(
 ) -> HandlerResult {
     // For static assets like .ico, return 200 without body
     // This allows favicon to display on captcha page without sending HTML
-    if is_static_asset_request(request) {
+    if is_static_asset_request(request, loc_conf) {
         if send_empty_response(request, HTTPStatus::OK).is_ok() {
             shm::metrics_inc_http_captcha();
             return HandlerResult::Done;
@@ -244,7 +253,7 @@ pub(crate) fn handle_captcha_decision(
     };
 
     // Create captcha handler
-    let handler = CaptchaHandler::new(&captcha_config, loc_conf.captcha_template.as_ref());
+    let handler = CaptchaHandler::new(&captcha_config);
 
     // Check for existing valid session cookie
     if handler.has_valid_session(request, client_ip) {
@@ -382,9 +391,17 @@ fn maybe_clear_stale_captcha_cookie(request: &mut Request, loc_conf: &LocConfig)
     let r: *const ngx_http_request_t = request.as_ref();
     let has_cookie = unsafe { get_cookie(r, &captcha_config.cookie_name).is_some() };
 
-    if has_cookie {
-        // Client has a stale captcha cookie - add header to clear it
-        let clear_cookie = build_clear_cookie(&captcha_config.cookie_name, "/");
+    if has_cookie && !response_has_set_cookie(request, &captcha_config.cookie_name) {
+        let r: *const ngx_http_request_t = request.as_ref();
+        let is_secure =
+            unsafe { should_cookie_be_secure(r, captcha_config.cookie_secure) };
+        let clear_cookie = build_clear_cookie_with_attrs(
+            &captcha_config.cookie_name,
+            "/",
+            is_secure,
+            true,
+            SameSite::Lax,
+        );
         request.add_header_out("Set-Cookie", &clear_cookie);
     }
 }
@@ -655,6 +672,8 @@ fn send_ban_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LocConfig;
+    use crate::shm::{DecisionType, LookupResult, Origin};
 
     #[test]
     fn test_handler_result_conversion() {
@@ -662,5 +681,54 @@ mod tests {
         let _: Status = HandlerResult::Declined.into();
         let _: Status = HandlerResult::Forbidden.into();
         let _: Status = HandlerResult::Error.into();
+    }
+
+    #[test]
+    fn test_should_run_appsec_access() {
+        let lookup_none = LookupResult {
+            found: false,
+            decision_type: DecisionType::Unknown,
+            origin: Origin::Crowdsec,
+            scenario_id: 0,
+        };
+        let lookup_ban = LookupResult {
+            found: true,
+            decision_type: DecisionType::Ban,
+            origin: Origin::Crowdsec,
+            scenario_id: 0,
+        };
+        let mut loc = LocConfig {
+            appsec_enabled: Some(true),
+            ..Default::default()
+        };
+
+        assert!(should_run_appsec_access(&loc, &lookup_none));
+        assert!(!should_run_appsec_access(&loc, &lookup_ban));
+
+        loc.appsec_always = Some(true);
+        assert!(should_run_appsec_access(&loc, &lookup_ban));
+
+        loc.appsec_enabled = Some(false);
+        assert!(!should_run_appsec_access(&loc, &lookup_ban));
+    }
+
+    #[test]
+    fn test_static_asset_path_matching() {
+        let default_conf = LocConfig::default();
+        assert!(default_conf.is_static_asset_path("/favicon.ico"));
+        assert!(!default_conf.is_static_asset_path("/style.css"));
+
+        let css_conf = LocConfig {
+            static_asset_extensions: Some(vec![".css".to_string(), ".js".to_string()]),
+            ..Default::default()
+        };
+        assert!(css_conf.is_static_asset_path("/assets/app.JS"));
+        assert!(!css_conf.is_static_asset_path("/favicon.ico"));
+
+        let off_conf = LocConfig {
+            static_asset_extensions: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!off_conf.is_static_asset_path("/favicon.ico"));
     }
 }

@@ -4,9 +4,8 @@
 //! captcha challenges and session management.
 
 use crate::captcha::config::CaptchaConfig;
-use crate::captcha::cookie::{SameSite, build_set_cookie, get_cookie, is_https};
-use crate::captcha::jwt::{CaptchaClaims, JwtManager};
-use crate::captcha::verifier::{VerifyError, VerifyResult, verify_captcha};
+use crate::captcha::cookie::get_cookie;
+use crate::captcha::jwt::JwtManager;
 use crate::shm;
 use crate::template::{Template, TemplateVariables};
 use ngx::core::{Buffer, Status};
@@ -16,33 +15,18 @@ use ngx::ngx_log_debug_http;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-/// Result of captcha handling
-#[derive(Debug)]
-pub enum CaptchaHandlerResult {
-    /// Request should be allowed (valid session or verification passed)
-    Allow,
-    /// Captcha page was shown (response sent)
-    PageShown,
-    /// Body read initiated, waiting for callback
-    BodyReadPending,
-    /// Error occurred
-    Error(String),
-}
-
-/// Captcha handler combining all captcha logic
+/// Captcha handler combining session validation logic
 pub struct CaptchaHandler<'a> {
     config: &'a CaptchaConfig,
     jwt_manager: JwtManager,
-    template: Option<&'a Arc<Template>>,
 }
 
 impl<'a> CaptchaHandler<'a> {
     /// Create a new captcha handler
-    pub fn new(config: &'a CaptchaConfig, template: Option<&'a Arc<Template>>) -> Self {
+    pub fn new(config: &'a CaptchaConfig) -> Self {
         Self {
             config,
             jwt_manager: JwtManager::new(config.signing_key),
-            template,
         }
     }
 
@@ -76,74 +60,6 @@ impl<'a> CaptchaHandler<'a> {
                 false
             }
         }
-    }
-
-    /// Create a new session token for a client
-    pub fn create_session_token(
-        &self,
-        client_ip: &IpAddr,
-        request_uri: Option<&str>,
-    ) -> Result<String, String> {
-        let ip_for_token = if self.config.bind_ip {
-            Some(client_ip.to_string())
-        } else {
-            None
-        };
-
-        let claims = CaptchaClaims::new(
-            ip_for_token.as_deref(),
-            self.config.expiry_secs,
-            request_uri,
-        );
-
-        self.jwt_manager
-            .create_token(&claims)
-            .map_err(|e| format!("failed to create token: {}", e))
-    }
-
-    /// Build the Set-Cookie header value for a session token
-    pub fn build_session_cookie(&self, token: &str, is_secure: bool) -> String {
-        build_set_cookie(
-            &self.config.cookie_name,
-            token,
-            self.config.expiry_secs,
-            "/",
-            is_secure,
-            true, // HttpOnly
-            SameSite::Lax,
-        )
-    }
-
-    /// Verify a captcha response with the provider
-    pub fn verify_response(&self, response: &str, client_ip: &IpAddr) -> VerifyResult {
-        verify_captcha(
-            self.config.provider,
-            &self.config.secret_key,
-            response,
-            &client_ip.to_string(),
-        )
-    }
-
-    /// Check if we should fail open on a verification error
-    pub fn should_fail_open(&self, error: &VerifyError) -> bool {
-        if !self.config.fail_open {
-            return false;
-        }
-
-        // Only fail open for network/provider errors, not for invalid responses
-        matches!(
-            error,
-            VerifyError::NetworkError(_) | VerifyError::Timeout | VerifyError::ProviderError(_)
-        )
-    }
-
-    /// Get the captcha provider configuration for templates
-    pub fn get_provider_config(&self) -> (&'static str, &'static str, String) {
-        (
-            self.config.provider.script_url(),
-            self.config.provider.div_class(),
-            self.config.site_key.clone(),
-        )
     }
 }
 
@@ -268,60 +184,15 @@ pub fn send_see_other_redirect(request: &mut Request, redirect_uri: &str) -> Res
     Ok(())
 }
 
-/// Send a redirect response after successful captcha verification
-pub fn send_captcha_success_redirect(
-    request: &mut Request,
-    config: &CaptchaConfig,
-    token: &str,
-    redirect_uri: &str,
-) -> Result<(), ()> {
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-
-    // Determine if HTTPS
-    let is_secure = unsafe { is_https(r) };
-
-    // Build cookie header
-    let cookie = build_set_cookie(
-        &config.cookie_name,
-        token,
-        config.expiry_secs,
-        "/",
-        is_secure,
-        true,
-        SameSite::Lax,
-    );
-
-    // 303 See Other — follow-up must be GET (static sites often reject POST)
-    request.set_status(HTTPStatus::SEE_OTHER);
-    request.set_content_length_n(0);
-
-    // Discard request body
-    request.discard_request_body();
-
-    // Set headers
-    request.add_header_out("Location", redirect_uri);
-    request.add_header_out("Set-Cookie", &cookie);
-    request.add_header_out("Cache-Control", "no-store, no-cache, must-revalidate");
-
-    // Send headers only (no body for redirect)
-    let header_status = request.send_header();
-
-    // Finalize
-    unsafe {
-        ngx::ffi::ngx_http_finalize_request(r, header_status.into());
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_captcha_template_renders_site_key() {
-        let tpl = Template::parse(
+        let tpl = Template::parse_with_content_type(
             r#"<form action="{{form_action}}"><div class="{{captcha_div_class}}" data-sitekey="{{captcha_site_key}}"></div></form>"#,
+            "text/html; charset=utf-8",
         );
         let mut vars = TemplateVariables::new();
         vars.captcha_site_key = Some("test-site-key".to_string());
@@ -336,7 +207,10 @@ mod tests {
 
     #[test]
     fn test_captcha_template_renders_error_variable() {
-        let tpl = Template::parse(r#"{{captcha_error}}"#);
+        let tpl = Template::parse_with_content_type(
+            r#"{{captcha_error}}"#,
+            "text/html; charset=utf-8",
+        );
         let mut vars = TemplateVariables::new();
         vars.captcha_error = Some("Verification failed".to_string());
 

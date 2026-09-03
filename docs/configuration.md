@@ -41,6 +41,8 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_captcha_template` | http, server, location | - | **Required** when captcha provider keys are configured |
 | `crowdsec_appsec_url` | http, server | - | AppSec agent base URL |
 | `crowdsec_appsec` | http, server, location | `off` | Enable AppSec inspection |
+| `crowdsec_appsec_always` | http, server, location | `off` | Run AppSec even when the client IP has a ban/captcha decision |
+| `crowdsec_static_extensions` | http, server, location | `.ico` | File extensions that skip HTML ban/captcha pages (e.g. `.css`, `.js`); use `off` to disable |
 | `crowdsec_appsec_api_key` | http, server | - | Defaults to `crowdsec_api_key` |
 | `crowdsec_appsec_timeout` | http, server, location | `1000` | AppSec timeout (ms) |
 | `crowdsec_appsec_max_body_size` | http, server, location | `10m` | Max body forwarded to AppSec |
@@ -80,6 +82,8 @@ http {
     # Optional AppSec
     # crowdsec_appsec_url http://127.0.0.1:7422/;
     # crowdsec_appsec on;
+    # crowdsec_appsec_always on;
+    # crowdsec_static_extensions .ico .css .js .woff2;
 
     server {
         listen 80;

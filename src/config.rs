@@ -101,8 +101,13 @@ pub struct LocConfig {
     /// Cookie Secure flag setting (auto/on/off)
     pub captcha_cookie_secure: Option<CookieSecure>,
     pub appsec_enabled: Option<bool>,
+    /// When true, run AppSec even if the client IP already has a ban/captcha decision in SHM.
+    pub appsec_always: Option<bool>,
     pub appsec_failure_action: Option<AppSecFailureAction>,
     pub bot_challenge_enabled: Option<bool>,
+    /// File extensions that skip HTML ban/captcha pages (e.g. `.ico`, `.css`). `None` inherits;
+    /// empty vec disables the shortcut; unset chain defaults to `.ico` only.
+    pub static_asset_extensions: Option<Vec<String>>,
 }
 
 impl LocConfig {
@@ -158,6 +163,42 @@ impl LocConfig {
 
         Ok(())
     }
+
+    /// Whether the request path should use minimal ban/captcha responses (no HTML body).
+    pub fn is_static_asset_path(&self, path: &str) -> bool {
+        match &self.static_asset_extensions {
+            Some(exts) if exts.is_empty() => false,
+            Some(exts) => path_has_static_suffix(path, exts),
+            None => path.as_bytes()
+                .get(path.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".ico")),
+        }
+    }
+}
+
+fn normalize_static_extension(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let normalized = if s.starts_with('.') {
+        s.to_ascii_lowercase()
+    } else {
+        format!(".{}", s.to_ascii_lowercase())
+    };
+    if normalized.len() < 2 {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn path_has_static_suffix(path: &str, exts: &[String]) -> bool {
+    let path_bytes = path.as_bytes();
+    exts.iter().any(|ext| {
+        let ext_bytes = ext.as_bytes();
+        ext_bytes.len() <= path_bytes.len()
+            && path_bytes[path_bytes.len() - ext_bytes.len()..].eq_ignore_ascii_case(ext_bytes)
+    })
 }
 
 /// Directive handler for `crowdsec on|off;`
@@ -1279,6 +1320,20 @@ appsec_setter!(
     }
 );
 appsec_setter!(
+    set_appsec_always,
+    LocConfig,
+    |c: &mut LocConfig, v: &str| {
+        if v.eq_ignore_ascii_case("on") {
+            c.appsec_always = Some(true);
+        } else if v.eq_ignore_ascii_case("off") {
+            c.appsec_always = Some(false);
+        } else {
+            return false;
+        }
+        true
+    }
+);
+appsec_setter!(
     set_bot_challenge,
     LocConfig,
     |c: &mut LocConfig, v: &str| {
@@ -1310,9 +1365,67 @@ appsec_setter!(
 /// Generate the commands array for NGINX module registration
 ///
 /// Returns the static commands array for the module.
+/// Directive handler for `crowdsec_static_extensions <ext> ... | off;`
+///
+/// # Safety
+/// Called by NGINX during configuration parsing.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_static_extensions(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let nelts = (*(*cf).args).nelts as usize;
+        if nelts < 2 {
+            return NGX_CONF_ERROR;
+        }
+
+        if nelts == 2 {
+            let value = *args.add(1);
+            let value_str = match NgxStr::from_ngx_str(value).to_str() {
+                Ok(s) => s,
+                Err(_) => return NGX_CONF_ERROR,
+            };
+            if value_str.eq_ignore_ascii_case("off") {
+                conf.static_asset_extensions = Some(Vec::new());
+                return NGX_CONF_OK;
+            }
+        }
+
+        let list = conf
+            .static_asset_extensions
+            .get_or_insert_with(Vec::new);
+
+        for i in 1..nelts {
+            let token = *args.add(i);
+            let s = match NgxStr::from_ngx_str(token).to_str() {
+                Ok(s) => s,
+                Err(_) => return NGX_CONF_ERROR,
+            };
+            if s.eq_ignore_ascii_case("off") {
+                eprintln!("crowdsec: 'off' cannot be combined with other static_extensions arguments");
+                return NGX_CONF_ERROR;
+            }
+            let Some(ext) = normalize_static_extension(s) else {
+                eprintln!("crowdsec: invalid static extension '{s}'");
+                return NGX_CONF_ERROR;
+            };
+            if !list.iter().any(|e| e.eq_ignore_ascii_case(&ext)) {
+                list.push(ext);
+            }
+        }
+    }
+
+    NGX_CONF_OK
+}
+
 /// The array is null-terminated with an empty command.
 #[rustfmt::skip]
-pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 35] = [
+pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 37] = [
     // crowdsec on|off; - enable/disable at location level
     ngx_command_t {
         name: ngx_string!("crowdsec"),
@@ -1554,6 +1667,8 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 35] = [
     ngx_command_t { name: ngx_string!("crowdsec_appsec_max_body_size"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_max_body), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec_drop_unreadable_body"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_drop_unreadable_body), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_enabled), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_appsec_always"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_always), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_static_extensions"), type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF) as ngx_uint_t | 0x0000_2000) as ngx_uint_t, set: Some(ngx_http_crowdsec_set_static_extensions), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec_failure_action"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_failure), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_bot_challenge"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_bot_challenge), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     // Null terminator

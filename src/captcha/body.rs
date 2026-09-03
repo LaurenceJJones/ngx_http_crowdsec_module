@@ -18,7 +18,6 @@ use ngx::ffi::{
 };
 use ngx::ngx_log_debug;
 use std::net::IpAddr;
-use std::ptr;
 use std::sync::Arc;
 
 /// Context stored in the request for captcha POST handling

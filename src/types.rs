@@ -1,8 +1,10 @@
 use serde::Deserialize;
+#[cfg(test)]
 use std::net::IpAddr;
 
 /// A CrowdSec decision from the LAPI
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct Decision {
     pub id: Option<i64>,
     pub origin: Option<String>,
@@ -19,11 +21,13 @@ pub struct Decision {
 
 impl Decision {
     /// Check if this decision is a ban
+    #[cfg(test)]
     pub fn is_ban(&self) -> bool {
         self.decision_type.eq_ignore_ascii_case("ban")
     }
 
     /// Get the IP address if the scope is "ip" or "Ip"
+    #[cfg(test)]
     pub fn get_ip(&self) -> Option<IpAddr> {
         if let Some(scope) = &self.scope {
             if scope.eq_ignore_ascii_case("ip") {
@@ -33,11 +37,6 @@ impl Decision {
             }
         }
         None
-    }
-
-    /// Get the decision ID for deletion matching
-    pub fn get_id(&self) -> Option<i64> {
-        self.id
     }
 }
 

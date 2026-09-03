@@ -49,33 +49,6 @@ impl CaptchaClaims {
         }
     }
 
-    /// Check if the claims are valid for the given client IP
-    pub fn is_valid(&self, client_ip: Option<&str>) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        // Check expiration
-        if now > self.exp {
-            return false;
-        }
-
-        // Check token type
-        if self.typ != "captcha_pass" {
-            return false;
-        }
-
-        // Check IP binding if required
-        if let Some(ip) = client_ip {
-            if self.sub != "anonymous" && self.sub != ip {
-                return false;
-            }
-        }
-
-        true
-    }
-
     /// Serialize claims to JSON
     fn to_json(&self) -> String {
         // Manual JSON serialization to avoid serde dependency overhead

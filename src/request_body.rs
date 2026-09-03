@@ -4,8 +4,8 @@
 //! (AppSec POST bodies) and captcha verification use [`initiate_body_read`].
 
 use ngx::ffi::{
-    NGX_AGAIN, NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_buf_t, ngx_chain_t, ngx_http_finalize_request,
-    ngx_http_read_client_request_body, ngx_http_request_t, ngx_int_t, ngx_palloc,
+    ngx_buf_t, ngx_chain_t, ngx_http_finalize_request, ngx_http_read_client_request_body,
+    ngx_http_request_t, ngx_int_t,
 };
 use ngx::ngx_log_debug;
 use std::ffi::CStr;
@@ -107,17 +107,6 @@ pub unsafe fn extract_request_body_limited(
         }
 
         BodyExtractResult::Ok(result)
-    }
-}
-
-/// Convenience wrapper used by captcha verification (small in-memory bodies only).
-///
-/// # Safety
-/// Valid NGINX request pointer with body already read.
-pub unsafe fn extract_request_body(r: *const ngx_http_request_t) -> Vec<u8> {
-    match extract_request_body_limited(r, usize::MAX, false) {
-        BodyExtractResult::Ok(body) => body,
-        _ => Vec::new(),
     }
 }
 

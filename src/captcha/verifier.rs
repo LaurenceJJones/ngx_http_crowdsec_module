@@ -43,6 +43,7 @@ impl std::fmt::Display for VerifyError {
 
 /// Provider verification response structure
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct VerifyResponse {
     success: bool,
     #[serde(default)]

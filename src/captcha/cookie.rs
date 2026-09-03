@@ -4,6 +4,7 @@ use ngx::ffi::ngx_http_request_t;
 
 /// SameSite cookie attribute values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SameSite {
     /// Cookie is only sent in first-party context
     Strict,
@@ -95,12 +96,40 @@ pub fn build_set_cookie(
     cookie
 }
 
-/// Build a Set-Cookie header to clear/expire a cookie
-pub fn build_clear_cookie(name: &str, path: &str) -> String {
-    format!(
+/// Clear a session cookie using the same attributes as [`build_set_cookie`].
+pub fn build_clear_cookie_with_attrs(
+    name: &str,
+    path: &str,
+    secure: bool,
+    http_only: bool,
+    same_site: SameSite,
+) -> String {
+    let mut cookie = format!(
         "{}=; Max-Age=0; Path={}; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
         name, path
-    )
+    );
+
+    if secure {
+        cookie.push_str("; Secure");
+    }
+
+    if http_only {
+        cookie.push_str("; HttpOnly");
+    }
+
+    cookie.push_str("; SameSite=");
+    cookie.push_str(same_site.as_str());
+
+    cookie
+}
+
+/// Returns true if `headers_out` already has a Set-Cookie for `name`.
+pub fn response_has_set_cookie(request: &ngx::http::Request, name: &str) -> bool {
+    let prefix = format!("{name}=");
+    request.headers_out_iterator().any(|(key, value)| {
+        matches!(key.to_str(), Ok(k) if k.eq_ignore_ascii_case("Set-Cookie"))
+            && matches!(value.to_str(), Ok(v) if v.starts_with(&prefix))
+    })
 }
 
 /// Check if the request appears to be over HTTPS (auto-detection)
@@ -268,10 +297,20 @@ mod tests {
 
     #[test]
     fn test_build_clear_cookie() {
-        let cookie = build_clear_cookie("session", "/");
+        let cookie = build_clear_cookie_with_attrs("session", "/", false, false, SameSite::Lax);
         assert!(cookie.contains("session="));
         assert!(cookie.contains("Max-Age=0"));
         assert!(cookie.contains("Expires="));
+        assert!(cookie.contains("SameSite=Lax"));
+    }
+
+    #[test]
+    fn test_build_clear_cookie_with_attrs() {
+        let cookie = build_clear_cookie_with_attrs("token", "/", true, true, SameSite::Lax);
+        assert!(cookie.contains("token="));
+        assert!(cookie.contains("Secure"));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
     }
 
     #[test]

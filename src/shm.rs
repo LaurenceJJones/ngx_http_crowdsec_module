@@ -550,8 +550,10 @@ pub unsafe fn init_shm_zone(
 /// True if `data` points to a [`ShmData`] header written by this module layout.
 #[inline]
 unsafe fn decision_shm_layout_matches(data: *mut std::ffi::c_void) -> bool {
-    let hdr = data.cast::<ShmData>();
-    (*hdr).magic == SHM_MAGIC && (*hdr).layout_version == SHM_LAYOUT_VERSION
+    unsafe {
+        let hdr = data.cast::<ShmData>();
+        (*hdr).magic == SHM_MAGIC && (*hdr).layout_version == SHM_LAYOUT_VERSION
+    }
 }
 
 /// Shared memory zone initialization callback
@@ -1552,19 +1554,21 @@ const METRICS_SHM_SIZE: usize = 8192;
 /// # Safety
 /// Valid `ngx_conf_t` from NGINX configuration.
 pub unsafe fn init_metrics_shm_zone(cf: *mut ngx::ffi::ngx_conf_t) -> Result<(), ()> {
-    let name: ngx_str_t = ngx_string!("crowdsec_metrics");
-    let shm_zone = ngx::ffi::ngx_shared_memory_add(
-        cf,
-        &name as *const _ as *mut _,
-        METRICS_SHM_SIZE,
-        &raw const crate::ngx_http_crowdsec_module as *mut _,
-    );
-    if shm_zone.is_null() {
-        return Err(());
+    unsafe {
+        let name: ngx_str_t = ngx_string!("crowdsec_metrics");
+        let shm_zone = ngx::ffi::ngx_shared_memory_add(
+            cf,
+            &name as *const _ as *mut _,
+            METRICS_SHM_SIZE,
+            &raw const crate::ngx_http_crowdsec_module as *mut _,
+        );
+        if shm_zone.is_null() {
+            return Err(());
+        }
+        (*shm_zone).init = Some(metrics_zone_init);
+        (*shm_zone).data = ptr::null_mut();
+        METRICS_SHM_ZONE.store(shm_zone, Ordering::SeqCst);
     }
-    (*shm_zone).init = Some(metrics_zone_init);
-    (*shm_zone).data = ptr::null_mut();
-    METRICS_SHM_ZONE.store(shm_zone, Ordering::SeqCst);
     Ok(())
 }
 
@@ -1572,39 +1576,41 @@ unsafe extern "C" fn metrics_zone_init(
     shm_zone: *mut ngx_shm_zone_t,
     data: *mut std::ffi::c_void,
 ) -> ngx_int_t {
-    if !data.is_null() {
-        (*shm_zone).data = data;
-        return NGX_OK as ngx_int_t;
-    }
+    unsafe {
+        if !data.is_null() {
+            (*shm_zone).data = data;
+            return NGX_OK as ngx_int_t;
+        }
 
-    let shpool = (*shm_zone).shm.addr as *mut ngx_slab_pool_t;
-    if shpool.is_null() {
-        return ngx::ffi::NGX_ERROR as ngx_int_t;
-    }
+        let shpool = (*shm_zone).shm.addr as *mut ngx_slab_pool_t;
+        if shpool.is_null() {
+            return ngx::ffi::NGX_ERROR as ngx_int_t;
+        }
 
-    let sz = std::mem::size_of::<MetricsShm>();
-    let p = ngx_slab_alloc_locked(shpool, sz);
-    if p.is_null() {
-        eprintln!(
-            "crowdsec: warning: failed to allocate metrics SHM; counters disabled"
+        let sz = std::mem::size_of::<MetricsShm>();
+        let p = ngx_slab_alloc_locked(shpool, sz);
+        if p.is_null() {
+            eprintln!(
+                "crowdsec: warning: failed to allocate metrics SHM; counters disabled"
+            );
+            return NGX_OK as ngx_int_t;
+        }
+
+        ptr::write(
+            p.cast::<MetricsShm>(),
+            MetricsShm {
+                http_lookups: AtomicU64::new(0),
+                http_bans: AtomicU64::new(0),
+                http_captcha: AtomicU64::new(0),
+                http_bypass: AtomicU64::new(0),
+                lapi_poll_ok: AtomicU64::new(0),
+                lapi_poll_err: AtomicU64::new(0),
+                lapi_last_success_unix_secs: AtomicU64::new(0),
+            },
         );
-        return NGX_OK as ngx_int_t;
+
+        (*shm_zone).data = p;
     }
-
-    ptr::write(
-        p.cast::<MetricsShm>(),
-        MetricsShm {
-            http_lookups: AtomicU64::new(0),
-            http_bans: AtomicU64::new(0),
-            http_captcha: AtomicU64::new(0),
-            http_bypass: AtomicU64::new(0),
-            lapi_poll_ok: AtomicU64::new(0),
-            lapi_poll_err: AtomicU64::new(0),
-            lapi_last_success_unix_secs: AtomicU64::new(0),
-        },
-    );
-
-    (*shm_zone).data = p;
     NGX_OK as ngx_int_t
 }
 

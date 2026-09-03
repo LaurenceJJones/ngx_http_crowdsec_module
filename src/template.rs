@@ -81,6 +81,7 @@ pub struct Template {
 impl Template {
     /// Parse a template string into segments with default HTML content type
     /// Supports variables in the format {{variable_name}}
+    #[cfg(test)]
     pub fn parse(content: &str) -> Self {
         Self::parse_with_content_type(content, "text/html; charset=utf-8")
     }

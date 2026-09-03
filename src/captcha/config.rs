@@ -1,8 +1,5 @@
 //! Captcha configuration types and provider definitions
 
-use crate::template::Template;
-use std::sync::Arc;
-
 /// Cookie secure flag setting
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CookieSecure {
@@ -84,15 +81,6 @@ impl CaptchaProvider {
             Self::ReCaptcha => "g-recaptcha",
         }
     }
-
-    /// Get the sitekey attribute name for the widget
-    pub fn sitekey_attr(&self) -> &'static str {
-        match self {
-            Self::HCaptcha => "data-sitekey",
-            Self::Turnstile => "data-sitekey",
-            Self::ReCaptcha => "data-sitekey",
-        }
-    }
 }
 
 /// Captcha configuration stored at main config level
@@ -137,16 +125,10 @@ impl Default for CaptchaConfig {
 
 impl CaptchaConfig {
     /// Check if captcha is fully configured
+    #[cfg(test)]
     pub fn is_configured(&self) -> bool {
         !self.site_key.is_empty() && !self.secret_key.is_empty() && self.signing_key != [0u8; 32]
     }
-}
-
-/// Location-level captcha configuration (can override template)
-#[derive(Debug, Default, Clone)]
-pub struct CaptchaLocConfig {
-    /// Custom captcha template for this location
-    pub template: Option<Arc<Template>>,
 }
 
 #[cfg(test)]

@@ -107,6 +107,12 @@ impl Merge for LocConfig {
         if self.appsec_enabled.is_none() {
             self.appsec_enabled = prev.appsec_enabled;
         }
+        if self.appsec_always.is_none() {
+            self.appsec_always = prev.appsec_always;
+        }
+        if self.static_asset_extensions.is_none() {
+            self.static_asset_extensions = prev.static_asset_extensions.clone();
+        }
         if self.appsec_failure_action.is_none() {
             self.appsec_failure_action = prev.appsec_failure_action;
         }
