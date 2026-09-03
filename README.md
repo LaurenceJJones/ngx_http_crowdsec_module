@@ -125,4 +125,4 @@ Fork, branch, PR. See existing [CI](.github/workflows/ci.yml) for test expectati
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2025 CrowdSec.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2025 Laurence Jones.

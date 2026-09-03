@@ -4,6 +4,7 @@ version = "0.2.0-rc3"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
+authors = ["Laurence Jones <laurence.jones@live.co.uk>"]
 description = "NGINX dynamic module for CrowdSec integration"
 repository = "https://github.com/LaurenceJJones/ngx_http_crowdsec_module"
 keywords = ["nginx", "crowdsec", "security", "firewall", "waf"]
