@@ -17,8 +17,8 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec` | http, server, location | `off` | Enable/disable CrowdSec checking |
 | `crowdsec_url` | http | - | CrowdSec LAPI URL (required) |
 | `crowdsec_api_key` | http | - | Bouncer API key (required) |
-| `crowdsec_trusted_proxies` | http, server | - | CIDRs of reverse proxies; client IP from forwarded header with safe stripping |
-| `crowdsec_real_ip_header` | http, server | `X-Forwarded-For` | Header when trusted proxies are set |
+| `crowdsec_trusted_proxies` | http, server | - | Optional. CIDRs of reverse proxies; client IP from forwarded header (see [Client IP](#client-ip-behind-a-reverse-proxy)) |
+| `crowdsec_real_ip_header` | http, server | `X-Forwarded-For` | Header read when `crowdsec_trusted_proxies` is set |
 | `crowdsec_bypass` | http, server | - | CIDRs that skip enforcement (resolved client IP) |
 | `crowdsec_shm_size` | http | `1m` | Shared memory for decision cache |
 | `crowdsec_max_retries` | http | `3` | Startup connection retries |
@@ -69,7 +69,8 @@ http {
     # crowdsec_captcha_secret_key ...;
     # crowdsec_captcha_signing_key ...;
 
-    # Optional: behind CDN / reverse proxy
+    # Optional: behind CDN / reverse proxy — only if you do NOT already use
+    # nginx real_ip (see "Client IP" section below).
     # crowdsec_trusted_proxies 10.0.0.0/8;
     # crowdsec_real_ip_header CF-Connecting-IP;
 
@@ -107,6 +108,44 @@ crowdsec_bot_challenge on;  # experimental — CrowdSec 1.8
 ```
 
 POST/PUT/PATCH/DELETE bodies are inspected in the **PRECONTENT** phase; GET/HEAD use the access phase. Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin.
+
+## Client IP behind a reverse proxy
+
+The module resolves the client IP from the request **connection address** (the same underlying value `$remote_addr` uses after nginx has processed the request). Ban lookups, bypass rules, captcha IP binding, and AppSec all use this address.
+
+### If you already use nginx `real_ip`
+
+If `set_real_ip_from`, `real_ip_header`, and (when needed) `real_ip_recursive` are configured correctly, **you do not need** `crowdsec_trusted_proxies` or `crowdsec_real_ip_header`. The realip module runs in `POST_READ` (before CrowdSec's access handler) and rewrites the connection address to the end client; CrowdSec then sees that address automatically.
+
+Example (Cloudflare) — no CrowdSec IP directives required:
+
+```nginx
+set_real_ip_from 173.245.48.0/20;
+# ... other Cloudflare ranges ...
+real_ip_header CF-Connecting-IP;
+```
+
+Verify with `curl` through the proxy: `$remote_addr` in access logs should match the client you expect to ban.
+
+### If you do not use nginx `real_ip`
+
+Use the module's built-in resolver instead. It mirrors `real_ip_recursive on`: when the TCP peer matches `crowdsec_trusted_proxies`, the client IP is taken from `crowdsec_real_ip_header` (default `X-Forwarded-For`) with right-to-left trusted stripping.
+
+```nginx
+crowdsec_trusted_proxies 10.0.0.0/8 172.16.0.0/12;
+crowdsec_real_ip_header X-Forwarded-For;
+```
+
+For Cloudflare without the realip module:
+
+```nginx
+crowdsec_trusted_proxies 173.245.48.0/20;  # repeat for all CF ranges you trust
+crowdsec_real_ip_header CF-Connecting-IP;
+```
+
+### Pick one approach
+
+Do not configure both nginx `real_ip` and `crowdsec_trusted_proxies` for the same hop — it is redundant. Prefer whichever you already maintain site-wide; the module only needs the connection address to reflect the real client by the time its handlers run.
 
 ## Ban templates
 
