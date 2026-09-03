@@ -2,7 +2,7 @@
 
 CrowdSec enforcement as a **native NGINX dynamic module** (Rust). Stream IP bans from LAPI, optional captcha remediations, AppSec, and Prometheus metrics — without OpenResty or Lua.
 
-> **Status:** [v0.2.0-rc3](CHANGELOG.md) — stream bans, captcha, AppSec (including POST bodies), trusted proxy IP, bypass lists, ban redirects, metrics. See [CHANGELOG](CHANGELOG.md).
+> **Status:** [v0.2.0](CHANGELOG.md) — stream bans, captcha, AppSec (including POST bodies), trusted proxy IP, bypass lists, ban redirects, metrics. See [CHANGELOG](CHANGELOG.md).
 
 ## Why this module?
 

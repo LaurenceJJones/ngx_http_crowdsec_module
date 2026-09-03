@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-03
+
+First stable 0.2 release. Combines the rc1–rc3 feature set (AppSec with POST body inspection, captcha, Prometheus metrics, bypass lists, ban redirects, trusted-proxy client IP) with rc3 stability fixes validated in production.
+
+### Added
+
+- **OpenResty benchmark harness** — `./benchmarks/run.sh` compares throughput and latency against the official Lua bouncer ([results](benchmarks/results.md)).
+- **Configuration reference** — Full directive documentation in `docs/configuration.md`.
+
+### Changed
+
+- **README** — Restructured around why/use-cases and Docker vs production quick-start paths.
+- **Client IP documentation** — nginx `real_ip` is sufficient when already configured; `crowdsec_trusted_proxies` is optional.
+- **Captcha provider** — Must be set explicitly (`hcaptcha`, `recaptcha`, or `turnstile`); no implicit default at runtime.
+- **Copyright** — MIT license attributed to Laurence Jones.
+
+### Known limitations
+
+- **AppSec / bot challenge** — Bot challenge remains experimental (CrowdSec 1.8 protocol). Requires `crowdsec_appsec_url` and a matching AppSec component.
+- **Captcha verification** — Provider API calls on POST are synchronous in the worker; high traffic may need async verification (planned).
+- **Prometheus metrics** — No built-in authentication; protect the `crowdsec_metrics on` location with `allow`, `internal`, or auth.
+- **Shared-memory upgrades** — Incompatible `crowdsec_decisions` layout changes require a full nginx restart, not `reload` only.
+- **Remediation types** — Ban and captcha only; throttle and other LAPI types are ignored.
+- **Release artifacts** — Published `.so` targets nginx 1.30.3 on Debian bookworm amd64; other nginx versions require a source build matching `nginx -V`.
+- **Parity gaps** — Some lua-cs-bouncer edge cases may remain.
+
 ## [0.2.0-rc3] - 2026-09-03
 
 Third release candidate: PRECONTENT AppSec body inspection, AppSec 403 fix, poller hardening.
