@@ -115,7 +115,7 @@ crowdsec_appsec_failure_action passthrough;
 crowdsec_bot_challenge on;  # experimental — CrowdSec 1.8
 ```
 
-POST/PUT/PATCH/DELETE bodies are inspected in the **PRECONTENT** phase; GET/HEAD use the access phase. Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin.
+POST/PUT/PATCH/DELETE bodies are inspected in the **PRECONTENT** phase; bodyless GET/HEAD use the access phase. Any other method (including GET) with a `Content-Length` or chunked body is also read in PRECONTENT and forwarded to the agent with the original verb in `X-Crowdsec-Appsec-Verb`, so core rulesets can flag non-standard requests such as GET with a body. Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin.
 
 ## Client IP behind a reverse proxy
 

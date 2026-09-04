@@ -1,7 +1,7 @@
 //! Shared helpers for reading client request bodies before the upstream handler runs.
 //!
 //! NGINX's access phase executes before the body is buffered. PRECONTENT handlers
-//! (AppSec POST bodies) and captcha verification use [`initiate_body_read`].
+//! (AppSec POST bodies, captcha verification) use [`initiate_body_read`].
 
 use ngx::ffi::{
     ngx_buf_t, ngx_chain_t, ngx_http_finalize_request, ngx_http_read_client_request_body,

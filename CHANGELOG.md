@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-04
+
+Patch: forward any client request body to AppSec, including GET.
+
+### Fixed
+
+- **AppSec GET with body** — Requests that include a body (including GET) are read in PRECONTENT and forwarded to the WAF agent, matching core ruleset coverage for non-standard methods (e.g. CRS rule 920170).
+
 ## [0.3.0] - 2026-09-04
 
 Minor release: nginx-acme-inspired integration improvements, LAPI usage metrics, and operational logging.

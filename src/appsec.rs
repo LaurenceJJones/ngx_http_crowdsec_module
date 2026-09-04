@@ -7,7 +7,7 @@ use crate::request_body::{
     get_content_length, has_request_body, initiate_body_read, request_body_buffered,
 };
 use ngx::ffi::{ngx_http_finalize_request, ngx_http_request_t, ngx_int_t};
-use ngx::http::{HTTPStatus, Method, Request};
+use ngx::http::{HTTPStatus, Request};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -102,13 +102,6 @@ fn failure(action: AppSecFailureAction) -> HandlerResult {
     }
 }
 
-fn method_may_carry_body(method: Method) -> bool {
-    matches!(
-        method,
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    )
-}
-
 fn appsec_context(
     request: &Request,
     loc: &LocConfig,
@@ -135,7 +128,7 @@ fn appsec_context(
     Some((config, ip, failure_action, internal_challenge))
 }
 
-/// AppSec in ACCESS phase: headers/URI only. POST/PUT/PATCH/DELETE bodies defer to PRECONTENT.
+/// AppSec in ACCESS phase: headers/URI only. Any request with a body defers to PRECONTENT.
 pub fn inspect_access(
     request: &mut Request,
     loc: &LocConfig,
@@ -161,7 +154,7 @@ pub fn inspect_access(
     };
 
     let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-    if method_may_carry_body(request.method()) && unsafe { has_request_body(r) } {
+    if unsafe { has_request_body(r) } {
         return HandlerResult::Declined;
     }
 
@@ -176,7 +169,7 @@ pub fn inspect_access(
     )
 }
 
-/// AppSec in PRECONTENT phase: read and forward request bodies to the WAF agent.
+/// AppSec in PRECONTENT phase: read and forward any client request body to the WAF agent.
 pub fn inspect_precontent(
     request: &mut Request,
     loc: &LocConfig,
@@ -193,7 +186,7 @@ pub fn inspect_precontent(
     };
 
     let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-    if !method_may_carry_body(request.method()) || !unsafe { has_request_body(r) } {
+    if !unsafe { has_request_body(r) } {
         return HandlerResult::Declined;
     }
 

@@ -198,7 +198,7 @@ pub fn handle_access(
     }
 }
 
-/// PRECONTENT phase: AppSec inspection for requests that carry a body.
+/// PRECONTENT phase: AppSec inspection when the client sent a request body.
 pub fn handle_precontent(
     request: &mut Request,
     loc_conf: &LocConfig,
