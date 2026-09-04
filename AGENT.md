@@ -6,21 +6,57 @@ This document provides guidance for AI assistants working on this codebase.
 
 **ngx_http_crowdsec_module** is a high-performance NGINX dynamic module written in Rust that integrates CrowdSec security into NGINX. It enables real-time IP-based threat enforcement through the CrowdSec Local API (LAPI).
 
-**Version**: `0.2.0` (see `Cargo.toml` and [CHANGELOG.md](CHANGELOG.md)).
+**Version**: `0.3.0` (see `Cargo.toml` and [CHANGELOG.md](CHANGELOG.md)).
 
 ### Current Status
 
 - **Core functionality**: Working (IP bans, decision streaming, shared memory cache with layout versioning, reload-safe poller)
 - **Captcha flow**: Working (verification, JWT sessions, cookie handling, redirects)
 - **AppSec / bot challenge**: Working but experimental (`crowdsec_appsec`, `crowdsec_bot_challenge`; CrowdSec 1.8 protocol)
-- **Operational extras**: Trusted-proxy client IP (`realip.rs`), IP bypass lists, ban redirects, Prometheus metrics (`metrics.rs`), configurable `crowdsec_poll_interval` / `crowdsec_lapi_timeout`
-- **Goal**: Feature parity with [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer) — primary parity items landed in v0.2.0
+- **Operational extras**: LAPI usage metrics, trusted-proxy client IP (`realip.rs`), IP bypass lists, ban redirects, Prometheus metrics (`metrics.rs`), nginx-native logging (`log.rs`), configurable poll/LAPI timeouts
+- **Goal**: Feature parity with [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer)
 
 ### Supported Remediations
 
 - **Ban**: 403 with customizable template, or HTTP redirect via `crowdsec_ban_action redirect` (template variables include `{{scenario}}`, `{{origin}}`, `{{host}}`, plus `client_ip` / request fields)
 - **Captcha**: Challenges user with hCaptcha, reCAPTCHA, or Cloudflare Turnstile
 - **AppSec**: Request inspection against CrowdSec AppSec component; may allow, ban, or emit bot challenge responses
+
+## NGINX Rust (`ngx`) SDK — read before coding
+
+This module is built on the **[ngx-rust](https://github.com/nginx/ngx-rust)** crate. **Always confirm the pinned version and its public API before writing or refactoring NGINX integration code.** Do not assume APIs from other versions, from C NGINX examples, or from blog posts.
+
+### Version pin (source of truth)
+
+| Item | Where to look |
+|------|----------------|
+| **`ngx` crate version** | `Cargo.toml` → `[dependencies] ngx = "…"` (currently **`0.5.1`**) |
+| **Rust toolchain** | `Cargo.toml` → `rust-version` (currently **`1.85`**) |
+| **NGINX for local/Docker builds** | `docker/Dockerfile` `NGINX_VERSION` arg |
+| **Locked transitive deps** | `Cargo.lock` (includes `nginx-sys`) |
+
+Before calling a new `ngx` or `nginx_sys` symbol, verify it exists for **our exact pin**:
+
+1. **[docs.rs for our version](https://docs.rs/ngx/0.5.1/ngx/)** — `Request`, `HttpModule`, `Pool`, `Status`, macros (`http_request_handler!`, `ngx_log_error!`, `ngx_conf_log_error!`), etc.
+2. **Vendor / registry source** — after a Docker or `cargo build` with NGINX env, read `~/.cargo/registry/src/.../ngx-0.5.1/` (or the path from the build log) for traits and methods not obvious in docs.
+3. **[nginx-acme](https://github.com/nginx/nginx-acme)** — reference module from the ngx maintainers; same `ngx = "0.5.1"`. Prefer patterns proven there (logging, `NgxConfExt`, SHM zone lifecycle, `Request::output_filter`) over inventing raw FFI.
+
+### APIs and conventions in *this* repo
+
+- **Module registration**: `HttpModule`, `HttpModuleMainConf`, `HttpModuleLocationConf`, `ngx_modules!` (behind `export-modules` feature).
+- **Handlers**: `http_request_handler!`; return `Status` / map from `HandlerResult`.
+- **Config**: C directive handlers in `config.rs`; prefer `conf::NgxConfExt` and `ngx_conf_log_error!` for parse-time errors.
+- **Logging**: `crowdsec_*!` macros in `log.rs` for worker/cycle context; `ngx_log_debug_http!` for per-request debug. **Do not use `eprintln!`** for operational logs.
+- **Responses**: `response.rs` helpers + `Request::output_filter`; finalize still uses `ngx_http_finalize_request` (no `Request::finalize` in 0.5.1).
+- **SHM**: Custom slab layout in `shm.rs` + `DecisionsSharedZone` state machine; not a full `SlabPool` rewrite unless deliberately scoped.
+- **Background LAPI poll**: `std::thread` + `ureq` in `stream.rs` — **`ngx` `async` feature is not enabled**; do not introduce `ngx::async_` without an explicit dependency and design change.
+
+### When upgrading `ngx`
+
+1. Bump `ngx` (and usually `nginx-sys`) in `Cargo.toml`, run `cargo update`, rebuild via **Docker** (not bare `cargo build`).
+2. Read the [ngx-rust release notes](https://github.com/nginx/ngx-rust/releases) for breaking changes.
+3. Re-check every `ngx::` / raw FFI callsite; run CI and integration tests.
+4. Update this section’s version numbers and any API notes that changed.
 
 ## Building and Testing
 
@@ -96,14 +132,18 @@ cp .env.example .env
 ```
 src/
 ├── lib.rs              # Module entry point, NGINX integration, poller lifecycle
+├── log.rs              # crowdsec_*! logging macros (cycle/conf/request log targets)
+├── conf/               # NgxConfExt and config parse helpers
+├── lapi.rs             # Shared LAPI User-Agent and ureq agent
+├── response.rs         # send_header → output_filter → finalize helpers
+├── usage_metrics.rs    # LAPI POST /v1/usage-metrics
 ├── appsec.rs           # CrowdSec AppSec + bot challenge HTTP client
 ├── config.rs           # Configuration structures and directive handlers
 ├── handler.rs          # Main access phase handler (ban/captcha/appsec routing)
 ├── metrics.rs          # Prometheus text metrics location
 ├── realip.rs           # Trusted-proxy client IP (X-Forwarded-For, etc.)
 ├── template.rs         # Ban page template rendering (incl. {{scenario}})
-├── shm.rs              # Shared memory (decision cache, metrics zone, layout magic/version)
-├── store.rs            # Decision storage (hash table + CIDR)
+├── shm.rs              # Shared memory (decision cache, metrics zone, DecisionsSharedZone)
 ├── stream.rs           # CrowdSec LAPI streaming client (background thread)
 ├── types.rs            # Core types (Decision, DecisionType, etc.)
 └── captcha/
@@ -160,11 +200,13 @@ For `.ico` requests (favicon), the module returns minimal responses instead of f
 - Ban + `.ico` → 403 Forbidden (no body)
 - Captcha + `.ico` → 200 OK (minimal body)
 
-### Debug Logging
+### Debug and operational logging
 
-Use `ngx_log_debug_http!(request, "message")` for request-context logging or `ngx_log_debug!(log, "message")` for raw pointer contexts. These only appear when NGINX debug logging is enabled.
+- **Per-request debug**: `ngx_log_debug_http!(request, "…")` or `ngx_log_debug!(log, "…")` — only when `error_log … debug;`.
+- **Worker / poller / SHM**: `crowdsec_notice!`, `crowdsec_warn!`, etc. with `log::cycle_log()` — written to nginx `error_log` at the matching level.
+- **Config parse**: `ngx_conf_log_error!` or `NgxConfExt::error()`.
 
-For startup/config errors without request context, `eprintln!` is appropriate (goes to NGINX error log).
+See [docs/configuration.md — Logging and debugging LAPI polling](docs/configuration.md#logging-and-debugging-lapi-polling) for what the stream poller logs and when steady-state polls are silent.
 
 ## Configuration Directives
 
@@ -240,9 +282,11 @@ podman-compose down -v && podman-compose build --no-cache && podman-compose up
 
 ## Code Style Notes
 
-- Use `ngx_log_debug_http!` / `ngx_log_debug!` for debug logging
-- NGINX FFI requires careful memory management (allocate from request pool)
-- All NGINX types require `unsafe` blocks
-- The `ngx` crate provides safe wrappers where possible
-- Prefer editing existing files over creating new ones
+- Verify **`ngx` 0.5.1 APIs** on docs.rs (or registry source) before adding new NGINX integration code — see [NGINX Rust SDK](#nginx-rust-ngx-sdk--read-before-coding).
+- Use `crowdsec_*!` / `ngx_log_debug_http!` for logging; never `eprintln!` for module output.
+- NGINX FFI requires careful memory management (allocate from request pool).
+- All NGINX types require `unsafe` blocks where raw pointers are used.
+- The `ngx` crate provides safe wrappers where possible — prefer them over new raw FFI.
+- Prefer editing existing files over creating new ones.
+- Match patterns in [nginx-acme](https://github.com/nginx/nginx-acme) when unsure about idiomatic ngx-rust usage.
 
