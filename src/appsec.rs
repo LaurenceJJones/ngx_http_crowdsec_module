@@ -1,4 +1,5 @@
 use crate::captcha::send_captcha_page;
+use crate::lapi;
 use crate::config::{AppSecFailureAction, LocConfig, MainConfig};
 use crate::handler::{HandlerResult, get_client_ip, send_raw_response};
 use crate::request_body::{
@@ -24,7 +25,7 @@ pub struct AppSecConfig {
 }
 
 static CONFIG: Mutex<Option<AppSecConfig>> = Mutex::new(None);
-static AGENT: LazyLock<ureq::Agent> = LazyLock::new(ureq::Agent::new);
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(lapi::agent);
 
 /// Stored in the module request context while AppSec waits for the body.
 #[repr(C)]
@@ -381,6 +382,7 @@ fn call_appsec(
     } else {
         AGENT.get(&config.url)
     }
+    .set("User-Agent", lapi::BOUNCER_USER_AGENT)
     .set("X-Crowdsec-Appsec-Ip", &ip.to_string())
     .set("X-Crowdsec-Appsec-Uri", uri)
     .set("X-Crowdsec-Appsec-Host", host)
@@ -397,7 +399,7 @@ fn call_appsec(
         if !name.to_ascii_lowercase().starts_with("x-crowdsec-appsec-")
             && !matches!(
                 name.to_ascii_lowercase().as_str(),
-                "connection" | "transfer-encoding" | "upgrade"
+                "connection" | "transfer-encoding" | "upgrade" | "user-agent"
             )
         {
             call = call.set(name, value);
@@ -429,10 +431,11 @@ fn apply_appsec_response(
     }
 
     let Ok(envelope) = response.into_json::<Envelope>() else {
+        crate::usage_metrics::record_appsec_dropped(ip);
         return HandlerResult::Forbidden;
     };
 
-    match envelope.action.as_str() {
+    let result = match envelope.action.as_str() {
         "allow" => HandlerResult::Declined,
         "ban" => HandlerResult::Forbidden,
         "captcha" => {
@@ -485,7 +488,16 @@ fn apply_appsec_response(
         }
         _ if internal_challenge => HandlerResult::Forbidden,
         _ => HandlerResult::Forbidden,
+    };
+
+    if !matches!(
+        result,
+        HandlerResult::Declined | HandlerResult::Error | HandlerResult::AppSecPending
+    ) {
+        crate::usage_metrics::record_appsec_dropped(ip);
     }
+
+    result
 }
 
 fn finalize_precontent_result(r: *mut ngx_http_request_t, result: HandlerResult) {

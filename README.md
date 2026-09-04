@@ -117,6 +117,7 @@ docker build -f docker/Dockerfile --build-arg NGINX_VERSION=1.24.0 -t nginx-crow
 - **SHM after upgrade** — if reload fails with a layout/magic mismatch, do a full `nginx` stop/start (not reload).
 - **Wrong `.so`** — module must match NGINX version and build; check `nginx -V` against the release compatibility file.
 - **No decisions** — test LAPI: `curl -H "X-Api-Key: KEY" http://127.0.0.1:8080/v1/decisions/stream?startup=true`.
+- **No poll log lines** — steady-state polls are silent when there are no decision changes; see [Logging and debugging LAPI polling](docs/configuration.md#logging-and-debugging-lapi-polling).
 
 More: [docs/configuration.md#troubleshooting](docs/configuration.md#troubleshooting).
 

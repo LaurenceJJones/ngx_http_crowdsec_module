@@ -7,7 +7,9 @@ use crate::captcha::{self, CaptchaHandler};
 use crate::config::{BanActionMode, LocConfig, MainConfig};
 use crate::realip;
 use crate::shm::{self, DecisionType, LookupResult};
+use crate::usage_metrics;
 use crate::template::{Template, TemplateVariables};
+use crate::response::{HeaderFailureAction, body_chain, send_chain_and_finalize};
 use ngx::core::{Buffer, Status};
 use ngx::ffi::ngx_http_request_t;
 use ngx::http::{HTTPStatus, Method, Request};
@@ -120,10 +122,12 @@ pub fn handle_access(
     if !main_conf.bypass_cidrs.is_empty()
         && crate::realip::ip_in_cidr_list(&client_ip, &main_conf.bypass_cidrs)
     {
+        usage_metrics::record_processed(&client_ip);
         shm::metrics_inc_http_bypass();
         return HandlerResult::Declined;
     }
 
+    usage_metrics::record_processed(&client_ip);
     shm::metrics_inc_http_lookup();
 
     // Lookup IP in shared memory
@@ -145,6 +149,7 @@ pub fn handle_access(
     // Route based on decision type (Ban has priority over Captcha)
     match lookup.decision_type {
         DecisionType::Ban => {
+            usage_metrics::record_dropped(&client_ip, lookup.origin, lookup.scenario_id);
             if loc_conf.ban_action == Some(BanActionMode::Redirect) {
                 if let Some(ref url) = loc_conf.ban_redirect_url {
                     let code = loc_conf.ban_redirect_code.unwrap_or(302);
@@ -178,7 +183,7 @@ pub fn handle_access(
             HandlerResult::Forbidden
         }
         DecisionType::Captcha => {
-            // Handle captcha challenge
+            usage_metrics::record_dropped(&client_ip, lookup.origin, lookup.scenario_id);
             handle_captcha_decision(request, loc_conf, &client_ip)
         }
         DecisionType::Unknown => {
@@ -619,54 +624,8 @@ fn send_ban_response(
     );
     request.add_header_out("Pragma", "no-cache");
 
-    // Get pool and raw request pointer
-    let pool = request.pool();
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-
-    // Create buffer from rendered body using Pool's helper method
-    let mut buffer = match pool.create_buffer_from_str(&body) {
-        Some(buf) => buf,
-        None => return Err(()),
-    };
-
-    // Mark buffer as last in request and chain
-    buffer.set_last_buf(true);
-    buffer.set_last_in_chain(true);
-
-    // Create chain link (still needs manual FFI - no SDK wrapper)
-    let cl = unsafe {
-        let cl = ngx::ffi::ngx_alloc_chain_link(pool.as_ptr());
-        if cl.is_null() {
-            return Err(());
-        }
-        (*cl).buf = buffer.as_ngx_buf_mut();
-        (*cl).next = std::ptr::null_mut();
-        cl
-    };
-
-    // Send headers first
-    let header_status = request.send_header();
-    if header_status != Status::NGX_OK {
-        // Header sending failed or was filtered out
-        // For HEAD requests, this is normal - just finalize
-        if request.header_only() {
-            unsafe {
-                ngx::ffi::ngx_http_finalize_request(r, header_status.into());
-            }
-            return Ok(());
-        }
-        return Err(());
-    }
-
-    // Send body using output filter - pass pointer to pool-allocated chain
-    let rc = unsafe { ngx::ffi::ngx_http_output_filter(r, cl) };
-
-    // Finalize the request
-    unsafe {
-        ngx::ffi::ngx_http_finalize_request(r, rc);
-    }
-
-    Ok(())
+    let cl = body_chain(request, &body)?;
+    send_chain_and_finalize(request, cl, HeaderFailureAction::HeadOrError)
 }
 
 #[cfg(test)]

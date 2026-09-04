@@ -1,5 +1,7 @@
 use crate::captcha::{CaptchaConfig, CaptchaProvider, CookieSecure};
+use crate::conf::{ConfValueError, NgxConfExt};
 use crate::realip::TrustedCidr;
+use crate::shm::DecisionsSharedZone;
 use crate::template::Template;
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, NgxStr};
 use ngx::ffi::{
@@ -31,6 +33,8 @@ pub struct MainConfig {
     pub lapi_timeout_secs: Option<u64>,
     /// Shared memory size in bytes (default: 1MB)
     pub shm_size: Option<usize>,
+    /// Lifecycle state for the `crowdsec_decisions` shared zone.
+    pub decisions_zone: DecisionsSharedZone,
     pub appsec_url: Option<String>,
     pub appsec_api_key: Option<String>,
     pub appsec_timeout_ms: Option<u64>,
@@ -44,6 +48,42 @@ pub struct MainConfig {
     pub real_ip_header: Option<String>,
     /// Resolved client IPs in these CIDRs skip CrowdSec enforcement (health checks, internal probes).
     pub bypass_cidrs: Vec<TrustedCidr>,
+    /// Seconds between LAPI usage-metrics pushes (`0` disables). Default: 900 (15 minutes).
+    pub usage_metrics_interval_secs: Option<u64>,
+    /// Set when any merged location has `crowdsec on` (including inherited).
+    pub enforcement_requested: bool,
+}
+
+impl MainConfig {
+    /// Warn when LAPI settings are incomplete but enforcement or partial LAPI config was requested.
+    pub fn validate_lapi_config(&self, cf: &ngx_conf_t) {
+        use ngx::ngx_conf_log_error;
+        use ngx::ffi::NGX_LOG_WARN;
+
+        let url_set = self.lapi_url.is_some();
+        let key_set = self.api_key.is_some();
+        let needs_lapi = self.enforcement_requested || url_set || key_set;
+
+        if !needs_lapi {
+            return;
+        }
+
+        let cfp = core::ptr::from_ref(cf).cast_mut();
+        if self.lapi_url.is_none() {
+            ngx_conf_log_error!(
+                NGX_LOG_WARN,
+                cfp,
+                "crowdsec: crowdsec_url is not set; LAPI stream polling disabled"
+            );
+        }
+        if self.api_key.is_none() {
+            ngx_conf_log_error!(
+                NGX_LOG_WARN,
+                cfp,
+                "crowdsec: crowdsec_api_key is not set; LAPI stream polling disabled"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -164,6 +204,75 @@ impl LocConfig {
         Ok(())
     }
 
+    /// Merge inherited fields from `prev`, then validate enforcement settings.
+    pub fn merge_from(&mut self, prev: &LocConfig) -> Result<(), &'static str> {
+        if self.enabled.is_none() {
+            self.enabled = prev.enabled;
+        }
+        if self.ban_template.is_none() {
+            self.ban_template = prev.ban_template.clone();
+        }
+        if self.ban_action.is_none() {
+            self.ban_action = prev.ban_action;
+        }
+        if self.ban_redirect_url.is_none() {
+            self.ban_redirect_url = prev.ban_redirect_url.clone();
+        }
+        if self.ban_redirect_code.is_none() {
+            self.ban_redirect_code = prev.ban_redirect_code;
+        }
+        if self.captcha_template.is_none() {
+            self.captcha_template = prev.captcha_template.clone();
+        }
+        if self.captcha_provider.is_none() {
+            self.captcha_provider = prev.captcha_provider;
+        }
+        if self.captcha_site_key.is_none() {
+            self.captcha_site_key = prev.captcha_site_key.clone();
+        }
+        if self.captcha_secret_key.is_none() {
+            self.captcha_secret_key = prev.captcha_secret_key.clone();
+        }
+        if self.captcha_signing_key.is_none() {
+            self.captcha_signing_key = prev.captcha_signing_key;
+        }
+        if self.captcha_cookie_name.is_none() {
+            self.captcha_cookie_name = prev.captcha_cookie_name.clone();
+        }
+        if self.captcha_expiry_secs.is_none() {
+            self.captcha_expiry_secs = prev.captcha_expiry_secs;
+        }
+        if self.captcha_fail_open.is_none() {
+            self.captcha_fail_open = prev.captcha_fail_open;
+        }
+        if self.captcha_bind_ip.is_none() {
+            self.captcha_bind_ip = prev.captcha_bind_ip;
+        }
+        if self.captcha_cookie_secure.is_none() {
+            self.captcha_cookie_secure = prev.captcha_cookie_secure;
+        }
+        if self.appsec_enabled.is_none() {
+            self.appsec_enabled = prev.appsec_enabled;
+        }
+        if self.appsec_always.is_none() {
+            self.appsec_always = prev.appsec_always;
+        }
+        if self.static_asset_extensions.is_none() {
+            self.static_asset_extensions = prev.static_asset_extensions.clone();
+        }
+        if self.appsec_failure_action.is_none() {
+            self.appsec_failure_action = prev.appsec_failure_action;
+        }
+        if self.bot_challenge_enabled.is_none() {
+            self.bot_challenge_enabled = prev.bot_challenge_enabled;
+        }
+        if self.metrics_enabled.is_none() {
+            self.metrics_enabled = prev.metrics_enabled;
+        }
+
+        self.validate_enforcement()
+    }
+
     /// Whether the request path should use minimal ban/captcha responses (no HTML body).
     pub fn is_static_asset_path(&self, path: &str) -> bool {
         match &self.static_asset_extensions {
@@ -243,22 +352,23 @@ pub extern "C" fn ngx_http_crowdsec_set_url(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    let cf = unsafe { cf.as_mut().expect("cf") };
     let conf = unsafe { &mut *(conf as *mut MainConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                return NGX_CONF_ERROR;
-            }
-        };
-
-        conf.lapi_url = Some(value_str.to_string());
+    let args = cf.args();
+    if args.len() < 2 {
+        return cf.error("crowdsec_url", &ConfValueError("missing argument"));
     }
 
+    let value_str = match unsafe { NgxStr::from_ngx_str(args[1]) }.to_str() {
+        Ok(s) => s,
+        Err(err) => return cf.error("crowdsec_url", &err),
+    };
+
+    if value_str.is_empty() {
+        return cf.error("crowdsec_url", &ConfValueError("URL must not be empty"));
+    }
+
+    conf.lapi_url = Some(value_str.to_string());
     NGX_CONF_OK
 }
 
@@ -272,22 +382,26 @@ pub extern "C" fn ngx_http_crowdsec_set_api_key(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    let cf = unsafe { cf.as_mut().expect("cf") };
     let conf = unsafe { &mut *(conf as *mut MainConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                return NGX_CONF_ERROR;
-            }
-        };
-
-        conf.api_key = Some(value_str.to_string());
+    let args = cf.args();
+    if args.len() < 2 {
+        return cf.error("crowdsec_api_key", &ConfValueError("missing argument"));
     }
 
+    let value_str = match unsafe { NgxStr::from_ngx_str(args[1]) }.to_str() {
+        Ok(s) => s,
+        Err(err) => return cf.error("crowdsec_api_key", &err),
+    };
+
+    if value_str.is_empty() {
+        return cf.error(
+            "crowdsec_api_key",
+            &ConfValueError("API key must not be empty"),
+        );
+    }
+
+    conf.api_key = Some(value_str.to_string());
     NGX_CONF_OK
 }
 
@@ -391,9 +505,58 @@ pub extern "C" fn ngx_http_crowdsec_set_poll_interval(
                 conf.poll_interval_secs = Some(n);
             }
             _ => {
-                eprintln!("crowdsec: poll_interval must be 1-3600 seconds");
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: poll_interval must be 1-3600 seconds"
+                );
                 return NGX_CONF_ERROR;
             }
+        }
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_usage_metrics_interval <seconds>|off;`
+///
+/// # Safety
+/// Called by NGINX during configuration parsing.
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_usage_metrics_interval(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let cf = unsafe { cf.as_mut().expect("cf") };
+    let conf = unsafe { &mut *(conf as *mut MainConfig) };
+    let args = cf.args();
+    if args.len() < 2 {
+        return cf.error(
+            "crowdsec_usage_metrics_interval",
+            &ConfValueError("missing argument"),
+        );
+    }
+
+    let value_str = match unsafe { NgxStr::from_ngx_str(args[1]) }.to_str() {
+        Ok(s) => s,
+        Err(err) => return cf.error("crowdsec_usage_metrics_interval", &err),
+    };
+
+    if value_str.eq_ignore_ascii_case("off") {
+        conf.usage_metrics_interval_secs = Some(0);
+        return NGX_CONF_OK;
+    }
+
+    match value_str.parse::<u64>() {
+        Ok(n) if (600..=86400).contains(&n) || n == 0 => {
+            conf.usage_metrics_interval_secs = Some(n);
+        }
+        _ => {
+            return cf.error(
+                "crowdsec_usage_metrics_interval",
+                &ConfValueError("must be 600-86400 seconds or off"),
+            );
         }
     }
 
@@ -428,7 +591,11 @@ pub extern "C" fn ngx_http_crowdsec_set_lapi_timeout(
                 conf.lapi_timeout_secs = Some(n);
             }
             _ => {
-                eprintln!("crowdsec: lapi_timeout must be 1-600 seconds");
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: lapi_timeout must be 1-600 seconds"
+                );
                 return NGX_CONF_ERROR;
             }
         }
@@ -465,11 +632,24 @@ pub extern "C" fn ngx_http_crowdsec_set_shm_size(
         let size = parse_size(value_str);
         match size {
             Some(s) if s >= 64 * 1024 => {
-                // Minimum 64KB
                 conf.shm_size = Some(s);
+                if unsafe { crate::shm::decisions_zone_early_request(cf, &mut conf.decisions_zone, s) }
+                    .is_err()
+                {
+                    let cf_ref = unsafe { &*cf };
+                    return cf_ref.error(
+                        "crowdsec_shm_size",
+                        &ConfValueError("failed to request crowdsec_decisions shared zone"),
+                    );
+                }
             }
             _ => {
-                eprintln!("crowdsec: invalid shm_size '{}' (minimum 64k)", value_str);
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: invalid shm_size '{}' (minimum 64k)",
+                    value_str
+                );
                 return NGX_CONF_ERROR;
             }
         }
@@ -518,7 +698,9 @@ pub extern "C" fn ngx_http_crowdsec_set_trusted_proxies(
                 Err(_) => return NGX_CONF_ERROR,
             };
             if s.eq_ignore_ascii_case("off") {
-                eprintln!(
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
                     "crowdsec: 'off' cannot be combined with other trusted_proxies arguments"
                 );
                 return NGX_CONF_ERROR;
@@ -526,7 +708,12 @@ pub extern "C" fn ngx_http_crowdsec_set_trusted_proxies(
             match TrustedCidr::parse(s) {
                 Ok(cidr) => conf.trusted_proxies.push(cidr),
                 Err(()) => {
-                    eprintln!("crowdsec: invalid trusted_proxies entry '{}'", s);
+                    ngx::ngx_conf_log_error!(
+                        ngx::ffi::NGX_LOG_ERR,
+                        cf,
+                        "crowdsec: invalid trusted_proxies entry '{}'",
+                        s
+                    );
                     return NGX_CONF_ERROR;
                 }
             }
@@ -577,13 +764,22 @@ pub extern "C" fn ngx_http_crowdsec_set_bypass(
                 Err(_) => return NGX_CONF_ERROR,
             };
             if s.eq_ignore_ascii_case("off") {
-                eprintln!("crowdsec: 'off' cannot be combined with other bypass arguments");
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: 'off' cannot be combined with other bypass arguments"
+                );
                 return NGX_CONF_ERROR;
             }
             match TrustedCidr::parse(s) {
                 Ok(cidr) => conf.bypass_cidrs.push(cidr),
                 Err(()) => {
-                    eprintln!("crowdsec: invalid bypass entry '{}'", s);
+                    ngx::ngx_conf_log_error!(
+                        ngx::ffi::NGX_LOG_ERR,
+                        cf,
+                        "crowdsec: invalid bypass entry '{}'",
+                        s
+                    );
                     return NGX_CONF_ERROR;
                 }
             }
@@ -616,7 +812,11 @@ pub extern "C" fn ngx_http_crowdsec_set_real_ip_header(
 
         let trimmed = value_str.trim();
         if trimmed.is_empty() || trimmed.chars().any(|c| c == ' ' || c == '\t') {
-            eprintln!("crowdsec: real_ip_header must be a single token");
+            ngx::ngx_conf_log_error!(
+                ngx::ffi::NGX_LOG_ERR,
+                cf,
+                "crowdsec: real_ip_header must be a single token"
+            );
             return NGX_CONF_ERROR;
         }
 
@@ -694,9 +894,12 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_template(
                     }
                     Err(e) => {
                         // Log error - in production would use ngx::log
-                        eprintln!(
+                        ngx::ngx_conf_log_error!(
+                            ngx::ffi::NGX_LOG_ERR,
+                            cf,
                             "crowdsec: failed to load ban template from {}: {}",
-                            path_str, e
+                            path_str,
+                            e
                         );
                         return NGX_CONF_ERROR;
                     }
@@ -750,7 +953,11 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_action(
         } else if value_str.eq_ignore_ascii_case("redirect") {
             BanActionMode::Redirect
         } else {
-            eprintln!("crowdsec: ban_action must be block or redirect");
+            ngx::ngx_conf_log_error!(
+                ngx::ffi::NGX_LOG_ERR,
+                cf,
+                "crowdsec: ban_action must be block or redirect"
+            );
             return NGX_CONF_ERROR;
         };
 
@@ -782,7 +989,9 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_redirect_url(
         };
 
         if !validate_ban_redirect_url(value_str) {
-            eprintln!(
+            ngx::ngx_conf_log_error!(
+                ngx::ffi::NGX_LOG_ERR,
+                cf,
                 "crowdsec: ban_redirect_url must be http:// or https:// and at most 2048 characters"
             );
             return NGX_CONF_ERROR;
@@ -831,7 +1040,9 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_redirect_code(
         if let Some(code) = parse_ban_redirect_code(value_str) {
             conf.ban_redirect_code = Some(code);
         } else {
-            eprintln!(
+            ngx::ngx_conf_log_error!(
+                ngx::ffi::NGX_LOG_ERR,
+                cf,
                 "crowdsec: ban_redirect_code must be 301, 302, 303, 307, or 308 (got '{}')",
                 value_str.trim()
             );
@@ -895,7 +1106,9 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_provider(
         let provider = match CaptchaProvider::from_str(value_str) {
             Some(p) => p,
             None => {
-                eprintln!(
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
                     "crowdsec: invalid captcha provider '{}' (expected: hcaptcha, turnstile, recaptcha)",
                     value_str
                 );
@@ -989,7 +1202,9 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_signing_key(
         let key = match parse_hex_key(value_str) {
             Some(k) => k,
             None => {
-                eprintln!(
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
                     "crowdsec: invalid signing key (expected 64 hex characters, got {} chars)",
                     value_str.len()
                 );
@@ -1072,7 +1287,11 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_expiry(
                 conf.captcha_expiry_secs = Some(n);
             }
             _ => {
-                eprintln!("crowdsec: invalid captcha expiry (1-2592000 seconds)");
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: invalid captcha expiry (1-2592000 seconds)"
+                );
                 return NGX_CONF_ERROR;
             }
         }
@@ -1164,7 +1383,9 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_cookie_secure(
         match CookieSecure::from_str(value_str) {
             Some(secure) => conf.captcha_cookie_secure = Some(secure),
             None => {
-                eprintln!(
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
                     "crowdsec: invalid cookie_secure value '{}', expected auto|on|off",
                     value_str
                 );
@@ -1209,9 +1430,12 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_template(
                     arc_template
                 }
                 Err(e) => {
-                    eprintln!(
+                    ngx::ngx_conf_log_error!(
+                        ngx::ffi::NGX_LOG_ERR,
+                        cf,
                         "crowdsec: failed to load captcha template from {}: {}",
-                        path_str, e
+                        path_str,
+                        e
                     );
                     return NGX_CONF_ERROR;
                 }
@@ -1407,11 +1631,19 @@ pub extern "C" fn ngx_http_crowdsec_set_static_extensions(
                 Err(_) => return NGX_CONF_ERROR,
             };
             if s.eq_ignore_ascii_case("off") {
-                eprintln!("crowdsec: 'off' cannot be combined with other static_extensions arguments");
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: 'off' cannot be combined with other static_extensions arguments"
+                );
                 return NGX_CONF_ERROR;
             }
             let Some(ext) = normalize_static_extension(s) else {
-                eprintln!("crowdsec: invalid static extension '{s}'");
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: invalid static extension '{s}'"
+                );
                 return NGX_CONF_ERROR;
             };
             if !list.iter().any(|e| e.eq_ignore_ascii_case(&ext)) {
@@ -1425,7 +1657,7 @@ pub extern "C" fn ngx_http_crowdsec_set_static_extensions(
 
 /// The array is null-terminated with an empty command.
 #[rustfmt::skip]
-pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 37] = [
+pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 38] = [
     // crowdsec on|off; - enable/disable at location level
     ngx_command_t {
         name: ngx_string!("crowdsec"),
@@ -1512,6 +1744,15 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 37] = [
         name: ngx_string!("crowdsec_poll_interval"),
         type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_poll_interval),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
+    // crowdsec_usage_metrics_interval <seconds>|off; - LAPI usage metrics push interval (default: 900)
+    ngx_command_t {
+        name: ngx_string!("crowdsec_usage_metrics_interval"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_usage_metrics_interval),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
         post: std::ptr::null_mut(),

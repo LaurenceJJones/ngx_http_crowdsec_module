@@ -4,19 +4,27 @@
 //! It uses the stream mode to efficiently sync decisions and checks incoming
 //! requests against a shared memory decision cache accessible by all workers.
 
+#[macro_use]
+mod log;
+
 mod appsec;
 mod captcha;
+mod conf;
 mod config;
+mod lapi;
 mod handler;
 mod metrics;
 mod realip;
 mod request_body;
+mod response;
 pub mod shm;
 mod stream;
 mod template;
 mod types;
+mod usage_metrics;
 
 use config::{DEFAULT_SHM_SIZE, LocConfig, MainConfig, NGX_HTTP_CROWDSEC_COMMANDS};
+use conf::{ConfValueError, NgxConfExt};
 use handler::{handle_access, handle_precontent};
 use ngx::core::Status;
 use ngx::ffi::{
@@ -28,7 +36,8 @@ use ngx::http::{
     HttpModule, HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError,
     NgxHttpCoreModule, Request,
 };
-use ngx::{http_request_handler, ngx_modules, ngx_string};
+use ngx::{http_request_handler, ngx_conf_log_error, ngx_modules, ngx_string};
+use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -58,77 +67,7 @@ unsafe impl HttpModuleLocationConf for Module {
 
 impl Merge for LocConfig {
     fn merge(&mut self, prev: &LocConfig) -> Result<(), MergeConfigError> {
-        if self.enabled.is_none() {
-            self.enabled = prev.enabled;
-        }
-        if self.ban_template.is_none() {
-            self.ban_template = prev.ban_template.clone();
-        }
-        if self.ban_action.is_none() {
-            self.ban_action = prev.ban_action;
-        }
-        if self.ban_redirect_url.is_none() {
-            self.ban_redirect_url = prev.ban_redirect_url.clone();
-        }
-        if self.ban_redirect_code.is_none() {
-            self.ban_redirect_code = prev.ban_redirect_code;
-        }
-        if self.captcha_template.is_none() {
-            self.captcha_template = prev.captcha_template.clone();
-        }
-        // Captcha configuration inheritance
-        if self.captcha_provider.is_none() {
-            self.captcha_provider = prev.captcha_provider;
-        }
-        if self.captcha_site_key.is_none() {
-            self.captcha_site_key = prev.captcha_site_key.clone();
-        }
-        if self.captcha_secret_key.is_none() {
-            self.captcha_secret_key = prev.captcha_secret_key.clone();
-        }
-        if self.captcha_signing_key.is_none() {
-            self.captcha_signing_key = prev.captcha_signing_key;
-        }
-        if self.captcha_cookie_name.is_none() {
-            self.captcha_cookie_name = prev.captcha_cookie_name.clone();
-        }
-        if self.captcha_expiry_secs.is_none() {
-            self.captcha_expiry_secs = prev.captcha_expiry_secs;
-        }
-        if self.captcha_fail_open.is_none() {
-            self.captcha_fail_open = prev.captcha_fail_open;
-        }
-        if self.captcha_bind_ip.is_none() {
-            self.captcha_bind_ip = prev.captcha_bind_ip;
-        }
-        if self.captcha_cookie_secure.is_none() {
-            self.captcha_cookie_secure = prev.captcha_cookie_secure;
-        }
-        if self.appsec_enabled.is_none() {
-            self.appsec_enabled = prev.appsec_enabled;
-        }
-        if self.appsec_always.is_none() {
-            self.appsec_always = prev.appsec_always;
-        }
-        if self.static_asset_extensions.is_none() {
-            self.static_asset_extensions = prev.static_asset_extensions.clone();
-        }
-        if self.appsec_failure_action.is_none() {
-            self.appsec_failure_action = prev.appsec_failure_action;
-        }
-        if self.bot_challenge_enabled.is_none() {
-            self.bot_challenge_enabled = prev.bot_challenge_enabled;
-        }
-        if self.metrics_enabled.is_none() {
-            self.metrics_enabled = prev.metrics_enabled;
-        }
-
-        if let Err(msg) = self.validate_enforcement() {
-            eprintln!("crowdsec: {msg}");
-            return Err(MergeConfigError::NoValue);
-        }
-
-        Ok(())
+        self.merge_from(prev).map_err(|_| MergeConfigError::NoValue)
     }
 }
 
@@ -169,26 +108,68 @@ impl HttpModule for Module {
         unsafe { &*::core::ptr::addr_of!(ngx_http_crowdsec_module) }
     }
 
+    unsafe extern "C" fn init_main_conf(cf: *mut ngx_conf_t, conf: *mut c_void) -> *mut c_char {
+        let cf = unsafe { cf.as_ref().expect("cf") };
+        let conf = unsafe { &*(conf as *mut MainConfig) };
+        conf.validate_lapi_config(cf);
+        core::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn merge_loc_conf(
+        cf: *mut ngx_conf_t,
+        prev: *mut c_void,
+        conf: *mut c_void,
+    ) -> *mut c_char {
+        let cf = unsafe { cf.as_ref().expect("cf") };
+        let prev = unsafe { &*(prev as *mut LocConfig) };
+        let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+        match conf.merge_from(prev) {
+            Ok(()) => {
+                if conf.enabled == Some(true) {
+                    if let Some(main) = Self::main_conf_mut(cf) {
+                        main.enforcement_requested = true;
+                    }
+                }
+                core::ptr::null_mut()
+            }
+            Err(msg) => cf.error("crowdsec", &ConfValueError(msg)),
+        }
+    }
+
     unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
         unsafe {
             // Get the main configuration
-            let conf = match Self::main_conf(&*cf) {
+            let conf = match Self::main_conf_mut(&mut *cf) {
                 Some(c) => c,
                 None => return Status::NGX_ERROR.into(),
             };
 
             // Initialize shared memory zone
             let shm_size = conf.shm_size.unwrap_or(DEFAULT_SHM_SIZE);
-            let shm_name: ngx_str_t = ngx_string!("crowdsec_decisions");
 
-            if shm::init_shm_zone(cf, &shm_name, shm_size).is_err() {
-                eprintln!("crowdsec: failed to initialize shared memory zone");
+            if shm::init_decisions_zone(cf, &mut conf.decisions_zone, shm_size).is_err() {
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: failed to initialize shared memory zone"
+                );
                 return Status::NGX_ERROR.into();
             }
 
             if shm::init_metrics_shm_zone(cf).is_err() {
-                eprintln!(
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_WARN,
+                    cf,
                     "crowdsec: warning: failed to init crowdsec_metrics shared zone; counters disabled"
+                );
+            }
+
+            if usage_metrics::init_usage_metrics_shm_zone(cf).is_err() {
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_WARN,
+                    cf,
+                    "crowdsec: warning: failed to init crowdsec_usage_metrics shared zone; LAPI metrics disabled"
                 );
             }
 
@@ -202,6 +183,9 @@ impl HttpModule for Module {
                         timeout_secs: conf.lapi_timeout_secs.unwrap_or(30),
                         max_retries: conf.max_retries.unwrap_or(3),
                         retry_interval_secs: conf.retry_interval_secs.unwrap_or(5),
+                        usage_metrics_interval_secs: conf
+                            .usage_metrics_interval_secs
+                            .unwrap_or(900),
                     }),
                     _ => None,
                 };
@@ -273,6 +257,7 @@ pub unsafe extern "C" fn ngx_http_crowdsec_init_worker(_cycle: *mut ngx_cycle_t)
     }
 
     // This worker won the election - start polling thread.
+    usage_metrics::record_startup();
     let client = StreamClient::new(config);
     let handle = client.spawn_polling_thread();
     *POLLING_HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
@@ -286,9 +271,22 @@ pub unsafe extern "C" fn ngx_http_crowdsec_init_worker(_cycle: *mut ngx_cycle_t)
 /// This function is called by NGINX and must follow C calling conventions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ngx_http_crowdsec_exit_worker(_cycle: *mut ngx_cycle_t) {
-    // Only the poller worker needs to stop the thread
+    // Only the poller worker ships stream polls and usage metrics.
     if !shm::is_poller() {
         return;
+    }
+
+    if let Some(config) = GLOBAL_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        usage_metrics::flush_on_shutdown(
+            &config.url,
+            &config.api_key,
+            config.timeout_secs,
+            config.usage_metrics_interval_secs,
+        );
     }
 
     // Signal polling thread to stop
@@ -309,7 +307,7 @@ static NGX_HTTP_CROWDSEC_MODULE_CTX: ngx_http_module_t = ngx_http_module_t {
     preconfiguration: None,
     postconfiguration: Some(Module::postconfiguration),
     create_main_conf: Some(Module::create_main_conf),
-    init_main_conf: None,
+    init_main_conf: Some(Module::init_main_conf),
     create_srv_conf: None,
     merge_srv_conf: None,
     create_loc_conf: Some(Module::create_loc_conf),
@@ -330,6 +328,7 @@ pub static mut ngx_http_crowdsec_module: ngx_module_t = ngx_module_t {
 };
 
 // Export modules for dynamic loading
+#[cfg(feature = "export-modules")]
 ngx_modules!(ngx_http_crowdsec_module);
 
 #[cfg(test)]

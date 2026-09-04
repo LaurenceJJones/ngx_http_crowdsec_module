@@ -8,7 +8,8 @@ use crate::captcha::cookie::get_cookie;
 use crate::captcha::jwt::JwtManager;
 use crate::shm;
 use crate::template::{Template, TemplateVariables};
-use ngx::core::{Buffer, Status};
+use crate::response::{HeaderFailureAction, body_chain, send_chain_and_finalize};
+use ngx::core::Status;
 use ngx::ffi::ngx_http_request_t;
 use ngx::http::{HTTPStatus, Request};
 use ngx::ngx_log_debug_http;
@@ -111,50 +112,8 @@ pub fn send_captcha_page(
     );
     request.add_header_out("Pragma", "no-cache");
 
-    // Get pool and raw request pointer
-    let pool = request.pool();
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-
-    // Create buffer from rendered body
-    let mut buffer = match pool.create_buffer_from_str(&body) {
-        Some(buf) => buf,
-        None => return Err(()),
-    };
-
-    // Mark buffer as last
-    buffer.set_last_buf(true);
-    buffer.set_last_in_chain(true);
-
-    // Create chain link
-    let cl = unsafe {
-        let cl = ngx::ffi::ngx_alloc_chain_link(pool.as_ptr());
-        if cl.is_null() {
-            return Err(());
-        }
-        (*cl).buf = buffer.as_ngx_buf_mut();
-        (*cl).next = std::ptr::null_mut();
-        cl
-    };
-
-    // Send headers
-    let header_status = request.send_header();
-    if header_status != Status::NGX_OK {
-        if request.header_only() {
-            unsafe {
-                ngx::ffi::ngx_http_finalize_request(r, header_status.into());
-            }
-            return Ok(());
-        }
-        return Err(());
-    }
-
-    // Send body
-    let rc = unsafe { ngx::ffi::ngx_http_output_filter(r, cl) };
-
-    // Finalize request
-    unsafe {
-        ngx::ffi::ngx_http_finalize_request(r, rc);
-    }
+    let cl = body_chain(request, &body)?;
+    send_chain_and_finalize(request, cl, HeaderFailureAction::HeadOrError)?;
 
     shm::metrics_inc_http_captcha();
     Ok(())

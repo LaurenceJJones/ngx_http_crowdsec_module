@@ -49,6 +49,7 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_appsec_failure_action` | http, server, location | `passthrough` | Action when AppSec is unreachable |
 | `crowdsec_appsec_drop_unreadable_body` | http, server, location | `off` | Reject bodies that cannot be buffered |
 | `crowdsec_bot_challenge` | http, server, location | `off` | CrowdSec 1.8 bot challenge (experimental) |
+| `crowdsec_usage_metrics_interval` | http, server | `900` | Push bouncer metrics to LAPI (`POST /v1/usage-metrics`); `off` disables. Pending counters are flushed on worker shutdown (reload/stop). |
 | `crowdsec_metrics` | http, server, location | `off` | Expose Prometheus metrics at this location |
 
 ## Full example
@@ -185,4 +186,47 @@ After a module upgrade that changes the SHM layout, a full **stop/start** (not r
 
 **LAPI connectivity** — `curl -H "X-Api-Key: KEY" http://127.0.0.1:8080/v1/decisions/stream?startup=true` and `cscli bouncers list`.
 
-**Debug** — `error_log ... debug;` in `nginx.conf`.
+**Debug** — per-request CrowdSec messages use `ngx_log_debug_http!`; enable with `error_log ... debug;` in `nginx.conf` (noisy).
+
+### Logging and debugging LAPI polling
+
+The module logs through **nginx's error log**, not stderr. Messages from the background stream poller use the **cycle log** (`cycle_log()`), so they appear in the same `error_log` file as other nginx errors.
+
+Set the global log level to **`notice`** or lower (e.g. `info`, `debug`) to see routine poller messages. At **`warn`** or **`error` only**, successful poll and startup notices are hidden; failures still appear at `warn`.
+
+| Event | Level | When it is logged |
+|-------|-------|-------------------|
+| Poller thread started | `notice` | Once after worker election, includes LAPI URL |
+| Initial sync complete | `notice` | Once after first successful `startup=true` poll |
+| Initial sync retry | `warn` | Each failed startup attempt before success |
+| Stream update | `notice` | Only when a poll returns **new or deleted** decisions (`new > 0` or `deleted > 0`) |
+| Stream poll failed | `warn` | HTTP/JSON errors (fail-open; nginx keeps serving) |
+| Usage-metrics push failed | `warn` | LAPI rejected or unreachable `POST /v1/usage-metrics` |
+| Poller thread stopped | `notice` | Worker shutdown |
+| Config / SHM errors | `err` / `warn` | During `nginx -t` or startup (see messages below) |
+
+**Steady-state polls are intentionally quiet.** With default `crowdsec_poll_interval 10`, the poller runs every 10 seconds but **does not log** when the delta is empty (`0 new, 0 deleted`). That is normal — absence of log lines does not mean polling stopped.
+
+**Verify polling without log noise:**
+
+```bash
+# Bouncer last pull timestamp should advance every poll interval
+cscli bouncers list
+
+# CrowdSec LAPI access log (path varies by install)
+grep 'decisions/stream' /var/log/crowdsec.log | tail -5
+
+# Prometheus (if crowdsec_metrics is enabled on a location)
+curl -s http://127.0.0.1/metrics | grep crowdsec_lapi_poll
+```
+
+Look for `ngx_http_crowdsec_module/<version>` as the User-Agent on stream and usage-metrics requests (not `ureq`).
+
+**Usage metrics** — pushed every `crowdsec_usage_metrics_interval` seconds (default 900). There is no success log on each push; check LAPI for `POST /v1/usage-metrics` or CrowdSec Console remediation metrics. Pending counters are flushed on worker shutdown/reload.
+
+**Common config warnings at `nginx -t`:**
+
+- `crowdsec_url is not set` / `crowdsec_api_key is not set` — emitted when any location has `crowdsec on` (or one of URL/key is set) but LAPI settings are incomplete; stream polling is disabled until both are set.
+- `failed to allocate usage metrics SHM` — usage-metrics zone too small or exhausted; metrics push disabled until fixed (upgrade to a build with auto-sized zone or increase available SHM).
+
+**Shared memory after upgrade** — if reload fails with a layout/magic mismatch, do a full `nginx` stop/start (not reload only).

@@ -6,8 +6,7 @@
 
 use crate::config::LocConfig;
 use crate::shm;
-use ngx::core::{Buffer, Status};
-use ngx::ffi::ngx_http_request_t;
+use crate::response::{HeaderFailureAction, body_chain, disable_keepalive, send_chain_and_finalize};
 use ngx::http::{HTTPStatus, Method, Request};
 
 /// Result of attempting to serve `/metrics`-style Prometheus text.
@@ -94,11 +93,7 @@ fn send_text_response(
     content_type: &str,
     body: &str,
 ) -> Result<(), ()> {
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-
-    unsafe {
-        (*r).set_keepalive(0);
-    }
+    disable_keepalive(request);
 
     request.set_status(status);
     request.set_content_length_n(body.len());
@@ -106,37 +101,6 @@ fn send_text_response(
     request.add_header_out("Content-Type", content_type);
     request.add_header_out("Cache-Control", "no-store");
 
-    let pool = request.pool();
-
-    let mut buffer = match pool.create_buffer_from_str(body) {
-        Some(buf) => buf,
-        None => return Err(()),
-    };
-    buffer.set_last_buf(true);
-    buffer.set_last_in_chain(true);
-
-    let cl = unsafe {
-        let cl = ngx::ffi::ngx_alloc_chain_link(pool.as_ptr());
-        if cl.is_null() {
-            return Err(());
-        }
-        (*cl).buf = buffer.as_ngx_buf_mut();
-        (*cl).next = std::ptr::null_mut();
-        cl
-    };
-
-    let rc = request.send_header();
-    if rc != Status::NGX_OK {
-        unsafe {
-            ngx::ffi::ngx_http_finalize_request(r, rc.into());
-        }
-        return Ok(());
-    }
-
-    unsafe {
-        let out_rc = ngx::ffi::ngx_http_output_filter(r, cl);
-        ngx::ffi::ngx_http_finalize_request(r, out_rc);
-    }
-
-    Ok(())
+    let cl = body_chain(request, body)?;
+    send_chain_and_finalize(request, cl, HeaderFailureAction::Finalize)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ngx_http_crowdsec_module"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -28,9 +28,11 @@ form_urlencoded = "1.2"
 rand = "0.8"
 
 [features]
-default = []
+default = ["export-modules"]
+export-modules = []
 vendored = ["ngx/vendored"]
 
 [profile.release]
 lto = true
 opt-level = 3
+codegen-units = 1

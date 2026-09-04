@@ -7,6 +7,7 @@
 //! - Clock-based LRU eviction when capacity is reached
 //! - Dynamic capacity based on configured SHM size
 
+use crate::log::cycle_log;
 use ngx::ffi::{
     NGX_OK, ngx_atomic_t, ngx_int_t, ngx_rwlock_rlock, ngx_rwlock_unlock, ngx_rwlock_wlock,
     ngx_shm_zone_t, ngx_slab_alloc_locked, ngx_slab_pool_t, ngx_str_t,
@@ -21,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_SCENARIOS: usize = 256;
 
 /// Maximum length of a scenario string
-const MAX_SCENARIO_LEN: usize = 127;
+pub const MAX_SCENARIO_LEN: usize = 127;
 
 /// Magic at the start of [`ShmData`] (`b"CsD1"`).
 const SHM_MAGIC: u32 = u32::from_le_bytes(*b"CsD1");
@@ -105,7 +106,7 @@ impl DecisionType {
 
 /// Origin of the decision
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Origin {
     /// CrowdSec agent detection
     Crowdsec = 1,
@@ -153,6 +154,14 @@ impl Origin {
             Origin::Console => "console",
             Origin::Lists => "lists",
             Origin::Unknown => "unknown",
+        }
+    }
+
+    /// Label for LAPI usage-metrics (`origin` label), matching LAPI/Lua casing.
+    pub fn metrics_label(self) -> &'static str {
+        match self {
+            Origin::Capi => "CAPI",
+            other => other.as_str(),
         }
     }
 }
@@ -397,8 +406,99 @@ pub struct ShmData {
     cidr_prefixes: [u64; 3],
 }
 
-/// Global pointer to the shared memory zone
+/// Global pointer to the `crowdsec_decisions` shared memory zone (set when requested/finalized).
 static SHM_ZONE: AtomicPtr<ngx_shm_zone_t> = AtomicPtr::new(ptr::null_mut());
+
+/// Lifecycle state for the `crowdsec_decisions` zone (nginx-acme `SharedZone` pattern).
+///
+/// NGINX may invoke a zone's `init` callback before `postconfiguration` finishes replacing
+/// the placeholder. The dummy init marks the zone `Ready` without touching slab data.
+///
+/// `crowdsec_metrics` and `crowdsec_usage_metrics` are fixed-size auxiliary zones initialized
+/// only from `postconfiguration`; they keep the direct init path to limit refactor scope.
+#[derive(Clone, Debug, Default)]
+pub enum DecisionsSharedZone {
+    #[default]
+    Unset,
+    Configured(usize),
+    Requested(*mut ngx_shm_zone_t, usize),
+    Ready(*mut ngx_shm_zone_t, usize),
+}
+
+impl DecisionsSharedZone {
+    pub fn configure(&mut self, size: usize) -> Result<(), ()> {
+        match self {
+            Self::Unset => {
+                *self = Self::Configured(size);
+                Ok(())
+            }
+            Self::Configured(existing) if *existing == size => Ok(()),
+            Self::Configured(_) => Err(()),
+            Self::Requested(_, existing) | Self::Ready(_, existing) if *existing == size => Ok(()),
+            Self::Requested(_, _) | Self::Ready(_, _) => Err(()),
+        }
+    }
+
+    /// Register the zone with a dummy init (safe if NGINX inits before postconfiguration).
+    ///
+    /// # Safety
+    /// Valid `ngx_conf_t` from NGINX configuration parsing.
+    pub unsafe fn request(&mut self, cf: *mut ngx::ffi::ngx_conf_t) -> Result<*mut ngx_shm_zone_t, ()> {
+        unsafe {
+            match self {
+                Self::Configured(size) => {
+                    let zone_size = *size;
+                    let self_ptr = self as *mut Self;
+                    let name: ngx_str_t = ngx_string!("crowdsec_decisions");
+                    let shm_zone = ngx::ffi::ngx_shared_memory_add(
+                        cf,
+                        &name as *const _ as *mut _,
+                        zone_size,
+                        &raw const crate::ngx_http_crowdsec_module as *mut _,
+                    );
+                    if shm_zone.is_null() {
+                        return Err(());
+                    }
+                    (*shm_zone).init = Some(decisions_shm_dummy_init);
+                    (*shm_zone).data = self_ptr.cast();
+                    *self_ptr = Self::Requested(shm_zone, zone_size);
+                    Ok(shm_zone)
+                }
+                Self::Requested(zone, _) | Self::Ready(zone, _) => Ok(*zone),
+                Self::Unset => Err(()),
+            }
+        }
+    }
+
+    /// Replace the dummy init with the real allocator and detach config state from `data`.
+    ///
+    /// # Safety
+    /// `shm_zone` must be the pointer returned by [`Self::request`].
+    pub unsafe fn finalize(&self, shm_zone: *mut ngx_shm_zone_t) {
+        unsafe {
+            (*shm_zone).init = Some(decisions_shm_zone_init);
+            (*shm_zone).data = ptr::null_mut();
+            // noreuse stays 0: reload reuses the mapping when magic/layout_version match.
+            SHM_ZONE.store(shm_zone, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Request the decisions zone during directive parsing (before postconfiguration).
+///
+/// # Safety
+/// Valid `ngx_conf_t` from NGINX configuration parsing.
+pub unsafe fn decisions_zone_early_request(
+    cf: *mut ngx::ffi::ngx_conf_t,
+    zone_state: &mut DecisionsSharedZone,
+    size: usize,
+) -> Result<(), ()> {
+    unsafe {
+        zone_state.configure(size)?;
+        zone_state.request(cf)?;
+        Ok(())
+    }
+}
 
 /// Prometheus-style counters in a tiny separate zone (does not change `ShmData` layout).
 #[repr(C)]
@@ -514,36 +614,42 @@ fn apply_ipv6_mask(addr: &[u8; 16], prefix_len: u8) -> [u8; 16] {
     result
 }
 
-/// Initialize shared memory zone
-/// Called from postconfiguration
+/// Configure, request, and finalize the `crowdsec_decisions` shared zone.
+///
+/// Called from postconfiguration after all directives are parsed.
 ///
 /// # Safety
-/// Must be called with valid NGINX configuration context
-pub unsafe fn init_shm_zone(
+/// Must be called with valid NGINX configuration context.
+pub unsafe fn init_decisions_zone(
     cf: *mut ngx::ffi::ngx_conf_t,
-    name: &ngx_str_t,
+    zone_state: &mut DecisionsSharedZone,
     size: usize,
-) -> Result<*mut ngx_shm_zone_t, ()> {
+) -> Result<(), ()> {
     unsafe {
-        let shm_zone = ngx::ffi::ngx_shared_memory_add(
-            cf,
-            name as *const _ as *mut _,
-            size,
-            &raw const crate::ngx_http_crowdsec_module as *mut _,
-        );
+        zone_state.configure(size)?;
+        let shm_zone = zone_state.request(cf)?;
+        zone_state.finalize(shm_zone);
+        Ok(())
+    }
+}
 
-        if shm_zone.is_null() {
-            return Err(());
-        }
-
-        // Set the init callback
-        (*shm_zone).init = Some(shm_zone_init);
-        (*shm_zone).data = ptr::null_mut();
-
-        // Store globally for access from handlers
+unsafe extern "C" fn decisions_shm_dummy_init(
+    shm_zone: *mut ngx_shm_zone_t,
+    _data: *mut std::ffi::c_void,
+) -> ngx_int_t {
+    unsafe {
+        let zone_state = match (*shm_zone).data.cast::<DecisionsSharedZone>().as_mut() {
+            Some(state) => state,
+            None => return ngx::ffi::NGX_ERROR as ngx_int_t,
+        };
+        let size = match zone_state {
+            DecisionsSharedZone::Requested(_, size) => *size,
+            DecisionsSharedZone::Ready(_, size) => *size,
+            _ => return ngx::ffi::NGX_ERROR as ngx_int_t,
+        };
+        *zone_state = DecisionsSharedZone::Ready(shm_zone, size);
         SHM_ZONE.store(shm_zone, Ordering::SeqCst);
-
-        Ok(shm_zone)
+        NGX_OK as ngx_int_t
     }
 }
 
@@ -556,9 +662,9 @@ unsafe fn decision_shm_layout_matches(data: *mut std::ffi::c_void) -> bool {
     }
 }
 
-/// Shared memory zone initialization callback
-/// Called by NGINX after the zone is allocated
-unsafe extern "C" fn shm_zone_init(
+/// Shared memory zone initialization callback for `crowdsec_decisions`.
+/// Called by NGINX after the zone is allocated.
+unsafe extern "C" fn decisions_shm_zone_init(
     shm_zone: *mut ngx_shm_zone_t,
     data: *mut std::ffi::c_void,
 ) -> ngx_int_t {
@@ -574,7 +680,8 @@ unsafe extern "C" fn shm_zone_init(
                 poller_atomic.store(0, Ordering::SeqCst);
                 return NGX_OK as ngx_int_t;
             }
-            eprintln!(
+            crowdsec_error!(
+                cycle_log(),
                 "crowdsec: decision shared memory is incompatible with this module (layout changed). \
                  Perform a full nginx restart after upgrading the module, not only `reload`."
             );
@@ -602,7 +709,8 @@ unsafe extern "C" fn shm_zone_init(
         // Capacity is simply how many entries fit in available memory
         let capacity = (available_for_entries / entry_size).max(MIN_CAPACITY as usize) as u32;
 
-        eprintln!(
+        crowdsec_notice!(
+            cycle_log(),
             "crowdsec: initializing shared memory - zone size: {} bytes, hash capacity: {} entries",
             (*shm_zone).shm.size,
             capacity
@@ -611,7 +719,7 @@ unsafe extern "C" fn shm_zone_init(
         // Allocate header
         let header_ptr = ngx_slab_alloc_locked(shpool, header_size);
         if header_ptr.is_null() {
-            eprintln!("crowdsec: failed to allocate SHM header");
+            crowdsec_error!(cycle_log(), "crowdsec: failed to allocate SHM header");
             return ngx::ffi::NGX_ERROR as ngx_int_t;
         }
 
@@ -619,7 +727,8 @@ unsafe extern "C" fn shm_zone_init(
         let entries_size = entry_size * capacity as usize;
         let entries_ptr = ngx_slab_alloc_locked(shpool, entries_size);
         if entries_ptr.is_null() {
-            eprintln!(
+            crowdsec_error!(
+                cycle_log(),
                 "crowdsec: failed to allocate SHM hash table ({} bytes)",
                 entries_size
             );
@@ -630,7 +739,7 @@ unsafe extern "C" fn shm_zone_init(
         let scenarios_size = scenario_size * MAX_SCENARIOS;
         let scenarios_ptr = ngx_slab_alloc_locked(shpool, scenarios_size);
         if scenarios_ptr.is_null() {
-            eprintln!("crowdsec: failed to allocate SHM scenario table");
+            crowdsec_error!(cycle_log(), "crowdsec: failed to allocate SHM scenario table");
             return ngx::ffi::NGX_ERROR as ngx_int_t;
         }
 
@@ -1113,7 +1222,7 @@ pub fn add_decision(info: &DecisionInfo) {
                 match evict_clock(shm_data) {
                     Some(evicted) => evicted,
                     None => {
-                        eprintln!("crowdsec: hash table full, cannot add entry");
+                        crowdsec_warn!(cycle_log(), "crowdsec: hash table full, cannot add entry");
                         ngx_rwlock_unlock(&mut (*shm_data).lock);
                         return;
                     }
@@ -1211,7 +1320,7 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
             None => match evict_clock(shm_data) {
                 Some(evicted) => evicted,
                 None => {
-                    eprintln!("crowdsec: hash table full, cannot add CIDR entry");
+                    crowdsec_warn!(cycle_log(), "crowdsec: hash table full, cannot add CIDR entry");
                     ngx_rwlock_unlock(&mut (*shm_data).lock);
                     return;
                 }
@@ -1388,6 +1497,44 @@ pub fn clear_all() {
 
         ngx_rwlock_unlock(&mut (*shm_data).lock);
     }
+}
+
+/// Count non-expired cache rows grouped by origin, scenario, and IP family.
+pub fn count_active_decisions_by_origin() -> Vec<(Origin, u16, u8, u64)> {
+    use std::collections::HashMap;
+
+    let shm_data = match get_shm_data() {
+        Some(data) => data,
+        None => return Vec::new(),
+    };
+
+    let mut counts: HashMap<(Origin, u16, u8), u64> = HashMap::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    unsafe {
+        ngx_rwlock_rlock(&mut (*shm_data).lock);
+        let entries = get_entries(shm_data);
+        let capacity = (*shm_data).capacity;
+
+        for idx in 0..capacity as usize {
+            let entry = &*entries.add(idx);
+            if entry.is_vacant() || !entry.has_decisions() || entry.is_expired_at(now) {
+                continue;
+            }
+            let key = (entry.origin(), entry.scenario_id, entry.family);
+            *counts.entry(key).or_insert(0) += 1;
+        }
+
+        ngx_rwlock_unlock(&mut (*shm_data).lock);
+    }
+
+    counts
+        .into_iter()
+        .map(|((origin, scenario_id, family), count)| (origin, scenario_id, family, count))
+        .collect()
 }
 
 /// Get current count of entries (IPs + CIDRs)
@@ -1590,7 +1737,8 @@ unsafe extern "C" fn metrics_zone_init(
         let sz = std::mem::size_of::<MetricsShm>();
         let p = ngx_slab_alloc_locked(shpool, sz);
         if p.is_null() {
-            eprintln!(
+            crowdsec_warn!(
+                cycle_log(),
                 "crowdsec: warning: failed to allocate metrics SHM; counters disabled"
             );
             return NGX_OK as ngx_int_t;
@@ -1796,6 +1944,20 @@ mod tests {
 
         // Empty bitmask
         assert_eq!(DecisionType::from_bitmask(0), DecisionType::Unknown);
+    }
+
+    #[test]
+    fn test_decisions_shared_zone_configure() {
+        let size = 1024 * 1024;
+        let mut zone = DecisionsSharedZone::Unset;
+        assert!(zone.configure(size).is_ok());
+        assert!(matches!(zone, DecisionsSharedZone::Configured(s) if s == size));
+        assert!(zone.configure(size).is_ok());
+        assert!(zone.configure(size * 2).is_err());
+
+        let mut zone = DecisionsSharedZone::Requested(std::ptr::null_mut(), size);
+        assert!(zone.configure(size).is_ok());
+        assert!(zone.configure(size * 2).is_err());
     }
 
     #[test]

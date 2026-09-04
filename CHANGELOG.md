@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-04
+
+Minor release: nginx-acme-inspired integration improvements, LAPI usage metrics, and operational logging.
+
+### Added
+
+- **LAPI usage metrics** — Push `processed`, `dropped`, and `active_decisions` to `POST /v1/usage-metrics` (default interval 900s; `crowdsec_usage_metrics_interval off` to disable). Counters flushed on worker shutdown/reload.
+- **Bouncer User-Agent** — LAPI requests identify as `ngx_http_crowdsec_module/<version>` (fixes `ureq` showing in `cscli bouncers list`).
+- **NGINX-native logging** — `src/log.rs` with `crowdsec_*!` macros; stream/SHM/config messages go to the error log instead of stderr.
+- **`NgxConfExt`** — Config parse errors logged via `ngx_conf_log_error!` (`src/conf/ext.rs`).
+- **Response helper** — Shared `src/response.rs` for ban/metrics/captcha body output via `Request::output_filter`.
+- **SHM zone state machine** — `DecisionsSharedZone` dummy-init pattern (nginx-acme) for safer early zone registration.
+- **`export-modules` feature** — Gates `ngx_modules!` export (default on for standalone `.so` builds).
+
+### Changed
+
+- **Metrics origin labels** — `CAPI` casing matches LAPI/Lua; `lists:<scenario>` no longer truncated (usage-metrics SHM auto-sized).
+- **AppSec User-Agent** — Client UA forwarded only in `X-Crowdsec-Appsec-User-Agent`, not HTTP `User-Agent`.
+- **LAPI config validation** — Warns at `nginx -t` when `crowdsec on` or partial LAPI settings but URL/key missing.
+- **Release profile** — `codegen-units = 1` for smaller release binary.
+- **Documentation** — Logging and debugging LAPI polling (`docs/configuration.md`); steady-state poll silence and `error_log` levels explained.
+
+### Fixed
+
+- **Usage metrics SHM** — Zone size increased after origin label expansion (was 64KB, caused alloc failure on nginx start).
+
+## [0.2.2] - 2026-09-03
+
+Patch: AppSec always mode, static asset bypass, zero compiler warnings.
+
 ## [0.2.1] - 2026-09-03
 
 Patch release: required ban/captcha templates, captcha static-site fix, and template cleanup validated in production.

@@ -3,6 +3,8 @@
 //! This module handles polling the CrowdSec LAPI decisions stream and
 //! updating the shared memory decision store.
 
+use crate::lapi;
+use crate::log::cycle_log;
 use crate::shm::{self, CidrDecisionInfo, DecisionInfo, DecisionType, Origin};
 use crate::types::StreamResponse;
 use std::net::IpAddr;
@@ -44,6 +46,8 @@ pub struct StreamClientConfig {
     pub max_retries: u32,
     /// Retry interval in seconds between retry attempts
     pub retry_interval_secs: u64,
+    /// LAPI usage-metrics push interval (`0` = disabled). Default 900.
+    pub usage_metrics_interval_secs: u64,
 }
 
 impl Default for StreamClientConfig {
@@ -55,6 +59,7 @@ impl Default for StreamClientConfig {
             timeout_secs: 30,
             max_retries: 3,
             retry_interval_secs: 5,
+            usage_metrics_interval_secs: 900,
         }
     }
 }
@@ -71,7 +76,7 @@ impl StreamClient {
     pub fn new(config: StreamClientConfig) -> Self {
         Self {
             config,
-            agent: ureq::Agent::new(),
+            agent: lapi::agent(),
             running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -89,10 +94,7 @@ impl StreamClient {
     pub fn poll(&self, startup: bool) -> Result<(usize, usize), StreamError> {
         let url = self.build_url(startup);
 
-        let response = self
-            .agent
-            .get(&url)
-            .set("X-Api-Key", &self.config.api_key)
+        let response = lapi::with_api_key(self.agent.get(&url), &self.config.api_key)
             .timeout(Duration::from_secs(self.config.timeout_secs))
             .call()
             .map_err(|e| StreamError::Http(e.to_string()))?;
@@ -138,9 +140,11 @@ impl StreamClient {
                 }
                 // If neither works, log and skip
                 else {
-                    eprintln!(
+                    crowdsec_warn!(
+                        cycle_log(),
                         "crowdsec: cannot parse decision value '{}' (scope: {:?})",
-                        value, decision.scope
+                        value,
+                        decision.scope
                     );
                 }
             }
@@ -182,9 +186,12 @@ impl StreamClient {
                 }
                 // If neither works, log and skip
                 else {
-                    eprintln!(
+                    crowdsec_warn!(
+                        cycle_log(),
                         "crowdsec: cannot parse decision value '{}' (scope: {:?}, type: {})",
-                        value, decision.scope, decision.decision_type
+                        value,
+                        decision.scope,
+                        decision.decision_type
                     );
                 }
             }
@@ -224,7 +231,8 @@ impl StreamClient {
                 Ok(result) => {
                     shm::metrics_inc_lapi_poll_ok();
                     if attempt > 0 {
-                        eprintln!(
+                        crowdsec_notice!(
+                            cycle_log(),
                             "crowdsec: initial sync succeeded after {} retry attempt(s)",
                             attempt
                         );
@@ -235,7 +243,8 @@ impl StreamClient {
                     last_error = Some(e);
                     if attempt < self.config.max_retries {
                         let retry_delay = Duration::from_secs(self.config.retry_interval_secs);
-                        eprintln!(
+                        crowdsec_warn!(
+                            cycle_log(),
                             "crowdsec: initial sync attempt {} failed, retrying in {}s: {}",
                             attempt + 1,
                             retry_delay.as_secs(),
@@ -254,7 +263,8 @@ impl StreamClient {
 
     /// Internal polling loop
     fn run_polling_loop(self) {
-        eprintln!(
+        crowdsec_notice!(
+            cycle_log(),
             "crowdsec: starting polling thread for LAPI at {}",
             self.config.url
         );
@@ -262,7 +272,8 @@ impl StreamClient {
         // Initial startup poll to get full decision state with retry logic
         match self.poll_with_retry(true) {
             Ok((new, deleted)) => {
-                eprintln!(
+                crowdsec_notice!(
+                    cycle_log(),
                     "crowdsec: initial sync complete - {} new, {} deleted, {} total banned IPs",
                     new,
                     deleted,
@@ -270,7 +281,8 @@ impl StreamClient {
                 );
             }
             Err(e) => {
-                eprintln!(
+                crowdsec_warn!(
+                    cycle_log(),
                     "crowdsec: initial sync failed after {} retries (fail-open): {}",
                     self.config.max_retries + 1,
                     e
@@ -279,6 +291,8 @@ impl StreamClient {
         }
 
         let poll_duration = Duration::from_secs(self.config.poll_interval_secs);
+        let metrics_interval = Duration::from_secs(self.config.usage_metrics_interval_secs);
+        let mut last_metrics_push = std::time::Instant::now();
 
         // Main polling loop
         while self.running.load(Ordering::SeqCst) {
@@ -292,7 +306,8 @@ impl StreamClient {
                 Ok((new, deleted)) => {
                     shm::metrics_inc_lapi_poll_ok();
                     if new > 0 || deleted > 0 {
-                        eprintln!(
+                        crowdsec_notice!(
+                            cycle_log(),
                             "crowdsec: stream update - {} new, {} deleted, {} total banned IPs",
                             new,
                             deleted,
@@ -302,12 +317,28 @@ impl StreamClient {
                 }
                 Err(e) => {
                     shm::metrics_inc_lapi_poll_err();
-                    eprintln!("crowdsec: stream poll failed (fail-open): {}", e);
+                    crowdsec_warn!(
+                        cycle_log(),
+                        "crowdsec: stream poll failed (fail-open): {}",
+                        e
+                    );
                 }
+            }
+
+            if metrics_interval.as_secs() > 0 && last_metrics_push.elapsed() >= metrics_interval {
+                if let Err(e) = crate::usage_metrics::push_to_lapi(
+                    &self.config.url,
+                    &self.config.api_key,
+                    self.config.timeout_secs,
+                    metrics_interval.as_secs(),
+                ) {
+                    crowdsec_warn!(cycle_log(), "crowdsec: usage-metrics push failed: {e}");
+                }
+                last_metrics_push = std::time::Instant::now();
             }
         }
 
-        eprintln!("crowdsec: polling thread stopped");
+        crowdsec_notice!(cycle_log(), "crowdsec: polling thread stopped");
     }
 }
 
