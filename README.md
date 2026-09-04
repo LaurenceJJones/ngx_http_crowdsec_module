@@ -1,33 +1,26 @@
 # ngx_http_crowdsec_module
 
-CrowdSec enforcement as a **native NGINX dynamic module** (Rust). Stream IP bans from LAPI, optional captcha remediations, AppSec, and Prometheus metrics — without OpenResty or Lua.
+**CrowdSec enforcement built into NGINX** — a native dynamic module, not a Lua bouncer script.
 
-> **Status:** [v0.2.0](CHANGELOG.md) — stream bans, captcha, AppSec (including POST bodies), trusted proxy IP, bypass lists, ban redirects, metrics. See [CHANGELOG](CHANGELOG.md).
+CrowdSec watches your logs, spots attackers, and tells your bouncer who to block. The official [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer) runs that logic as **Lua inside the request path**: scripts loaded at runtime, executed on every check. Most distros can install NGINX with a Lua module — you do not need a special fork — but you are still running interpreted bouncer code in the hot path, maintaining scripts, and trusting a separate runtime to do security work on every request.
 
-## Why this module?
+This module does the same job differently. It is compiled into a single `.so`, configured with normal NGINX directives, and runs as part of the server itself. Point it at your LAPI, turn it on per server or location, and you get bans, captcha, AppSec, and metrics without bolting on a scripting layer.
 
-The official [lua-cs-bouncer](https://github.com/crowdsecurity/lua-cs-bouncer) runs inside **OpenResty**. This project targets teams that already run stock NGINX (or a vendor build) and want CrowdSec at the edge with fewer moving parts.
+## Why use it?
 
-| | This module | OpenResty + Lua bouncer |
-|---|-------------|-------------------------|
-| Runtime | Standard NGINX + one `.so` | OpenResty + LuaJIT + bouncer scripts |
-| AppSec POST bodies | Yes (PRECONTENT phase) | Yes |
-| Hot-path overhead | Lower (~1.7× in [synthetic bench](benchmarks/results.md)) | Baseline |
-| Real-world latency | Usually dominated by upstream / AppSec RTT, not bouncer | Same |
+**It is part of NGINX, not a script on top of it.** Load one module, set `crowdsec on`, done. No bouncer Lua files to deploy, update, or debug. Configuration lives in your NGINX config where it belongs.
 
-**Good fit when you:**
+**No Lua runtime in the security path.** Enforcement is compiled ahead of time — not JIT'd or interpreted on each request. That means fewer moving parts, a smaller attack surface, and behavior you can reason about from a binary built for your NGINX version rather than scripts that change independently of your server.
 
-- Already have NGINX and don't want to switch to OpenResty
-- Need AppSec on POST/PUT/PATCH/DELETE without a separate WAF hop
-- Want shared-memory bans across workers, fail-open behaviour, and optional Prometheus metrics in one module
+**You get the features CrowdSec users expect.** Stream bans from LAPI into shared memory so every worker sees the same decisions. Captcha remediations (hCaptcha, reCAPTCHA, Turnstile). AppSec on GET and POST. Prometheus metrics if you want them. Bypass lists and trusted-proxy handling when NGINX sits behind Cloudflare or another reverse proxy.
 
-**Performance note:** Benchmarks show roughly **1.7–1.8×** higher throughput and ~half the average bouncer latency vs OpenResty on a static allow path ([methodology](benchmarks/results.md)). That is a solid win on high-RPS edges; for typical sites behind TLS and `proxy_pass`, users won't feel a 2× difference — treat speed as a bonus, not the main reason to adopt.
+**It fails open when things go wrong.** If LAPI is down, traffic keeps flowing — your site does not go dark because the bouncer could not phone home. One worker polls; the rest read from shared memory. Misconfiguration shows up at `nginx -t`.
 
-## Quick start
+**It is fast on top of all that.** In synthetic benchmarks against the Lua bouncer, this module handles roughly **1.7×** the throughput on a simple allow path ([details](benchmarks/results.md)). On most real sites that difference is hard to notice — but it is there if you need it.
 
-### 1. Try it locally (Docker)
+## Try it in five minutes
 
-Fastest way to see bans working — includes CrowdSec LAPI and a pre-built module:
+Docker spins up NGINX, CrowdSec, and a pre-built module:
 
 ```bash
 git clone https://github.com/LaurenceJJones/ngx_http_crowdsec_module.git
@@ -41,13 +34,13 @@ docker exec crowdsec cscli decisions add --ip 1.2.3.4 --type ban --duration 1h -
 docker compose down
 ```
 
-More detail: [docker/README.md](docker/README.md).
+More in [docker/README.md](docker/README.md).
 
-### 2. Production NGINX
+## Production setup
 
-**Requirements:** NGINX with dynamic module support, CrowdSec LAPI, a bouncer API key. Two small SHM zones: `crowdsec_decisions` (size from `crowdsec_shm_size`) and `crowdsec_metrics` (8 KB).
+You need NGINX with dynamic module support, a running CrowdSec LAPI, and a bouncer API key.
 
-1. **Install the module** — download a release `.so` that matches your NGINX version from [Releases](https://github.com/LaurenceJJones/ngx_http_crowdsec_module/releases), or [build](#building) for your exact `nginx -V` output.
+1. **Get the module** — download a release `.so` that matches your NGINX version from [Releases](https://github.com/LaurenceJJones/ngx_http_crowdsec_module/releases), or [build](#building) against your exact `nginx -V` output.
 
 2. **Register a bouncer** on the CrowdSec host:
 
@@ -55,7 +48,7 @@ More detail: [docker/README.md](docker/README.md).
    cscli bouncers add nginx-bouncer
    ```
 
-3. **Configure NGINX** — minimal stream-mode setup:
+3. **Configure NGINX:**
 
    ```nginx
    load_module /etc/nginx/modules/libngx_http_crowdsec_module.so;
@@ -82,23 +75,25 @@ More detail: [docker/README.md](docker/README.md).
    }
    ```
 
-4. **Validate and reload:**
+4. **Test and reload:**
 
    ```bash
    nginx -t && systemctl reload nginx
    ```
 
-Behind Cloudflare or another L7 proxy, ensure nginx sees the real client IP — either with the standard [`real_ip`](docs/configuration.md#client-ip-behind-a-reverse-proxy) module (no CrowdSec IP directives needed if already configured) or with `crowdsec_trusted_proxies` + `crowdsec_real_ip_header`. Ban and captcha pages require template files (`crowdsec_ban_template`, and `crowdsec_captcha_template` when captcha is configured) — see [`templates/`](templates/) and [docs/configuration.md](docs/configuration.md).
+Behind a CDN or reverse proxy, make sure NGINX sees the real client IP — usually with the standard [`real_ip`](docs/configuration.md#client-ip-behind-a-reverse-proxy) module, or with `crowdsec_trusted_proxies` if you prefer CrowdSec-specific settings. Captcha and custom ban pages need template files; examples are in [`templates/`](templates/).
+
+Full directive reference: [docs/configuration.md](docs/configuration.md).
 
 ## Documentation
 
 | Topic | Link |
 |-------|------|
 | All directives, AppSec, captcha, templates | [docs/configuration.md](docs/configuration.md) |
-| Docker dev environment & tests | [docker/README.md](docker/README.md) |
+| Docker dev environment | [docker/README.md](docker/README.md) |
 | Ban page templates | [templates/README.md](templates/README.md) |
-| Benchmarks vs OpenResty Lua | [benchmarks/results.md](benchmarks/results.md) |
-| Changelog & roadmap | [CHANGELOG.md](CHANGELOG.md) |
+| Benchmarks vs Lua bouncer | [benchmarks/results.md](benchmarks/results.md) |
+| Changelog | [CHANGELOG.md](CHANGELOG.md) |
 
 ## Building
 
@@ -106,24 +101,23 @@ Behind Cloudflare or another L7 proxy, ensure nginx sees the real client IP — 
 
 ```bash
 docker build -f docker/Dockerfile -t nginx-crowdsec .
-# Pin NGINX version if needed:
 docker build -f docker/Dockerfile --build-arg NGINX_VERSION=1.24.0 -t nginx-crowdsec .
 ```
 
-**From source** against your NGINX tree: set `NGINX_SOURCE_DIR` and `NGINX_BUILD_DIR`, then `cargo build --release`. The artifact is `target/release/libngx_http_crowdsec_module.so`. See [docker/Dockerfile](docker/Dockerfile) for the full configure flags used in CI.
+**From source:** set `NGINX_SOURCE_DIR` and `NGINX_BUILD_DIR`, then `cargo build --release`. Output: `target/release/libngx_http_crowdsec_module.so`. See [docker/Dockerfile](docker/Dockerfile) for the configure flags used in CI.
 
 ## Troubleshooting
 
-- **SHM after upgrade** — if reload fails with a layout/magic mismatch, do a full `nginx` stop/start (not reload).
-- **Wrong `.so`** — module must match NGINX version and build; check `nginx -V` against the release compatibility file.
-- **No decisions** — test LAPI: `curl -H "X-Api-Key: KEY" http://127.0.0.1:8080/v1/decisions/stream?startup=true`.
-- **No poll log lines** — steady-state polls are silent when there are no decision changes; see [Logging and debugging LAPI polling](docs/configuration.md#logging-and-debugging-lapi-polling).
+- **Module won't load** — the `.so` must match your NGINX version and platform. Check `nginx -V` against the release compatibility notes.
+- **Reload fails after upgrade** — do a full stop/start, not reload, if shared memory layout changed.
+- **No bans appearing** — confirm LAPI is reachable and the bouncer key is valid: `curl -H "X-Api-Key: KEY" http://127.0.0.1:8080/v1/decisions/stream?startup=true`.
+- **No poll messages in the log** — normal when nothing changed; see [logging and debugging](docs/configuration.md#logging-and-debugging-lapi-polling).
 
 More: [docs/configuration.md#troubleshooting](docs/configuration.md#troubleshooting).
 
 ## Contributing
 
-Fork, branch, PR. See existing [CI](.github/workflows/ci.yml) for test expectations.
+Fork, branch, PR. CI runs on every push — see [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## License
 
