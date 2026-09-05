@@ -34,7 +34,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/crowdsec-state"
           echo '{"new":[],"deleted":[]}' > "$RUNNER_TEMP/crowdsec-state/decisions.json"
           echo '{"_status":200,"action":"allow"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
-          # Upstream must exist before nginx starts (static proxy_pass resolves at startup).
+          # Upstream for AppSec POST + proxy_pass test (variable proxy_pass resolves at request time).
           docker run -d --name upstream --network crowdsec-ci --network-alias upstream \
             python:3.13-alpine \
             python -c 'from http.server import BaseHTTPRequestHandler, HTTPServer; \
@@ -45,6 +45,12 @@ jobs:
                 self.send_response(204); self.end_headers(); \
               def log_message(self,*a): pass; \
             HTTPServer(("0.0.0.0",9000), H).serve_forever()'
+          for i in $(seq 1 30); do
+            docker run --rm --network crowdsec-ci python:3.13-alpine \
+              python -c "import socket; s=socket.create_connection(('upstream',9000),1); s.close()" \
+              2>/dev/null && break
+            sleep 1
+          done
           docker run -d --name crowdsec --network crowdsec-ci \
             -v "$PWD/tests:/mock:ro" \
             -v "$RUNNER_TEMP/crowdsec-state:/state:ro" \
