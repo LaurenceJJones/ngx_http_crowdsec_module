@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-05
+
+Patch: AppSec POST body inspection no longer breaks `proxy_pass`.
+
 ### Fixed
 
 - **AppSec POST + proxy_pass** — POST bodies with AppSec enabled returned nginx 404 instead of reaching `proxy_pass`. Run body inspection in ACCESS (not PRECONTENT); return the AppSec result directly on synchronous body reads. After async body reads, restore the location `content_handler` and resume phases — `ngx_http_finalize_request(NGX_DECLINED)` clears it and drops proxy handlers.
