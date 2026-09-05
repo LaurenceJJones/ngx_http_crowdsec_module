@@ -4,8 +4,8 @@
 //! (AppSec POST bodies, captcha verification) use [`initiate_body_read`].
 
 use ngx::ffi::{
-    ngx_buf_t, ngx_chain_t, ngx_http_finalize_request, ngx_http_read_client_request_body,
-    ngx_http_request_t, ngx_int_t,
+    ngx_buf_t, ngx_chain_t, ngx_http_core_loc_conf_t, ngx_http_core_module,
+    ngx_http_core_run_phases, ngx_http_read_client_request_body, ngx_http_request_t, ngx_int_t,
 };
 use ngx::ngx_log_debug;
 use std::ffi::CStr;
@@ -141,13 +141,30 @@ pub unsafe fn request_body_buffered(r: *const ngx_http_request_t) -> bool {
     }
 }
 
-/// Finalize the request after AppSec allows it to continue.
+/// Resume phase processing after a module allows the request to continue.
+///
+/// Do not use `ngx_http_finalize_request(NGX_DECLINED)` here: that clears
+/// `r->content_handler` before re-entering phases, which drops `proxy_pass`
+/// handlers when resuming after an async body read started in ACCESS.
 ///
 /// # Safety
 /// Valid NGINX request pointer.
 pub unsafe fn finalize_allow(r: *mut ngx_http_request_t) {
     unsafe {
-        ngx_http_finalize_request(r, ngx::ffi::NGX_DECLINED as ngx_int_t);
+        let core = &raw const ngx_http_core_module;
+        let clcf = *(*r).loc_conf.add((*core).ctx_index as usize) as *mut ngx_http_core_loc_conf_t;
+        if !clcf.is_null() {
+            (*r).content_handler = (*clcf).handler;
+        }
+
+        (*r).write_event_handler = Some(resume_request_phases);
+        ngx_http_core_run_phases(r);
+    }
+}
+
+unsafe extern "C" fn resume_request_phases(r: *mut ngx_http_request_t) {
+    unsafe {
+        ngx_http_core_run_phases(r);
     }
 }
 

@@ -40,9 +40,15 @@ jobs:
           docker cp "$container:/etc/nginx/modules/libngx_http_crowdsec_module.so" \
             "dist/ngx_http_crowdsec_module-nginx-${NGINX_VERSION}-debian-bookworm-amd64.so"
           docker rm "$container"
+          docker build -f docker/Dockerfile.ubuntu-module --target builder -t crowdsec-module:ubuntu-noble .
+          ubuntu_cid=$(docker create crowdsec-module:ubuntu-noble)
+          docker cp "$ubuntu_cid:/build/target/release/libngx_http_crowdsec_module.so" \
+            "dist/ngx_http_crowdsec_module-ubuntu-noble-amd64.so"
+          docker rm "$ubuntu_cid"
           cat > dist/compatibility.txt <<EOF
           NGINX_VERSION=${NGINX_VERSION}
-          DISTRIBUTION=debian-bookworm
+          DEBIAN_MODULE=ngx_http_crowdsec_module-nginx-${NGINX_VERSION}-debian-bookworm-amd64.so
+          UBUNTU_MODULE=ngx_http_crowdsec_module-ubuntu-noble-amd64.so (nginx 1.24.x apt, 24.04)
           ARCHITECTURE=amd64
           RUST_VERSION=1.98
           EOF

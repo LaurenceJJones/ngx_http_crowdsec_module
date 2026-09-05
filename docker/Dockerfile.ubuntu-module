@@ -1,0 +1,41 @@
+# Build libngx_http_crowdsec_module.so against Ubuntu's nginx package (apt nginx-dev).
+# Matches VPS installs like Ubuntu 24.04 + nginx/1.24.0 (Ubuntu).
+#
+# Usage: scripts/build-ubuntu-module.sh
+#   (or: docker build -f docker/Dockerfile.ubuntu-module -t crowdsec-module:ubuntu .)
+
+FROM ubuntu:24.04 AS builder
+ARG RUST_VERSION=1.98.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libpcre2-dev \
+    zlib1g-dev \
+    clang \
+    llvm \
+    nginx-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${RUST_VERSION}"
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN rustc --version
+
+# Same tree and configure step Ubuntu uses for third-party dynamic modules.
+WORKDIR /usr/share/nginx/src
+RUN ./configure --with-compat --with-cc-opt="-fPIC -I/usr/include" --with-ld-opt="-fPIC"
+
+ENV NGINX_SOURCE_DIR=/usr/share/nginx/src
+ENV NGINX_BUILD_DIR=/usr/share/nginx/src/objs
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+
+RUN cargo build --release --locked

@@ -36,6 +36,52 @@ pub struct AppSecBodyContext {
     pub failure_action: u8,
     pub internal_challenge: u8,
     pub bot_challenge: u8,
+    /// Set while the ACCESS handler still owns the request (synchronous body read).
+    pub defer_finalize: u8,
+    /// Result from the body callback when `defer_finalize` is set.
+    pub stored_result: u8,
+}
+
+#[repr(u8)]
+#[derive(PartialEq, Eq, Copy, Clone)]
+enum StoredAppSecResult {
+    Unset = 0,
+    Declined = 1,
+    Forbidden = 2,
+    Done = 3,
+    Error = 4,
+}
+
+impl StoredAppSecResult {
+    fn from_handler_result(result: HandlerResult) -> Self {
+        match result {
+            HandlerResult::Declined => Self::Declined,
+            HandlerResult::Forbidden => Self::Forbidden,
+            HandlerResult::Done => Self::Done,
+            HandlerResult::Error => Self::Error,
+            HandlerResult::CaptchaPending | HandlerResult::AppSecPending => Self::Error,
+        }
+    }
+
+    fn into_handler_result(self) -> HandlerResult {
+        match self {
+            Self::Declined => HandlerResult::Declined,
+            Self::Forbidden => HandlerResult::Forbidden,
+            Self::Done => HandlerResult::Done,
+            Self::Unset | Self::Error => HandlerResult::Error,
+        }
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unset),
+            1 => Some(Self::Declined),
+            2 => Some(Self::Forbidden),
+            3 => Some(Self::Done),
+            4 => Some(Self::Error),
+            _ => None,
+        }
+    }
 }
 
 impl AppSecBodyContext {
@@ -60,6 +106,8 @@ impl AppSecBodyContext {
             },
             internal_challenge: u8::from(internal_challenge),
             bot_challenge: u8::from(bot_challenge),
+            defer_finalize: 1,
+            stored_result: StoredAppSecResult::Unset as u8,
         }
     }
 
@@ -75,6 +123,37 @@ impl AppSecBodyContext {
             .ok()?
             .parse()
             .ok()
+    }
+
+    fn store_result(&mut self, result: HandlerResult) {
+        self.stored_result = StoredAppSecResult::from_handler_result(result) as u8;
+    }
+
+    fn take_result(&self) -> Option<HandlerResult> {
+        match StoredAppSecResult::from_u8(self.stored_result)? {
+            StoredAppSecResult::Unset => None,
+            stored => Some(stored.into_handler_result()),
+        }
+    }
+
+    /// Sync reads defer to the ACCESS handler; async reads finalize in the callback.
+    unsafe fn finish(
+        &self,
+        main_r: *mut ngx_http_request_t,
+        ctx_ptr: *mut *mut std::ffi::c_void,
+        result: HandlerResult,
+    ) {
+        unsafe {
+            if self.defer_finalize != 0 {
+                let ctx_mut = *ctx_ptr as *mut AppSecBodyContext;
+                if !ctx_mut.is_null() {
+                    (*ctx_mut).store_result(result);
+                }
+                return;
+            }
+            *ctx_ptr = std::ptr::null_mut();
+            finalize_precontent_result(main_r, result);
+        }
     }
 }
 
@@ -128,7 +207,8 @@ fn appsec_context(
     Some((config, ip, failure_action, internal_challenge))
 }
 
-/// AppSec in ACCESS phase: headers/URI only. Any request with a body defers to PRECONTENT.
+/// AppSec in ACCESS phase: headers/URI, or body inspection when the client sent a body.
+/// Body reads run here (not PRECONTENT) so proxy_pass keeps the correct content handler.
 pub fn inspect_access(
     request: &mut Request,
     loc: &LocConfig,
@@ -155,7 +235,15 @@ pub fn inspect_access(
 
     let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
     if unsafe { has_request_body(r) } {
-        return HandlerResult::Declined;
+        return inspect_request_body(
+            request,
+            loc,
+            r,
+            &ip,
+            &config,
+            failure_action,
+            internal_challenge,
+        );
     }
 
     inspect_with_body(
@@ -169,28 +257,25 @@ pub fn inspect_access(
     )
 }
 
-/// AppSec in PRECONTENT phase: read and forward any client request body to the WAF agent.
+/// PRECONTENT is not used for AppSec body reads; kept so older configs behave the same.
 pub fn inspect_precontent(
     request: &mut Request,
     loc: &LocConfig,
     main_conf: &MainConfig,
 ) -> HandlerResult {
-    if loc.appsec_enabled != Some(true) {
-        return HandlerResult::Declined;
-    }
+    let _ = (request, loc, main_conf);
+    HandlerResult::Declined
+}
 
-    let Some((config, ip, failure_action, internal_challenge)) =
-        appsec_context(request, loc, main_conf)
-    else {
-        return failure(loc.appsec_failure_action.unwrap_or_default());
-    };
-
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-    if !unsafe { has_request_body(r) } {
-        return HandlerResult::Declined;
-    }
-
-    // finalize_allow(NGX_DECLINED) resumes phases at PRECONTENT; skip if already inspected.
+fn inspect_request_body(
+    request: &mut Request,
+    loc: &LocConfig,
+    r: *mut ngx_http_request_t,
+    ip: &IpAddr,
+    config: &AppSecConfig,
+    failure_action: AppSecFailureAction,
+    internal_challenge: bool,
+) -> HandlerResult {
     if unsafe { request_body_buffered(r) } {
         return HandlerResult::Declined;
     }
@@ -203,7 +288,7 @@ pub fn inspect_precontent(
     unsafe {
         match initiate_appsec_body_read(
             r,
-            &ip,
+            ip,
             failure_action,
             internal_challenge,
             loc.bot_challenge_enabled == Some(true),
@@ -234,12 +319,31 @@ unsafe fn initiate_appsec_body_read(
         );
 
         let rc = initiate_body_read(r, ctx.cast(), appsec_body_handler);
+        let module = &raw const crate::ngx_http_crowdsec_module;
+        let ctx_ptr = (*r).ctx.wrapping_add((*module).ctx_index as usize);
+
+        if rc == ngx::ffi::NGX_OK as ngx_int_t {
+            // Body buffered synchronously: the callback ran inside this handler.
+            // Return the stored result directly; do not finalize_allow() here.
+            let ctx = *ctx_ptr as *mut AppSecBodyContext;
+            if ctx.is_null() || (*ctx).magic != APPSEC_BODY_CTX_MAGIC {
+                return Err(failure(failure_action));
+            }
+            let Some(result) = (*ctx).take_result() else {
+                return Err(failure(failure_action));
+            };
+            *ctx_ptr = std::ptr::null_mut();
+            return Err(result);
+        }
+
         if rc == ngx::ffi::NGX_AGAIN as ngx_int_t {
-            Ok(())
-        } else if rc == ngx::ffi::NGX_OK as ngx_int_t {
-            // Body was already buffered; callback ran synchronously and finalized.
-            Err(HandlerResult::BodyHandled)
-        } else if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx_int_t {
+            if !(*ctx_ptr).is_null() {
+                (*(*ctx_ptr as *mut AppSecBodyContext)).defer_finalize = 0;
+            }
+            return Ok(());
+        }
+
+        if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx_int_t {
             Err(HandlerResult::Forbidden)
         } else {
             Err(failure(failure_action))
@@ -261,10 +365,12 @@ unsafe extern "C" fn appsec_body_handler(r: *mut ngx_http_request_t) {
 
         let context = &*ctx;
         let failure_action = context.failure_action();
+        let finish = |result: HandlerResult| context.finish(main_r, ctx_ptr, result);
+
         let config = match CONFIG.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             Some(c) => c,
             None => {
-                finalize_precontent_result(main_r, failure(failure_action));
+                finish(failure(failure_action));
                 return;
             }
         };
@@ -272,21 +378,19 @@ unsafe extern "C" fn appsec_body_handler(r: *mut ngx_http_request_t) {
         let ip = match context.client_ip() {
             Some(ip) => ip,
             None => {
-                finalize_precontent_result(main_r, failure(failure_action));
+                finish(failure(failure_action));
                 return;
             }
         };
 
-        let body_result = extract_request_body_limited(
+        let body = match extract_request_body_limited(
             r,
             config.max_body_size,
             !config.drop_unreadable_body,
-        );
-
-        let body = match body_result {
+        ) {
             BodyExtractResult::Ok(body) => body,
             BodyExtractResult::TooLarge => {
-                finalize_precontent_result(main_r, failure(failure_action));
+                finish(failure(failure_action));
                 return;
             }
             BodyExtractResult::Unreadable => {
@@ -295,7 +399,7 @@ unsafe extern "C" fn appsec_body_handler(r: *mut ngx_http_request_t) {
                 } else {
                     AppSecFailureAction::Passthrough
                 };
-                finalize_precontent_result(main_r, failure(action));
+                finish(failure(action));
                 return;
             }
         };
@@ -307,12 +411,12 @@ unsafe extern "C" fn appsec_body_handler(r: *mut ngx_http_request_t) {
         let loc = match crate::crowdsec_loc_conf(&request).cloned() {
             Some(c) => c,
             None => {
-                finalize_precontent_result(main_r, failure(failure_action));
+                finish(failure(failure_action));
                 return;
             }
         };
 
-        let result = inspect_with_body(
+        finish(inspect_with_body(
             &mut request,
             &loc,
             &ip,
@@ -320,9 +424,7 @@ unsafe extern "C" fn appsec_body_handler(r: *mut ngx_http_request_t) {
             failure_action,
             context.internal_challenge != 0,
             Some(body.as_slice()),
-        );
-        *ctx_ptr = std::ptr::null_mut();
-        finalize_precontent_result(main_r, result);
+        ));
     }
 }
 
@@ -502,8 +604,7 @@ fn finalize_precontent_result(r: *mut ngx_http_request_t, result: HandlerResult)
                 ngx::core::Status::from(HTTPStatus::FORBIDDEN).0,
             );
         },
-        HandlerResult::Done | HandlerResult::AppSecPending | HandlerResult::CaptchaPending
-        | HandlerResult::BodyHandled => {}
+        HandlerResult::Done | HandlerResult::AppSecPending | HandlerResult::CaptchaPending => {}
         HandlerResult::Error => unsafe { finalize_allow(r) },
     }
 }
@@ -546,5 +647,20 @@ mod tests {
         );
         assert_eq!(ctx.client_ip().unwrap().to_string(), "203.0.113.10");
         assert_eq!(ctx.failure_action(), AppSecFailureAction::Deny);
+        assert_eq!(ctx.defer_finalize, 1);
+    }
+
+    #[test]
+    fn stored_appsec_result_roundtrip() {
+        let cases = [
+            (HandlerResult::Declined, StoredAppSecResult::Declined),
+            (HandlerResult::Forbidden, StoredAppSecResult::Forbidden),
+            (HandlerResult::Done, StoredAppSecResult::Done),
+            (HandlerResult::Error, StoredAppSecResult::Error),
+        ];
+        for (result, stored) in cases {
+            assert_eq!(StoredAppSecResult::from_handler_result(result) as u8, stored as u8);
+            assert_eq!(StoredAppSecResult::from_u8(stored as u8).unwrap().into_handler_result(), result);
+        }
     }
 }

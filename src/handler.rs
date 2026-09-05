@@ -17,6 +17,7 @@ use ngx::ngx_log_debug_http;
 use std::net::IpAddr;
 
 /// Access phase handler result
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum HandlerResult {
     /// Allow the request to proceed
     Declined,
@@ -30,8 +31,6 @@ pub enum HandlerResult {
     CaptchaPending,
     /// AppSec is waiting for the request body before calling the WAF
     AppSecPending,
-    /// Body callback ran synchronously and already continued the request
-    BodyHandled,
 }
 
 impl From<HandlerResult> for Status {
@@ -44,7 +43,6 @@ impl From<HandlerResult> for Status {
             HandlerResult::CaptchaPending | HandlerResult::AppSecPending => {
                 Status::NGX_DONE // Body read in progress
             }
-            HandlerResult::BodyHandled => Status::NGX_OK,
         }
     }
 }

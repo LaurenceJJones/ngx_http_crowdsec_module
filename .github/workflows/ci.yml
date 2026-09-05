@@ -63,6 +63,19 @@ jobs:
           test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'evil-payload' http://nginx:8080/)" = 403
           echo '{"_status":200,"action":"allow"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
 
+          # POST + proxy_pass: body must reach upstream after AppSec allow (not nginx 404).
+          docker run -d --name upstream --network crowdsec-ci python:3.13-alpine \
+            python -c 'from http.server import BaseHTTPRequestHandler, HTTPServer; \
+            class H(BaseHTTPRequestHandler): \
+              def do_POST(self): \
+                n=int(self.headers.get("Content-Length",0) or 0); \
+                self.rfile.read(n); \
+                self.send_response(204); self.end_headers(); \
+              def log_message(self,*a): pass; \
+            HTTPServer(("0.0.0.0",9000), H).serve_forever()'
+          sleep 1
+          test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'form=data' http://nginx:8080/proxy/test)" = 204
+
           printf '{"new":[{"type":"ban","scope":"ip","value":"%s","duration":"2m"}],"deleted":[]}' \
             "$client_ip" > "$RUNNER_TEMP/crowdsec-state/decisions.json"
           for i in {1..20}; do
