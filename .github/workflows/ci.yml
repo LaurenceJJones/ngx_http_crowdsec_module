@@ -64,7 +64,8 @@ jobs:
           echo '{"_status":200,"action":"allow"}' > "$RUNNER_TEMP/crowdsec-state/appsec.json"
 
           # POST + proxy_pass: body must reach upstream after AppSec allow (not nginx 404).
-          docker run -d --name upstream --network crowdsec-ci python:3.13-alpine \
+          docker run -d --name upstream --network crowdsec-ci --network-alias upstream \
+            python:3.13-alpine \
             python -c 'from http.server import BaseHTTPRequestHandler, HTTPServer; \
             class H(BaseHTTPRequestHandler): \
               def do_POST(self): \
@@ -73,7 +74,7 @@ jobs:
                 self.send_response(204); self.end_headers(); \
               def log_message(self,*a): pass; \
             HTTPServer(("0.0.0.0",9000), H).serve_forever()'
-          sleep 1
+          sleep 2
           test "$(docker exec client curl -s -o /dev/null -w '%{http_code}' -X POST -d 'form=data' http://nginx:8080/proxy/test)" = 204
 
           printf '{"new":[{"type":"ban","scope":"ip","value":"%s","duration":"2m"}],"deleted":[]}' \
