@@ -1,7 +1,7 @@
 //! Shared helpers for reading client request bodies before the upstream handler runs.
 //!
-//! NGINX's access phase executes before the body is buffered. ACCESS-phase
-//! AppSec/captcha POST handlers use [`initiate_body_read`].
+//! NGINX's access/precontent phases execute before the content handler reads
+//! the body. ACCESS captcha POST and PRECONTENT AppSec use [`initiate_body_read`].
 
 use ngx::core::Status;
 use ngx::ffi::{
@@ -159,7 +159,8 @@ pub unsafe fn initiate_body_read(
     }
 }
 
-/// Balance `r->main->count++` from [`ngx_http_read_client_request_body`] in ACCESS.
+/// Balance `r->main->count++` from [`ngx_http_read_client_request_body`] in
+/// ACCESS or PRECONTENT.
 ///
 /// Matches nginx `ngx_http_mirror_module`: after OK/AGAIN, call
 /// `ngx_http_finalize_request(NGX_DONE)` and return `true` so the phase handler
@@ -168,7 +169,7 @@ pub unsafe fn initiate_body_read(
 ///
 /// # Safety
 /// Valid NGINX request pointer. `rc` is the return from [`initiate_body_read`].
-pub unsafe fn finish_access_body_read(r: *mut ngx_http_request_t, rc: ngx_int_t) -> bool {
+pub unsafe fn finish_phase_body_read(r: *mut ngx_http_request_t, rc: ngx_int_t) -> bool {
     unsafe {
         if rc == ngx::ffi::NGX_OK as ngx_int_t || rc == ngx::ffi::NGX_AGAIN as ngx_int_t {
             ngx_http_finalize_request(r, Status::NGX_DONE.into());
@@ -195,12 +196,14 @@ pub unsafe fn request_body_buffered(r: *const ngx_http_request_t) -> bool {
 ///
 /// Do not use `ngx_http_finalize_request(NGX_DECLINED)` here: that clears
 /// `r->content_handler` before re-entering phases, which drops `proxy_pass`
-/// handlers when resuming after an async body read started in ACCESS.
+/// handlers when resuming after a body read started in ACCESS/PRECONTENT.
 ///
 /// # Safety
 /// Valid NGINX request pointer.
 pub unsafe fn finalize_allow(r: *mut ngx_http_request_t) {
     unsafe {
+        (*r).set_preserve_body(1);
+
         let core = &raw const ngx_http_core_module;
         let clcf = *(*r).loc_conf.add((*core).ctx_index as usize) as *mut ngx_http_core_loc_conf_t;
         if !clcf.is_null() {

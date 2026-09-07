@@ -123,6 +123,8 @@ pub enum Origin {
     Console = 4,
     /// Blocklists
     Lists = 5,
+    /// AppSec WAF (not stored in the decision cache; ban-page / metrics only)
+    Appsec = 6,
     /// Unknown origin
     Unknown = 255,
 }
@@ -139,6 +141,8 @@ impl Origin {
             Origin::Console
         } else if s.eq_ignore_ascii_case("lists") {
             Origin::Lists
+        } else if s.eq_ignore_ascii_case("appsec") {
+            Origin::Appsec
         } else {
             Origin::Unknown
         }
@@ -151,6 +155,7 @@ impl Origin {
             3 => Origin::Capi,
             4 => Origin::Console,
             5 => Origin::Lists,
+            6 => Origin::Appsec,
             _ => Origin::Unknown,
         }
     }
@@ -163,6 +168,7 @@ impl Origin {
             Origin::Capi => "capi",
             Origin::Console => "console",
             Origin::Lists => "lists",
+            Origin::Appsec => "appsec",
             Origin::Unknown => "unknown",
         }
     }
@@ -903,6 +909,18 @@ pub struct LookupResult {
     pub decision_type: DecisionType,
     pub origin: Origin,
     pub scenario_id: u16,
+}
+
+impl LookupResult {
+    /// Synthetic ban for AppSec (no LAPI scenario; `{{origin}}` is `appsec`).
+    pub fn appsec_ban() -> Self {
+        Self {
+            found: true,
+            decision_type: DecisionType::Ban,
+            origin: Origin::Appsec,
+            scenario_id: 0,
+        }
+    }
 }
 
 /// Find entry by hash using linear probing
@@ -1823,6 +1841,19 @@ pub fn metrics_prometheus_snapshot() -> (u64, u64, u64, u64, u64, u64, u64, u32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_appsec_is_template_label_only() {
+        assert_eq!(Origin::from_str("appsec"), Origin::Appsec);
+        assert_eq!(Origin::from_u8(6), Origin::Appsec);
+        assert_eq!(Origin::Appsec.as_str(), "appsec");
+        assert_eq!(Origin::Appsec.metrics_label(), "appsec");
+        let lookup = LookupResult::appsec_ban();
+        assert!(lookup.found);
+        assert_eq!(lookup.decision_type, DecisionType::Ban);
+        assert_eq!(lookup.origin, Origin::Appsec);
+        assert_eq!(lookup.scenario_id, 0);
+    }
 
     #[test]
     fn test_hash_ip() {

@@ -684,6 +684,7 @@ mod tests {
         assert_eq!(origin_label(Origin::Crowdsec, 0), "crowdsec");
         assert_eq!(origin_label(Origin::Lists, 0), "lists");
         assert_eq!(origin_label(Origin::Capi, 0), "CAPI");
+        assert_eq!(origin_label(Origin::Appsec, 0), "appsec");
     }
 
     #[test]

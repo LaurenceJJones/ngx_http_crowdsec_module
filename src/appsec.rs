@@ -2,9 +2,9 @@ use crate::lapi;
 use crate::config::{AppSecFailureAction, LocConfig, MainConfig};
 use crate::handler::{HandlerResult, StoredPhaseResult, get_client_ip, send_raw_response};
 use crate::request_body::{
-    APPSEC_BODY_CTX_MAGIC, CAPTCHA_POST_CTX_MAGIC, BodyExtractResult, extract_request_body_limited,
-    finalize_allow, finish_access_body_read, get_content_length, has_request_body,
-    initiate_body_read, module_ctx_slot, request_body_buffered, request_ctx_magic,
+    APPSEC_BODY_CTX_MAGIC, BodyExtractResult, extract_request_body_limited, finalize_allow,
+    finish_phase_body_read, get_content_length, has_request_body, initiate_body_read,
+    module_ctx_slot, request_body_buffered, request_ctx_magic,
 };
 use crate::shm;
 use ngx::ffi::{ngx_http_finalize_request, ngx_http_request_t, ngx_int_t};
@@ -38,7 +38,7 @@ pub struct AppSecBodyContext {
     pub failure_action: u8,
     pub internal_challenge: u8,
     pub bot_challenge: u8,
-    /// Outcome stored so ACCESS re-entry after `finalize_allow` does not re-inspect.
+    /// Outcome stored so PRECONTENT re-entry after `finalize_allow` does not re-inspect.
     pub stored_result: u8,
     /// SHM already has a ban for this IP (`appsec_always`); keep ban over captcha/allow.
     pub shm_ban: u8,
@@ -94,7 +94,7 @@ impl AppSecBodyContext {
         StoredPhaseResult::decode(self.stored_result)
     }
 
-    /// Store the outcome (for ACCESS re-entry) then allow, deny, or leave a sent response.
+    /// Store the outcome (for PRECONTENT re-entry) then allow, deny, or leave a sent response.
     unsafe fn finish(
         &self,
         main_r: *mut ngx_http_request_t,
@@ -177,9 +177,8 @@ fn appsec_context(
     Ok((config, ip, failure_action, internal_challenge))
 }
 
-/// AppSec in ACCESS phase: headers/URI, or body inspection when the client sent a body.
-/// Body reads run here (not PRECONTENT) so proxy_pass keeps the correct content handler.
-pub fn inspect_access(
+/// AppSec in PRECONTENT: headers/URI, plus body when the client sent one.
+pub fn inspect(
     request: &mut Request,
     loc: &LocConfig,
     main_conf: &MainConfig,
@@ -279,20 +278,16 @@ fn inspect_request_body(
     }
 }
 
-/// ACCESS re-entry after a body callback resumed phases (mirror-module pattern).
+/// PRECONTENT re-entry after a body callback resumed phases (mirror-module pattern).
 unsafe fn resume_body_read(r: *mut ngx_http_request_t) -> Option<HandlerResult> {
     unsafe {
-        match request_ctx_magic(r)? {
-            APPSEC_BODY_CTX_MAGIC => {
-                let ctx = *module_ctx_slot(r) as *const AppSecBodyContext;
-                match (*ctx).take_result() {
-                    Some(result) => Some(result),
-                    None => Some(HandlerResult::BodyReadPending),
-                }
-            }
-            // Captcha POST already owns this request (fail-open resume).
-            CAPTCHA_POST_CTX_MAGIC => Some(HandlerResult::Declined),
-            _ => None,
+        if request_ctx_magic(r)? != APPSEC_BODY_CTX_MAGIC {
+            return None;
+        }
+        let ctx = *module_ctx_slot(r) as *const AppSecBodyContext;
+        match (*ctx).take_result() {
+            Some(result) => Some(result),
+            None => Some(HandlerResult::BodyReadPending),
         }
     }
 }
@@ -319,7 +314,7 @@ unsafe fn initiate_appsec_body_read(
         );
 
         let rc = initiate_body_read(r, ctx.cast(), appsec_body_handler);
-        if finish_access_body_read(r, rc) {
+        if finish_phase_body_read(r, rc) {
             return HandlerResult::BodyReadPending;
         }
 
@@ -482,6 +477,27 @@ fn call_appsec(
     }
 }
 
+fn apply_appsec_ban_page(
+    request: &mut Request,
+    loc: &LocConfig,
+    ip: &IpAddr,
+) -> HandlerResult {
+    crate::handler::handle_ban_decision(request, loc, ip, &shm::LookupResult::appsec_ban())
+}
+
+fn apply_shm_or_appsec_ban(
+    request: &mut Request,
+    loc: &LocConfig,
+    ip: &IpAddr,
+) -> HandlerResult {
+    let lookup = shm::lookup_ip(ip);
+    if lookup.found && lookup.decision_type == shm::DecisionType::Ban {
+        crate::handler::handle_ban_decision(request, loc, ip, &lookup)
+    } else {
+        apply_appsec_ban_page(request, loc, ip)
+    }
+}
+
 fn apply_appsec_response(
     request: &mut Request,
     loc: &LocConfig,
@@ -501,30 +517,24 @@ fn apply_appsec_response(
     }
 
     let Ok(envelope) = response.into_json::<Envelope>() else {
-        crate::usage_metrics::record_appsec_dropped(ip);
-        if shm_ban {
-            shm::metrics_inc_http_ban();
-            return crate::handler::finish_block_ban(request, loc);
-        }
-        return HandlerResult::Forbidden;
+        // Protocol: 403 with empty/invalid JSON is a ban.
+        return apply_appsec_ban_page(request, loc, ip);
     };
 
-    let mut apply_ban = || {
-        shm::metrics_inc_http_ban();
-        crate::handler::finish_block_ban(request, loc)
-    };
-
-    let result = match envelope.action.as_str() {
-        "allow" => HandlerResult::Declined,
-        "ban" => apply_ban(),
-        "captcha" if shm_ban => apply_ban(),
+    let (result, skip_appsec_dropped) = match envelope.action.as_str() {
+        "allow" => (HandlerResult::Declined, true),
+        "ban" => (apply_appsec_ban_page(request, loc, ip), true),
+        "captcha" if shm_ban => (apply_shm_or_appsec_ban(request, loc, ip), true),
         "captcha" => {
             let Some(captcha_config) = loc.captcha_config() else {
                 return crate::handler::apply_unenforceable_action(request, loc);
             };
-            crate::handler::try_send_captcha_page(request, loc, &captcha_config, ip, None)
+            (
+                crate::handler::try_send_captcha_page(request, loc, &captcha_config, ip, None),
+                false,
+            )
         }
-        "challenge" if shm_ban => apply_ban(),
+        "challenge" if shm_ban => (apply_shm_or_appsec_ban(request, loc, ip), true),
         "challenge" if bot_challenge && !envelope.user_body_content.is_empty() => {
             let status = HTTPStatus::from_u16(if envelope.http_status == 0 {
                 200
@@ -548,17 +558,21 @@ fn apply_appsec_response(
                         .map(|v| ("Set-Cookie".to_string(), v)),
                 )
                 .collect::<Vec<_>>();
-            if send_raw_response(request, status, &envelope.user_body_content, &headers).is_ok() {
-                HandlerResult::Done
-            } else {
-                HandlerResult::Forbidden
-            }
+            (
+                if send_raw_response(request, status, &envelope.user_body_content, &headers).is_ok()
+                {
+                    HandlerResult::Done
+                } else {
+                    HandlerResult::Forbidden
+                },
+                false,
+            )
         }
-        _ if internal_challenge => HandlerResult::Forbidden,
-        _ => HandlerResult::Forbidden,
+        _ if internal_challenge => (HandlerResult::Forbidden, false),
+        _ => (HandlerResult::Forbidden, false),
     };
 
-    if !matches!(result, HandlerResult::Declined | HandlerResult::Error) {
+    if !skip_appsec_dropped && !matches!(result, HandlerResult::Declined | HandlerResult::Error) {
         crate::usage_metrics::record_appsec_dropped(ip);
     }
 

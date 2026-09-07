@@ -10,7 +10,7 @@ use crate::captcha::verifier::{VerifyResult, parse_captcha_response, verify_capt
 use crate::handler::{HandlerResult, StoredPhaseResult};
 use crate::request_body::{
     BodyExtractResult, CAPTCHA_POST_CTX_MAGIC, extract_request_body_limited, finalize_allow,
-    finish_access_body_read, get_content_length, get_request_log, initiate_body_read as start_body_read,
+    finish_phase_body_read, get_content_length, get_request_log, initiate_body_read as start_body_read,
     module_ctx_slot, request_ctx_magic,
 };
 use crate::captcha::handler::{captcha_return_uri, captcha_template_vars};
@@ -185,7 +185,7 @@ pub unsafe fn resume_body_read(r: *mut ngx_http_request_t) -> Option<HandlerResu
 
 /// Initiate ACCESS-phase body reading for captcha POST.
 ///
-/// After OK/AGAIN, balance the extra request count (`finish_access_body_read`) and
+/// After OK/AGAIN, balance the extra request count (`finish_phase_body_read`) and
 /// return `BodyReadPending`. The callback applies the outcome (same as nginx mirror).
 ///
 /// # Safety
@@ -212,7 +212,7 @@ pub unsafe fn initiate_body_read(
         std::ptr::write(ctx, CaptchaPostContext::from_config(config, client_ip));
 
         let rc = start_body_read(r, ctx.cast(), captcha_body_handler);
-        if finish_access_body_read(r, rc) {
+        if finish_phase_body_read(r, rc) {
             return HandlerResult::BodyReadPending;
         }
 

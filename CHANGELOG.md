@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-07
+
+Patch: AppSec inspection returns to **PRECONTENT** (nginx `mirror`), and AppSec bans use the ban template.
+
+Upgrade requires a **full `nginx` restart** (not reload): the PRECONTENT handler is registered again.
+
+### Changed
+
+- AppSec inspection (headers and request body) runs in **PRECONTENT**, matching nginx `mirror`. ACCESS is IP ban/captcha only; remediations are deferred when `crowdsec_appsec_always` must inspect first. Body resume sets `r->preserve_body` so `proxy_pass` still sees the POST body.
+- AppSec `ban` (and invalid AppSec 403 JSON) uses `crowdsec_ban_template` / `crowdsec_ban_action` like LAPI bans. `{{origin}}` is `appsec`; `{{scenario}}` is empty (CrowdSec does not send the matched rule to the bouncer).
+
 ## [0.4.1] - 2026-09-07
 
 Patch: AppSec/captcha POST body reads no longer leak nginx worker memory, plus lifecycle and lookup fixes.

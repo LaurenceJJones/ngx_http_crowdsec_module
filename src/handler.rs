@@ -85,7 +85,7 @@ fn is_static_asset_request(request: &Request, loc_conf: &LocConfig) -> bool {
         .is_ok_and(|path| loc_conf.is_static_asset_path(path))
 }
 
-fn should_run_appsec_access(loc_conf: &LocConfig, lookup: &LookupResult) -> bool {
+fn should_run_appsec(loc_conf: &LocConfig, lookup: &LookupResult) -> bool {
     loc_conf.appsec_enabled == Some(true) && (!lookup.found || loc_conf.appsec_always == Some(true))
 }
 
@@ -103,10 +103,7 @@ pub fn get_client_ip(request: &Request, main_conf: &MainConfig) -> Option<std::n
     )
 }
 
-/// Main access phase handler logic
-///
-/// This function checks if the client IP has decisions according to CrowdSec
-/// stored in shared memory, and handles ban or captcha remediations.
+/// Main access phase handler: IP ban/captcha only (no AppSec body reads).
 ///
 /// # Arguments
 /// * `request` - The NGINX request (mutable for sending responses)
@@ -159,29 +156,82 @@ pub fn handle_access(
     // Lookup IP in shared memory
     let lookup = shm::lookup_ip(&client_ip);
 
-    if should_run_appsec_access(loc_conf, &lookup) {
-        let shm_ban = lookup.found && lookup.decision_type == DecisionType::Ban;
-        let appsec = crate::appsec::inspect_access(request, loc_conf, main_conf, shm_ban);
-        if !matches!(appsec, HandlerResult::Declined) {
-            return appsec;
-        }
+    // AppSec (including body reads) runs in PRECONTENT. Defer remediations so
+    // `crowdsec_appsec_always` can inspect before a ban/captcha page.
+    if should_run_appsec(loc_conf, &lookup) {
+        return HandlerResult::Declined;
     }
 
+    apply_lookup_remediation(request, loc_conf, main_conf, &client_ip, &lookup)
+}
+
+/// PRECONTENT: AppSec headers/body, then any remediations deferred from ACCESS.
+pub fn handle_precontent(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+    main_conf: &MainConfig,
+) -> HandlerResult {
+    match loc_conf.enabled {
+        Some(true) => {}
+        Some(false) | None => return HandlerResult::Declined,
+    }
+
+    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
+    let is_subrequest = unsafe { !(*r).main.is_null() && (*r).main != r };
+    if is_subrequest {
+        return HandlerResult::Declined;
+    }
+
+    let client_ip = match get_client_ip(request, main_conf) {
+        Some(ip) => ip,
+        None => return HandlerResult::Error,
+    };
+
+    if !main_conf.bypass_cidrs.is_empty()
+        && crate::realip::ip_in_cidr_list(&client_ip, &main_conf.bypass_cidrs)
+    {
+        return HandlerResult::Declined;
+    }
+
+    let lookup = shm::lookup_ip(&client_ip);
+    let uri = request.unparsed_uri().to_str().unwrap_or("/");
+    let internal_challenge = uri.starts_with("/crowdsec-internal/challenge/");
+
+    if !should_run_appsec(loc_conf, &lookup) && !internal_challenge {
+        return HandlerResult::Declined;
+    }
+
+    let shm_ban = lookup.found && lookup.decision_type == DecisionType::Ban;
+    let appsec = crate::appsec::inspect(request, loc_conf, main_conf, shm_ban);
+    if !matches!(appsec, HandlerResult::Declined) {
+        return appsec;
+    }
+
+    apply_lookup_remediation(request, loc_conf, main_conf, &client_ip, &lookup)
+}
+
+fn apply_lookup_remediation(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+    main_conf: &MainConfig,
+    client_ip: &IpAddr,
+    lookup: &LookupResult,
+) -> HandlerResult {
     if !lookup.found {
-        // No remediation - but check if client has a stale captcha cookie to clear
         maybe_clear_stale_captcha_cookie(request, loc_conf);
         return HandlerResult::Declined;
     }
 
-    // Route based on decision type (Ban has priority over Captcha)
     match lookup.decision_type {
-        DecisionType::Ban => handle_ban_decision(request, loc_conf, &client_ip, &lookup),
-        DecisionType::Captcha => handle_captcha_decision(request, loc_conf, &client_ip, &lookup),
-        DecisionType::Unknown => handle_unknown_decision(request, loc_conf, main_conf, &client_ip, &lookup),
+        DecisionType::Ban => handle_ban_decision(request, loc_conf, client_ip, lookup),
+        DecisionType::Captcha => handle_captcha_decision(request, loc_conf, client_ip, lookup),
+        DecisionType::Unknown => {
+            handle_unknown_decision(request, loc_conf, main_conf, client_ip, lookup)
+        }
     }
 }
 
-fn handle_ban_decision(
+pub(crate) fn handle_ban_decision(
     request: &mut Request,
     loc_conf: &LocConfig,
     client_ip: &IpAddr,
@@ -552,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_run_appsec_access() {
+    fn test_should_run_appsec() {
         let lookup_none = LookupResult {
             found: false,
             decision_type: DecisionType::Unknown,
@@ -570,14 +620,14 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(should_run_appsec_access(&loc, &lookup_none));
-        assert!(!should_run_appsec_access(&loc, &lookup_ban));
+        assert!(should_run_appsec(&loc, &lookup_none));
+        assert!(!should_run_appsec(&loc, &lookup_ban));
 
         loc.appsec_always = Some(true);
-        assert!(should_run_appsec_access(&loc, &lookup_ban));
+        assert!(should_run_appsec(&loc, &lookup_ban));
 
         loc.appsec_enabled = Some(false);
-        assert!(!should_run_appsec_access(&loc, &lookup_ban));
+        assert!(!should_run_appsec(&loc, &lookup_ban));
     }
 
     #[test]

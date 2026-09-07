@@ -34,7 +34,7 @@ All templates support the following variables using `{{variable_name}}` syntax:
 - `{{request_method}}` - The HTTP method (GET, POST, etc.)
 - `{{request_uri}}` - The requested URI path
 - `{{scenario}}` - CrowdSec scenario (includes cscli `--reason` text; stored in SHM, truncated to 127 bytes)
-- `{{origin}}` - Where the decision came from (`crowdsec`, `cscli`, `capi`, `console`, `lists`, `unknown`)
+- `{{origin}}` - Where the decision came from (`crowdsec`, `cscli`, `capi`, `console`, `lists`, `appsec`, `unknown`). AppSec bans use `appsec`; `{{scenario}}` is empty because the AppSec protocol does not include the matched rule.
 - `{{host}}` - The request's `Host` header (useful behind reverse proxies)
 
 ## Usage

@@ -25,11 +25,12 @@ mod usage_metrics;
 
 use config::{DEFAULT_SHM_SIZE, LocConfig, MainConfig, NGX_HTTP_CROWDSEC_COMMANDS};
 use conf::{ConfValueError, NgxConfExt};
-use handler::handle_access;
+use handler::{handle_access, handle_precontent};
 use ngx::core::Status;
 use ngx::ffi::{
     NGX_HTTP_MODULE, NGX_OK, ngx_array_push, ngx_conf_t, ngx_cycle_t, ngx_http_handler_pt,
-    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t,
+    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE,
+    ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE, ngx_int_t, ngx_module_t,
 };
 use ngx::http::{
     HttpModule, HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError,
@@ -83,6 +84,21 @@ http_request_handler!(
             None => return Status::NGX_DECLINED,
         };
         Status::from(handle_access(request, loc_conf, main_conf))
+    }
+);
+
+http_request_handler!(
+    crowdsec_precontent_handler,
+    |request: &mut ngx::http::Request| {
+        let loc_conf = match Module::location_conf(request) {
+            Some(c) => c,
+            None => return Status::NGX_DECLINED,
+        };
+        let main_conf = match Module::main_conf(request) {
+            Some(c) => c,
+            None => return Status::NGX_DECLINED,
+        };
+        Status::from(handle_precontent(request, loc_conf, main_conf))
     }
 );
 
@@ -200,6 +216,14 @@ impl HttpModule for Module {
             }
 
             *handler = Some(crowdsec_access_handler);
+
+            let pre = ngx_array_push(
+                &mut cmcf.phases[ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE as usize].handlers,
+            ) as *mut ngx_http_handler_pt;
+            if pre.is_null() {
+                return Status::NGX_ERROR.into();
+            }
+            *pre = Some(crowdsec_precontent_handler);
 
             Status::NGX_OK.into()
         }

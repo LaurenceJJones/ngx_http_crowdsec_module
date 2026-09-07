@@ -138,7 +138,7 @@ crowdsec_appsec_failure_action passthrough;
 crowdsec_bot_challenge on;  # experimental — CrowdSec 1.8
 ```
 
-Request bodies (POST/PUT/PATCH/DELETE, and any method with a body) are inspected in the **ACCESS** phase so `proxy_pass` keeps the correct content handler. Keep `crowdsec_appsec_timeout` in the tens of milliseconds if you cannot accept a blocked worker; captcha provider verify is also synchronous on the worker (5s timeout). Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin. IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`) are treated as IPv4 for bans, bypass, and trusted proxies.
+Request bodies (POST/PUT/PATCH/DELETE, and any method with a body) are inspected in the **PRECONTENT** phase so `proxy_pass` keeps the correct content handler. Keep `crowdsec_appsec_timeout` in the tens of milliseconds if you cannot accept a blocked worker; captcha provider verify is also synchronous on the worker (5s timeout). Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin. IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`) are treated as IPv4 for bans, bypass, and trusted proxies.
 
 ## Client IP behind a reverse proxy
 
@@ -181,6 +181,8 @@ Do not configure both nginx `real_ip` and `crowdsec_trusted_proxies` for the sam
 ## Ban templates
 
 Template variables: `{{client_ip}}`, `{{request_method}}`, `{{request_uri}}`, `{{scenario}}`, `{{origin}}`, `{{host}}`.
+
+LAPI IP bans and AppSec `ban` share this page (and `crowdsec_ban_action redirect`). AppSec sets `{{origin}}` to `appsec` and leaves `{{scenario}}` empty.
 
 Built-in examples live in [`templates/`](../templates/). See [`templates/README.md`](../templates/README.md).
 

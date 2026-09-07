@@ -50,14 +50,14 @@ Verify symbols on [docs.rs/ngx/0.5.1](https://docs.rs/ngx/0.5.1/ngx/) or registr
 
 | Phase | Role |
 |-------|------|
-| **ACCESS** | IP ban/captcha routing; **AppSec** (headers + request body via `inspect_access`) |
-| **PRECONTENT** | Not registered. AppSec and captcha POST run in **ACCESS** |
+| **ACCESS** | IP ban/captcha only. Never reads the request body except captcha POST. |
+| **PRECONTENT** | **AppSec** (headers + body via `inspect`). Ban/captcha deferred here when `crowdsec_appsec_always` must inspect first. |
 
 **AppSec + request bodies** (`src/appsec.rs`, `src/request_body.rs`):
 
-- Body reads run in **ACCESS**, not PRECONTENT, so `proxy_pass` keeps the correct content handler.
-- After `ngx_http_read_client_request_body` returns OK/AGAIN, call **`ngx_http_finalize_request(NGX_DONE)`** and return **`NGX_DONE`** from ACCESS (balances `r->main->count++`; see nginx `mirror` module). Skipping this leaks request pools on every AppSec/captcha POST.
-- Body callback on allow: **`finalize_allow`** restores `clcf->handler` into `r->content_handler` then `ngx_http_core_run_phases`. ACCESS re-entry must return the stored result — **never** `ngx_http_finalize_request(NGX_DECLINED)` (that clears `content_handler` and breaks `proxy_pass`).
+- Body reads run in **PRECONTENT** (nginx `mirror` phase), not ACCESS, so `proxy_pass` keeps the correct content handler.
+- After `ngx_http_read_client_request_body` returns OK/AGAIN, call **`ngx_http_finalize_request(NGX_DONE)`** and return **`NGX_DONE`** from the phase handler (balances `r->main->count++`).
+- Body callback on allow: set **`r->preserve_body`**, **`finalize_allow`** restores `clcf->handler` into `r->content_handler` then `ngx_http_core_run_phases`. Re-entry must return the stored result — **never** `ngx_http_finalize_request(NGX_DECLINED)` (that clears `content_handler` and breaks `proxy_pass`).
 
 Key files: `appsec.rs`, `handler.rs`, `request_body.rs`, `captcha/body.rs`, `shm.rs`, `stream.rs`.
 
@@ -139,11 +139,12 @@ grep "\*${REQ}" /var/log/nginx/debug.log \
   | grep -E 'phase|body|proxy|filename|finalize|upstream|crowdsec|appsec'
 ```
 
-**Phase trail** — follow `http … phase:` lines in order. CrowdSec/AppSec runs in **access**; `proxy_pass` / `try_files` / static run in **content** (and later phases). If access ends with `finalize request: 403` and you never see content/proxy lines, the block happened before upstream.
+**Phase trail** — follow `http … phase:` lines in order. CrowdSec IP ban/captcha runs in **access**; AppSec runs in **precontent**; `proxy_pass` / `try_files` / static run in **content**. If access/precontent ends with `finalize request: 403` and you never see content/proxy lines, the block happened before upstream.
 
 | Grep pattern | Meaning |
 |--------------|---------|
-| `http access phase` | ACCESS handlers (CrowdSec ban/captcha/AppSec) |
+| `http access phase` | ACCESS handlers (CrowdSec IP ban/captcha) |
+| `http precontent phase` | PRECONTENT handlers (AppSec) |
 | `http read client request body` | Body buffering (AppSec POST path) |
 | `http finalize request: 403` | Request terminated in a phase handler |
 | `finalize http proxy request` | **Healthy** — heading to upstream |
