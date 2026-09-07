@@ -37,7 +37,21 @@ class H(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 9000), H).serve_forever()
 '
 
+upstream_ready=0
+for _ in $(seq 1 30); do
+  if docker run --rm --network "$NET" python:3.13-alpine \
+    python -c "import socket; s=socket.create_connection(('upstream',9000),1); s.close()" \
+    2>/dev/null; then
+    upstream_ready=1
+    break
+  fi
+  sleep 1
+done
+test "$upstream_ready" = 1
+UPSTREAM_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' cs-up)
+
 docker run -d --name nginx-test --network "$NET" \
+  --add-host "upstream:${UPSTREAM_IP}" \
   -e CROWDSEC_BOUNCER_KEY=test-bouncer-key-12345 \
   -e CAPTCHA_SITE_KEY=x -e CAPTCHA_SECRET_KEY=x \
   -e CAPTCHA_SIGNING_KEY=0000000000000000000000000000000000000000000000000000000000000000 \
