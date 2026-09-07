@@ -23,19 +23,8 @@ docker run -d --name cs-mock --network "$NET" --network-alias crowdsec \
   python:3.13-alpine python /mock/mock_lapi.py
 
 docker run -d --name cs-up --network "$NET" --network-alias upstream \
-  python:3.13-alpine python -c '
-from http.server import BaseHTTPRequestHandler, HTTPServer
-class H(BaseHTTPRequestHandler):
-    def do_POST(self):
-        n = int(self.headers.get("Content-Length", "0") or 0)
-        if n:
-            self.rfile.read(n)
-        self.send_response(204)
-        self.end_headers()
-    def log_message(self, *a):
-        pass
-HTTPServer(("0.0.0.0", 9000), H).serve_forever()
-'
+  -v "$ROOT/tests:/mock:ro" \
+  python:3.13-alpine python /mock/mock_upstream.py
 
 upstream_ready=0
 for _ in $(seq 1 30); do
