@@ -4,7 +4,7 @@ use crate::captcha::cookie::{
 };
 use crate::captcha::handler::{captcha_return_uri, send_captcha_page, send_see_other_redirect};
 use crate::captcha::{self, CaptchaHandler};
-use crate::config::{BanActionMode, LocConfig, MainConfig};
+use crate::config::{BanActionMode, FallbackRemediation, LocConfig, MainConfig, UnenforceableAction};
 use crate::realip;
 use crate::shm::{self, DecisionType, LookupResult};
 use crate::usage_metrics;
@@ -148,50 +148,75 @@ pub fn handle_access(
     match lookup.decision_type {
         DecisionType::Ban => {
             usage_metrics::record_dropped(&client_ip, lookup.origin, lookup.scenario_id);
-            if loc_conf.ban_action == Some(BanActionMode::Redirect) {
-                if let Some(ref url) = loc_conf.ban_redirect_url {
-                    let code = loc_conf.ban_redirect_code.unwrap_or(302);
-                    if send_ban_redirect(request, url, ban_redirect_status(code)).is_ok() {
-                        shm::metrics_inc_http_ban();
-                        return HandlerResult::Done;
-                    }
-                } else {
-                    ngx_log_debug_http!(
-                        request,
-                        "crowdsec: ban_action redirect but ban_redirect_url not set; using block"
-                    );
-                }
-            }
-            // For static assets like .ico, just return 403 without HTML body
-            if is_static_asset_request(request, loc_conf) {
-                shm::metrics_inc_http_ban();
-                return HandlerResult::Forbidden;
-            }
-            // Handle ban - send 403 with template
-            if let Some(ref template) = loc_conf.ban_template {
-                match send_ban_response(request, template, &client_ip, &lookup) {
-                    Ok(_) => {
-                        shm::metrics_inc_http_ban();
-                        return HandlerResult::Done;
-                    }
-                    Err(_) => {}
-                }
-            }
-            shm::metrics_inc_http_ban();
-            HandlerResult::Forbidden
+            handle_ban_decision(request, loc_conf, &client_ip, &lookup)
         }
         DecisionType::Captcha => {
             usage_metrics::record_dropped(&client_ip, lookup.origin, lookup.scenario_id);
             handle_captcha_decision(request, loc_conf, &client_ip)
         }
-        DecisionType::Unknown => {
-            // Unknown decision type, fail-open
+        DecisionType::Unknown => handle_unknown_decision(request, loc_conf, main_conf, &client_ip, &lookup),
+    }
+}
+
+fn handle_ban_decision(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+    client_ip: &IpAddr,
+    lookup: &LookupResult,
+) -> HandlerResult {
+    if loc_conf.ban_action == Some(BanActionMode::Redirect) {
+        if let Some(ref url) = loc_conf.ban_redirect_url {
+            let code = loc_conf.ban_redirect_code.unwrap_or(302);
+            if send_ban_redirect(request, url, ban_redirect_status(code)).is_ok() {
+                shm::metrics_inc_http_ban();
+                return HandlerResult::Done;
+            }
+        } else {
             ngx_log_debug_http!(
                 request,
-                "crowdsec: unknown decision type for IP {}",
-                client_ip
+                "crowdsec: ban_action redirect but ban_redirect_url not set; using block"
             );
-            HandlerResult::Declined
+        }
+    }
+    if is_static_asset_request(request, loc_conf) {
+        shm::metrics_inc_http_ban();
+        return finish_block_ban(request, loc_conf);
+    }
+    let ban_status = ban_block_status(loc_conf);
+    if let Some(ref template) = loc_conf.ban_template {
+        if send_ban_response(request, template, ban_status, client_ip, lookup).is_ok() {
+            shm::metrics_inc_http_ban();
+            return HandlerResult::Done;
+        }
+    } else if send_block_response(request, ban_status).is_ok() {
+        shm::metrics_inc_http_ban();
+        return HandlerResult::Done;
+    }
+    shm::metrics_inc_http_ban();
+    apply_unenforceable_action(request, loc_conf)
+}
+
+fn handle_unknown_decision(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+    main_conf: &MainConfig,
+    client_ip: &IpAddr,
+    lookup: &LookupResult,
+) -> HandlerResult {
+    ngx_log_debug_http!(
+        request,
+        "crowdsec: unknown decision type for IP {}",
+        client_ip
+    );
+    match main_conf.fallback_remediation_or_default() {
+        FallbackRemediation::Allow => HandlerResult::Declined,
+        FallbackRemediation::Ban => {
+            usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
+            handle_ban_decision(request, loc_conf, client_ip, lookup)
+        }
+        FallbackRemediation::Captcha => {
+            usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
+            handle_captcha_decision(request, loc_conf, client_ip)
         }
     }
 }
@@ -238,20 +263,19 @@ pub(crate) fn handle_captcha_decision(
             shm::metrics_inc_http_captcha();
             return HandlerResult::Done;
         }
-        return HandlerResult::Error;
+        return apply_unenforceable_action(request, loc_conf);
     }
 
     // Get captcha configuration from location config (inherits from parent levels)
     let captcha_config = match loc_conf.captcha_config() {
         Some(cfg) => cfg,
         None => {
-            // Captcha not configured - fail open with warning
             ngx_log_debug_http!(
                 request,
-                "crowdsec: captcha decision for {} but captcha not configured, allowing",
+                "crowdsec: captcha decision for {} but captcha not configured",
                 client_ip
             );
-            return HandlerResult::Declined;
+            return apply_unenforceable_action(request, loc_conf);
         }
     };
 
@@ -277,43 +301,71 @@ pub(crate) fn handle_captcha_decision(
 
     // Handle based on request method
     match request.method() {
-        Method::GET | Method::HEAD => {
-            // Show captcha page
-            if send_captcha_page(
-                request,
-                &captcha_config,
-                loc_conf.captcha_template.as_ref(),
-                client_ip,
-                None,
-            )
-            .is_ok()
-            {
-                HandlerResult::Done
-            } else {
-                HandlerResult::Forbidden
-            }
-        }
+        Method::GET | Method::HEAD => try_send_captcha_page(request, loc_conf, &captcha_config, client_ip, None),
         Method::POST => {
+            if loc_conf.captcha_template.is_none() {
+                return apply_unenforceable_action(request, loc_conf);
+            }
             // Handle captcha verification
             handle_captcha_post(request, loc_conf, &captcha_config, client_ip)
         }
-        _ => {
-            // Other methods - show captcha page
-            if send_captcha_page(
-                request,
-                &captcha_config,
-                loc_conf.captcha_template.as_ref(),
-                client_ip,
-                None,
-            )
-            .is_ok()
-            {
-                HandlerResult::Done
-            } else {
-                HandlerResult::Forbidden
-            }
-        }
+        _ => try_send_captcha_page(request, loc_conf, &captcha_config, client_ip, None),
     }
+}
+
+pub(crate) fn try_send_captcha_page(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+    captcha_config: &crate::captcha::CaptchaConfig,
+    client_ip: &IpAddr,
+    error_message: Option<&str>,
+) -> HandlerResult {
+    if loc_conf.captcha_template.is_none() {
+        return apply_unenforceable_action(request, loc_conf);
+    }
+    if send_captcha_page(
+        request,
+        captcha_config,
+        loc_conf.captcha_template.as_ref(),
+        client_ip,
+        error_message,
+    )
+    .is_ok()
+    {
+        HandlerResult::Done
+    } else {
+        apply_unenforceable_action(request, loc_conf)
+    }
+}
+
+pub(crate) fn apply_unenforceable_action(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+) -> HandlerResult {
+    match loc_conf.unenforceable_action_or_default() {
+        UnenforceableAction::Allow => HandlerResult::Declined,
+        UnenforceableAction::Block => finish_block_ban(request, loc_conf),
+    }
+}
+
+fn ban_block_status(loc_conf: &LocConfig) -> HTTPStatus {
+    HTTPStatus::from_u16(loc_conf.ban_status_code()).unwrap_or(HTTPStatus::FORBIDDEN)
+}
+
+pub(crate) fn finish_block_ban(request: &mut Request, loc_conf: &LocConfig) -> HandlerResult {
+    let status = ban_block_status(loc_conf);
+    if send_block_response(request, status).is_ok() {
+        HandlerResult::Done
+    } else if status == HTTPStatus::FORBIDDEN {
+        HandlerResult::Forbidden
+    } else {
+        HandlerResult::Error
+    }
+}
+
+/// Minimal response for block-mode bans (no template body).
+pub(crate) fn send_block_response(request: &mut Request, status: HTTPStatus) -> Result<(), ()> {
+    send_empty_response(request, status)
 }
 
 /// Handle POST request for captcha verification
@@ -328,27 +380,24 @@ fn handle_captcha_post(
     // Check content type
     let is_form = unsafe { captcha::body::is_form_urlencoded(r) };
     if !is_form {
-        // Not form data, show captcha page with error
-        let _ = send_captcha_page(
+        return try_send_captcha_page(
             request,
+            loc_conf,
             captcha_config,
-            loc_conf.captcha_template.as_ref(),
             client_ip,
             Some("Invalid request format"),
         );
-        return HandlerResult::Done;
     }
 
     // Check body size
     if !unsafe { captcha::body::is_body_size_acceptable(r) } {
-        let _ = send_captcha_page(
+        return try_send_captcha_page(
             request,
+            loc_conf,
             captcha_config,
-            loc_conf.captcha_template.as_ref(),
             client_ip,
             Some("Request too large"),
         );
-        return HandlerResult::Done;
     }
 
     // Initiate async body reading - the callback will handle verification
@@ -581,6 +630,7 @@ fn send_ban_redirect(request: &mut Request, location: &str, status: HTTPStatus) 
 fn send_ban_response(
     request: &mut Request,
     template: &Template,
+    status: HTTPStatus,
     client_ip: &IpAddr,
     lookup: &LookupResult,
 ) -> Result<(), ()> {
@@ -605,8 +655,8 @@ fn send_ban_response(
     // Render the template
     let body = template.render(&vars);
 
-    // Set status code
-    request.set_status(HTTPStatus::FORBIDDEN);
+    // Set status code (crowdsec_ban_status / Lua RET_CODE)
+    request.set_status(status);
 
     // Set content length
     request.set_content_length_n(body.len());

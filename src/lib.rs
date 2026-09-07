@@ -30,13 +30,13 @@ use ngx::core::Status;
 use ngx::ffi::{
     NGX_HTTP_MODULE, NGX_OK, ngx_array_push, ngx_conf_t, ngx_cycle_t, ngx_http_handler_pt,
     ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE,
-    ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE, ngx_int_t, ngx_module_t, ngx_str_t,
+    ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE, ngx_int_t, ngx_module_t,
 };
 use ngx::http::{
     HttpModule, HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError,
     NgxHttpCoreModule, Request,
 };
-use ngx::{http_request_handler, ngx_conf_log_error, ngx_modules, ngx_string};
+use ngx::{http_request_handler, ngx_modules};
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -186,6 +186,7 @@ impl HttpModule for Module {
                         usage_metrics_interval_secs: conf
                             .usage_metrics_interval_secs
                             .unwrap_or(900),
+                        fallback_remediation: conf.fallback_remediation_or_default(),
                     }),
                     _ => None,
                 };
@@ -335,7 +336,7 @@ ngx_modules!(ngx_http_crowdsec_module);
 mod tests {
     use super::*;
     use crate::captcha::CookieSecure;
-    use crate::config::BanActionMode;
+    use crate::config::{BanActionMode, FallbackRemediation, UnenforceableAction};
 
     #[test]
     fn location_merge_inherits_cookie_security() {
@@ -351,14 +352,81 @@ mod tests {
     }
 
     #[test]
-    fn merge_fails_when_crowdsec_on_without_ban_template() {
+    fn merge_allows_crowdsec_on_without_ban_template() {
         let parent = LocConfig::default();
         let mut child = LocConfig {
             enabled: Some(true),
             ..Default::default()
         };
 
+        assert!(child.merge(&parent).is_ok());
+        assert_eq!(child.ban_status_code(), 403);
+    }
+
+    #[test]
+    fn merge_requires_captcha_template_when_unenforceable_block() {
+        let parent = LocConfig::default();
+        let mut child = LocConfig {
+            enabled: Some(true),
+            captcha_provider: Some(crate::captcha::CaptchaProvider::Turnstile),
+            captcha_site_key: Some("site".to_string()),
+            captcha_secret_key: Some("secret".to_string()),
+            captcha_signing_key: Some([1u8; 32]),
+            unenforceable_action: Some(UnenforceableAction::Block),
+            ..Default::default()
+        };
+
         assert!(child.merge(&parent).is_err());
+    }
+
+    #[test]
+    fn merge_allows_captcha_keys_without_template_when_unenforceable_allow() {
+        let parent = LocConfig::default();
+        let mut child = LocConfig {
+            enabled: Some(true),
+            captcha_provider: Some(crate::captcha::CaptchaProvider::Turnstile),
+            captcha_site_key: Some("site".to_string()),
+            captcha_secret_key: Some("secret".to_string()),
+            captcha_signing_key: Some([1u8; 32]),
+            unenforceable_action: Some(UnenforceableAction::Allow),
+            ..Default::default()
+        };
+
+        assert!(child.merge(&parent).is_ok());
+    }
+
+    #[test]
+    fn fallback_remediation_resolve_unknown_type() {
+        assert_eq!(
+            FallbackRemediation::Allow.resolve_unknown_type("mfa"),
+            None
+        );
+        assert_eq!(
+            FallbackRemediation::Ban.resolve_unknown_type("mfa"),
+            Some(crate::shm::DecisionType::Ban)
+        );
+        assert_eq!(
+            FallbackRemediation::Captcha.resolve_unknown_type("mfa"),
+            Some(crate::shm::DecisionType::Captcha)
+        );
+        assert_eq!(
+            FallbackRemediation::Ban.resolve_unknown_type("ban"),
+            Some(crate::shm::DecisionType::Ban)
+        );
+    }
+
+    #[test]
+    fn ban_status_code_rejects_non_error_codes() {
+        let loc = LocConfig {
+            ban_status: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(loc.ban_status_code(), 403);
+        let loc = LocConfig {
+            ban_status: Some(429),
+            ..Default::default()
+        };
+        assert_eq!(loc.ban_status_code(), 429);
     }
 
     #[test]

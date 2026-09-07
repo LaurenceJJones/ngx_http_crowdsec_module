@@ -1,12 +1,13 @@
 use crate::captcha::{CaptchaConfig, CaptchaProvider, CookieSecure};
 use crate::conf::{ConfValueError, NgxConfExt};
 use crate::realip::TrustedCidr;
-use crate::shm::DecisionsSharedZone;
+use crate::shm::{DecisionType, DecisionsSharedZone};
 use crate::template::Template;
 use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, NgxStr};
 use ngx::ffi::{
-    NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
-    NGX_HTTP_SRV_CONF, ngx_command_t, ngx_conf_t, ngx_str_t, ngx_uint_t,
+    NGX_CONF_1MORE, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF,
+    NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_SRV_CONF, ngx_command_t, ngx_conf_t, ngx_str_t,
+    ngx_uint_t,
 };
 use ngx::ngx_string;
 use std::collections::HashMap;
@@ -52,6 +53,8 @@ pub struct MainConfig {
     pub usage_metrics_interval_secs: Option<u64>,
     /// Set when any merged location has `crowdsec on` (including inherited).
     pub enforcement_requested: bool,
+    /// Unknown LAPI remediation types: allow (ignore), ban, or captcha (http level only).
+    pub fallback_remediation: Option<FallbackRemediation>,
 }
 
 impl MainConfig {
@@ -84,6 +87,10 @@ impl MainConfig {
             );
         }
     }
+
+    pub fn fallback_remediation_or_default(&self) -> FallbackRemediation {
+        self.fallback_remediation.unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -94,12 +101,57 @@ pub enum AppSecFailureAction {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BanActionMode {
-    /// Return 403 (optionally with `crowdsec_ban_template` body)
+    /// Return `crowdsec_ban_status` (default 403), optionally with `crowdsec_ban_template` body
     #[default]
     Block,
     /// Redirect to `crowdsec_ban_redirect_url` (must be `http://` or `https://`). Status from
     /// `crowdsec_ban_redirect_code` (default 302).
     Redirect,
+}
+
+/// When a known remediation cannot be applied (missing config/template, send failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnenforceableAction {
+    /// Allow the request through (fail-open).
+    #[default]
+    Allow,
+    /// Return `crowdsec_ban_status` with no HTML body.
+    Block,
+}
+
+/// Policy for unknown LAPI remediation types (Lua `FALLBACK_REMEDIATION` + spec ignore).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FallbackRemediation {
+    /// Do not store the decision (ignore).
+    #[default]
+    Allow,
+    /// Store and enforce as ban.
+    Ban,
+    /// Store and enforce as captcha.
+    Captcha,
+}
+
+impl FallbackRemediation {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "allow" => Some(Self::Allow),
+            "ban" => Some(Self::Ban),
+            "captcha" => Some(Self::Captcha),
+            _ => None,
+        }
+    }
+
+    /// Map an unknown stream decision type, or return `None` to skip storing.
+    pub fn resolve_unknown_type(self, raw_type: &str) -> Option<DecisionType> {
+        if DecisionType::from_str(raw_type) != DecisionType::Unknown {
+            return Some(DecisionType::from_str(raw_type));
+        }
+        match self {
+            Self::Allow => None,
+            Self::Ban => Some(DecisionType::Ban),
+            Self::Captcha => Some(DecisionType::Captcha),
+        }
+    }
 }
 
 /// Location configuration for CrowdSec module
@@ -116,6 +168,8 @@ pub struct LocConfig {
     pub ban_redirect_url: Option<String>,
     /// HTTP status for ban redirect: 301, 302, 303, 307, or 308 (default 302 if unset)
     pub ban_redirect_code: Option<u16>,
+    /// HTTP status for block-mode bans without a template (Lua `RET_CODE`; default 403)
+    pub ban_status: Option<u16>,
     /// When true, this location serves Prometheus text metrics (use a dedicated location).
     pub metrics_enabled: Option<bool>,
     /// Captcha template for rendering captcha challenge pages
@@ -136,6 +190,8 @@ pub struct LocConfig {
     pub captcha_expiry_secs: Option<u64>,
     /// Whether to fail open when provider is unreachable
     pub captcha_fail_open: Option<bool>,
+    /// Action when a known remediation cannot be applied
+    pub unenforceable_action: Option<UnenforceableAction>,
     /// Whether to bind JWT to client IP
     pub captcha_bind_ip: Option<bool>,
     /// Cookie Secure flag setting (auto/on/off)
@@ -187,21 +243,31 @@ impl LocConfig {
             return Ok(());
         }
 
-        if self.ban_action != Some(BanActionMode::Redirect) && self.ban_template.is_none() {
-            return Err(
-                "crowdsec on requires crowdsec_ban_template (or crowdsec_ban_action redirect with crowdsec_ban_redirect_url)",
-            );
-        }
-
         if self.ban_action == Some(BanActionMode::Redirect) && self.ban_redirect_url.is_none() {
             return Err("crowdsec_ban_action redirect requires crowdsec_ban_redirect_url");
         }
 
-        if self.captcha_config().is_some() && self.captcha_template.is_none() {
-            return Err("captcha settings require crowdsec_captcha_template");
+        if self.captcha_config().is_some()
+            && self.captcha_template.is_none()
+            && self.unenforceable_action_or_default() == UnenforceableAction::Block
+        {
+            return Err(
+                "captcha settings with crowdsec_unenforceable_action block require crowdsec_captcha_template",
+            );
         }
 
         Ok(())
+    }
+
+    /// Block-mode ban HTTP status (400–599). Defaults to 403 (Lua `RET_CODE`).
+    pub fn ban_status_code(&self) -> u16 {
+        self.ban_status
+            .filter(|code| (400..600).contains(code))
+            .unwrap_or(403)
+    }
+
+    pub fn unenforceable_action_or_default(&self) -> UnenforceableAction {
+        self.unenforceable_action.unwrap_or_default()
     }
 
     /// Merge inherited fields from `prev`, then validate enforcement settings.
@@ -220,6 +286,9 @@ impl LocConfig {
         }
         if self.ban_redirect_code.is_none() {
             self.ban_redirect_code = prev.ban_redirect_code;
+        }
+        if self.ban_status.is_none() {
+            self.ban_status = prev.ban_status;
         }
         if self.captcha_template.is_none() {
             self.captcha_template = prev.captcha_template.clone();
@@ -244,6 +313,9 @@ impl LocConfig {
         }
         if self.captcha_fail_open.is_none() {
             self.captcha_fail_open = prev.captcha_fail_open;
+        }
+        if self.unenforceable_action.is_none() {
+            self.unenforceable_action = prev.unenforceable_action;
         }
         if self.captcha_bind_ip.is_none() {
             self.captcha_bind_ip = prev.captcha_bind_ip;
@@ -633,10 +705,10 @@ pub extern "C" fn ngx_http_crowdsec_set_shm_size(
         match size {
             Some(s) if s >= 64 * 1024 => {
                 conf.shm_size = Some(s);
-                if unsafe { crate::shm::decisions_zone_early_request(cf, &mut conf.decisions_zone, s) }
+                if crate::shm::decisions_zone_early_request(cf, &mut conf.decisions_zone, s)
                     .is_err()
                 {
-                    let cf_ref = unsafe { &*cf };
+                    let cf_ref = &*cf;
                     return cf_ref.error(
                         "crowdsec_shm_size",
                         &ConfValueError("failed to request crowdsec_decisions shared zone"),
@@ -1053,6 +1125,45 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_redirect_code(
     NGX_CONF_OK
 }
 
+fn parse_ban_status_code(s: &str) -> Option<u16> {
+    let code: u16 = s.trim().parse().ok()?;
+    ((400..600).contains(&code)).then_some(code)
+}
+
+/// Directive handler for `crowdsec_ban_status <code>;` (block mode; Lua `RET_CODE`)
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_ban_status(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        if let Some(code) = parse_ban_status_code(value_str) {
+            conf.ban_status = Some(code);
+        } else {
+            ngx::ngx_conf_log_error!(
+                ngx::ffi::NGX_LOG_ERR,
+                cf,
+                "crowdsec: ban_status must be an HTTP error status 400-599 (got '{}')",
+                value_str.trim()
+            );
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    NGX_CONF_OK
+}
+
 /// Directive handler for `crowdsec_metrics on|off;`
 ///
 /// # Safety
@@ -1322,6 +1433,77 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_fail_open(
         };
 
         conf.captcha_fail_open = Some(value_str.eq_ignore_ascii_case("on"));
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_unenforceable_action allow|block;`
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_unenforceable_action(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        conf.unenforceable_action = match value_str.trim().to_ascii_lowercase().as_str() {
+            "allow" => Some(UnenforceableAction::Allow),
+            "block" => Some(UnenforceableAction::Block),
+            _ => {
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: unenforceable_action must be allow or block (got '{}')",
+                    value_str.trim()
+                );
+                return NGX_CONF_ERROR;
+            }
+        };
+    }
+
+    NGX_CONF_OK
+}
+
+/// Directive handler for `crowdsec_fallback_remediation allow|ban|captcha;` (http level)
+#[unsafe(no_mangle)]
+pub extern "C" fn ngx_http_crowdsec_set_fallback_remediation(
+    cf: *mut ngx_conf_t,
+    _cmd: *mut ngx_command_t,
+    conf: *mut c_void,
+) -> *mut c_char {
+    let conf = unsafe { &mut *(conf as *mut MainConfig) };
+
+    unsafe {
+        let args = (*(*cf).args).elts as *mut ngx_str_t;
+        let value = *args.add(1);
+
+        let value_str = match NgxStr::from_ngx_str(value).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+
+        match FallbackRemediation::from_str(value_str) {
+            Some(action) => conf.fallback_remediation = Some(action),
+            None => {
+                ngx::ngx_conf_log_error!(
+                    ngx::ffi::NGX_LOG_ERR,
+                    cf,
+                    "crowdsec: fallback_remediation must be allow, ban, or captcha (got '{}')",
+                    value_str.trim()
+                );
+                return NGX_CONF_ERROR;
+            }
+        }
     }
 
     NGX_CONF_OK
@@ -1657,7 +1839,7 @@ pub extern "C" fn ngx_http_crowdsec_set_static_extensions(
 
 /// The array is null-terminated with an empty command.
 #[rustfmt::skip]
-pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 38] = [
+pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec on|off; - enable/disable at location level
     ngx_command_t {
         name: ngx_string!("crowdsec"),
@@ -1694,10 +1876,19 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 38] = [
         offset: 0,
         post: std::ptr::null_mut(),
     },
+    // crowdsec_fallback_remediation allow|ban|captcha; - unknown LAPI decision types
+    ngx_command_t {
+        name: ngx_string!("crowdsec_fallback_remediation"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_fallback_remediation),
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
     // crowdsec_trusted_proxies <cidr> ... | off;
     ngx_command_t {
         name: ngx_string!("crowdsec_trusted_proxies"),
-        type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF) as ngx_uint_t | 0x0000_2000) as ngx_uint_t,
+        type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF) as ngx_uint_t | NGX_CONF_1MORE as ngx_uint_t) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_trusted_proxies),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1715,7 +1906,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 38] = [
     // crowdsec_bypass <cidr> ... | off;
     ngx_command_t {
         name: ngx_string!("crowdsec_bypass"),
-        type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF) as ngx_uint_t | 0x0000_2000) as ngx_uint_t,
+        type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF) as ngx_uint_t | NGX_CONF_1MORE as ngx_uint_t) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_bypass),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1811,6 +2002,15 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 38] = [
         offset: 0,
         post: std::ptr::null_mut(),
     },
+    // crowdsec_ban_status <code>; - block-mode status when no template (Lua RET_CODE)
+    ngx_command_t {
+        name: ngx_string!("crowdsec_ban_status"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_ban_status),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
     // ===== Captcha directives (inheritable at http/server/location levels) =====
     // crowdsec_captcha_provider hcaptcha|turnstile|recaptcha;
     ngx_command_t {
@@ -1875,6 +2075,15 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 38] = [
         offset: 0,
         post: std::ptr::null_mut(),
     },
+    // crowdsec_unenforceable_action allow|block;
+    ngx_command_t {
+        name: ngx_string!("crowdsec_unenforceable_action"),
+        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        set: Some(ngx_http_crowdsec_set_unenforceable_action),
+        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        offset: 0,
+        post: std::ptr::null_mut(),
+    },
     // crowdsec_captcha_bind_ip on|off;
     ngx_command_t {
         name: ngx_string!("crowdsec_captcha_bind_ip"),
@@ -1909,7 +2118,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 38] = [
     ngx_command_t { name: ngx_string!("crowdsec_appsec_drop_unreadable_body"), type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_drop_unreadable_body), conf: NGX_HTTP_MAIN_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_enabled), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec_always"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_always), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
-    ngx_command_t { name: ngx_string!("crowdsec_static_extensions"), type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF) as ngx_uint_t | 0x0000_2000) as ngx_uint_t, set: Some(ngx_http_crowdsec_set_static_extensions), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
+    ngx_command_t { name: ngx_string!("crowdsec_static_extensions"), type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF) as ngx_uint_t | NGX_CONF_1MORE as ngx_uint_t) as ngx_uint_t, set: Some(ngx_http_crowdsec_set_static_extensions), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_appsec_failure_action"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_appsec_failure), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     ngx_command_t { name: ngx_string!("crowdsec_bot_challenge"), type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t, set: Some(set_bot_challenge), conf: NGX_HTTP_LOC_CONF_OFFSET, offset: 0, post: std::ptr::null_mut() },
     // Null terminator

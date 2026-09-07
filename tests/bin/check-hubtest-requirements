@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Verify host tools required for local CrowdSec hub AppSec tests.
+set -euo pipefail
+
+missing=0
+
+require_cmd() {
+  local name="$1"
+  if command -v "$name" >/dev/null 2>&1; then
+    printf 'ok  %s (%s)\n' "$name" "$(command -v "$name")"
+  else
+    printf 'missing  %s\n' "$name" >&2
+    missing=1
+  fi
+}
+
+require_cmd cscli
+require_cmd crowdsec
+require_cmd nuclei
+require_cmd docker
+require_cmd git
+
+if ((missing)); then
+  cat >&2 <<'EOF'
+
+Install hints:
+  - CrowdSec + cscli: https://docs.crowdsec.net/docs/getting_started/install_crowdsec
+    (match the engine version used in docker stacks, currently v1.8.x)
+  - nuclei: https://github.com/projectdiscovery/nuclei#install
+  - docker: build the module image first:
+      docker build -f docker/Dockerfile -t nginx-crowdsec:test .
+
+EOF
+  exit 1
+fi

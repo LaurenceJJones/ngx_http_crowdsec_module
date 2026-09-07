@@ -2,12 +2,12 @@
 
 This directory contains example ban templates that can be used with the `crowdsec_ban_template` directive.
 
-## Template files (required)
+## Template files
 
-There are **no built-in HTML pages** in the module. `nginx -t` fails if:
+Example pages for `crowdsec_ban_template` and `crowdsec_captcha_template`. Both are **optional**:
 
-- `crowdsec on` is set without `crowdsec_ban_template` (unless `crowdsec_ban_action redirect` with a redirect URL), or
-- Captcha provider keys are configured without `crowdsec_captcha_template`.
+- **Ban** — without a template, block mode returns `crowdsec_ban_status` (default 403) with a minimal body. Set `crowdsec_ban_action redirect` to redirect instead.
+- **Captcha** — without a template, `crowdsec_unenforceable_action allow` (default) passes the request through when a captcha decision cannot be shown; use `block` to return `crowdsec_ban_status` instead. With `unenforceable_action block`, a template is required at `nginx -t`.
 
 Copy and customize the examples in this directory, then point nginx at them:
 

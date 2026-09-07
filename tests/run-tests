@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+set -eu
+
+die() {
+  echo >&2 "$@"
+  exit 1
+}
+
+TEST_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export TEST_DIR
+
+"${TEST_DIR}/bin/check-requirements"
+
+echo "Running tests..."
+echo "TEST_STACK: ${TEST_STACK:-integration}"
+echo "NGINX_CROWDSEC_IMAGE: ${NGINX_CROWDSEC_IMAGE:-nginx-crowdsec:test}"
+
+if [[ $# -ge 1 ]]; then
+  echo "test files: $*"
+  exec "${TEST_DIR}/lib/bats-core/bin/bats" \
+    --jobs 1 \
+    --timing \
+    --print-output-on-failure \
+    "$@"
+fi
+
+echo "test files: ${TEST_DIR}/bats/integration"
+exec "${TEST_DIR}/lib/bats-core/bin/bats" \
+  --jobs 1 \
+  --timing \
+  --print-output-on-failure \
+  "${TEST_DIR}/bats/integration"

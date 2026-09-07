@@ -1,0 +1,22 @@
+# Local CrowdSec hub AppSec test target (NOT for CI).
+#
+# Mirrors crowdsecurity/hub/docker/appsec/docker-compose.yaml but uses this
+# project's NGINX module instead of the OpenResty bouncer.
+#
+# Requires host networking so hubtest (on the host) can reach:
+#   - this NGINX listener on 127.0.0.1:7822
+#   - ephemeral AppSec/LAPI started by cscli hubtest on 127.0.0.1:4241 / 8181
+#
+# Start: scripts/hubtest-target.sh up
+
+name: cshubtest
+
+services:
+  nginx:
+    image: ${NGINX_CROWDSEC_IMAGE:-nginx-crowdsec:test}
+    container_name: cs-hubtest-nginx
+    network_mode: host
+    entrypoint: ["/usr/sbin/nginx"]
+    command: ["-g", "daemon off;"]
+    volumes:
+      - ../docker/nginx.hubtest.conf:/etc/nginx/nginx.conf:ro,z

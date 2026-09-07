@@ -1,0 +1,57 @@
+# CrowdSec 1.8 bot-challenge stack (scripts/test-bats-challenge.sh).
+name: cschallenge
+
+services:
+  crowdsec:
+    image: crowdsecurity/crowdsec:v1.8.1
+    container_name: cs-challenge-crowdsec
+    environment:
+      COLLECTIONS: "crowdsecurity/appsec-bot-challenge"
+      DISABLE_ONLINE_API: "true"
+      BOUNCER_KEY_nginx: "test-bouncer-key-12345"
+    volumes:
+      - cschallenge_data:/var/lib/crowdsec/data
+      - cschallenge_config:/etc/crowdsec
+      - ../docker/crowdsec/acquis.d/appsec-bot-challenge.yaml:/etc/crowdsec/acquis.d/appsec.yaml:ro,z
+    healthcheck:
+      test: ["CMD", "cscli", "lapi", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 120s
+    networks:
+      cschallenge_net:
+        aliases:
+          - crowdsec
+
+  nginx:
+    image: ${NGINX_CROWDSEC_IMAGE:-nginx-crowdsec:test}
+    container_name: cs-challenge-nginx
+    depends_on:
+      crowdsec:
+        condition: service_healthy
+    environment:
+      CROWDSEC_BOUNCER_KEY: test-bouncer-key-12345
+    volumes:
+      - ../docker/nginx.challenge.conf:/etc/nginx/nginx.conf.template:ro,z
+    networks:
+      cschallenge_net:
+        aliases:
+          - nginx
+
+  client:
+    image: curlimages/curl:8.16.0
+    container_name: cs-challenge-client
+    command: sleep infinity
+    depends_on:
+      - nginx
+    networks:
+      cschallenge_net:
+
+volumes:
+  cschallenge_data:
+  cschallenge_config:
+
+networks:
+  cschallenge_net:
+    driver: bridge

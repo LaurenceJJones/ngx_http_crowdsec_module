@@ -1,4 +1,3 @@
-use crate::captcha::send_captcha_page;
 use crate::lapi;
 use crate::config::{AppSecFailureAction, LocConfig, MainConfig};
 use crate::handler::{HandlerResult, get_client_ip, send_raw_response};
@@ -268,7 +267,7 @@ pub fn inspect_precontent(
 }
 
 fn inspect_request_body(
-    request: &mut Request,
+    _request: &mut Request,
     loc: &LocConfig,
     r: *mut ngx_http_request_t,
     ip: &IpAddr,
@@ -532,25 +531,12 @@ fn apply_appsec_response(
 
     let result = match envelope.action.as_str() {
         "allow" => HandlerResult::Declined,
-        "ban" => HandlerResult::Forbidden,
+        "ban" => crate::handler::finish_block_ban(request, loc),
         "captcha" => {
-            let captcha_config = match loc.captcha_config() {
-                Some(cfg) => cfg,
-                None => return failure(failure_action),
+            let Some(captcha_config) = loc.captcha_config() else {
+                return crate::handler::apply_unenforceable_action(request, loc);
             };
-            if send_captcha_page(
-                request,
-                &captcha_config,
-                loc.captcha_template.as_ref(),
-                ip,
-                None,
-            )
-            .is_ok()
-            {
-                HandlerResult::Done
-            } else {
-                HandlerResult::Forbidden
-            }
+            crate::handler::try_send_captcha_page(request, loc, &captcha_config, ip, None)
         }
         "challenge" if bot_challenge && !envelope.user_body_content.is_empty() => {
             let status = HTTPStatus::from_u16(if envelope.http_status == 0 {

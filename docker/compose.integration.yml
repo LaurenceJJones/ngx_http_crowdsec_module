@@ -1,0 +1,100 @@
+# Real CrowdSec LAPI + AppSec stack for BATS integration tests.
+# Requires nginx-crowdsec:test image (built from docker/Dockerfile).
+
+name: csint
+
+services:
+  upstream:
+    image: python:3.13-alpine
+    container_name: cs-int-upstream
+    command: python /mock/mock_upstream.py
+    volumes:
+      - ../tests:/mock:ro,z
+    networks:
+      csint_net:
+        aliases:
+          - upstream
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; s=socket.create_connection(('127.0.0.1',9000),1); s.close()",
+        ]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 2s
+
+  crowdsec:
+    image: crowdsecurity/crowdsec:v1.8.1
+    container_name: cs-int-crowdsec
+    environment:
+      COLLECTIONS: "crowdsecurity/nginx crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-generic-rules"
+      DISABLE_ONLINE_API: "true"
+      BOUNCER_KEY_nginx: "test-bouncer-key-12345"
+    volumes:
+      - csint_data:/var/lib/crowdsec/data
+      - csint_config:/etc/crowdsec
+      - ../docker/crowdsec/acquis.d/appsec.yaml:/etc/crowdsec/acquis.d/appsec.yaml:ro,z
+    healthcheck:
+      test: ["CMD", "cscli", "lapi", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 90s
+    networks:
+      csint_net:
+        aliases:
+          - crowdsec
+
+  nginx:
+    image: ${NGINX_CROWDSEC_IMAGE:-nginx-crowdsec:test}
+    container_name: cs-int-nginx
+    depends_on:
+      upstream:
+        condition: service_healthy
+      crowdsec:
+        condition: service_healthy
+    environment:
+      CROWDSEC_BOUNCER_KEY: test-bouncer-key-12345
+      CAPTCHA_SITE_KEY: test
+      CAPTCHA_SECRET_KEY: test
+      CAPTCHA_SIGNING_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    volumes:
+      - ../docker/nginx.integration.conf:/etc/nginx/nginx.conf.template:ro,z
+    networks:
+      csint_net:
+        aliases:
+          - nginx
+
+  client:
+    image: curlimages/curl:8.16.0
+    container_name: cs-int-client
+    command: sleep infinity
+    depends_on:
+      - nginx
+      - proxy
+    networks:
+      csint_net:
+
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: cs-int-proxy
+    volumes:
+      - ../docker/proxy.integration.conf:/etc/nginx/nginx.conf:ro,z
+    depends_on:
+      - nginx
+    networks:
+      csint_net:
+        aliases:
+          - proxy
+
+volumes:
+  csint_data:
+  csint_config:
+
+networks:
+  csint_net:
+    driver: bridge

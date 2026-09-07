@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+set -eu
+
+die() {
+  echo >&2 "$@"
+  exit 1
+}
+
+THIS_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TEST_DIR=$(CDPATH= cd -- "${THIS_DIR}/.." && pwd)
+
+check_bats_core() {
+  if ! "${TEST_DIR}/lib/bats-core/bin/bats" --version >/dev/null 2>&1; then
+    die "ERROR: bats submodules are required. Run: git submodule update --init --recursive"
+  fi
+}
+
+check_docker() {
+  if ! command -v docker >/dev/null; then
+    die "missing required program 'docker'"
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    die "missing required program 'docker compose'"
+  fi
+}
+
+check_python3() {
+  if ! command -v python3 >/dev/null; then
+    die "missing required program 'python3'"
+  fi
+}
+
+echo "Checking requirements..."
+check_bats_core
+check_docker
+check_python3

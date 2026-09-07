@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-07
+
+Minor release: Lua bouncer remediation parity, optional ban templates, and real CrowdSec CI.
+
+### Breaking changes
+
+- **`crowdsec_ban_template`** is no longer required when `crowdsec_ban_action` is `block`. Without a template the module returns **`crowdsec_ban_status`** (default 403) with a minimal body. To fail closed when a template is missing, set `crowdsec_unenforceable_action block`.
+- **`crowdsec_captcha_template`** is required only when captcha keys are set **and** `crowdsec_unenforceable_action` is `block`. With the default `allow`, captcha keys without a template no longer fail `nginx -t`.
+- **Unknown LAPI remediation types** are handled explicitly via **`crowdsec_fallback_remediation`** (default `allow`). Set `ban` or `captcha` if you relied on implicit behavior for future decision types.
+
+### Added
+
+- **`crowdsec_ban_status`** — Block-mode ban HTTP status (400–599, default 403). Lua bouncer parity with `RET_CODE`.
+- **`crowdsec_fallback_remediation allow|ban|captcha`** — Unknown LAPI remediation types (http level). Default `allow` (ignore/store skip).
+- **`crowdsec_unenforceable_action allow|block`** — When a known remediation (`ban` or `captcha`) cannot be applied (missing config/template, send failure). Default `allow` (fail-open). `block` returns `crowdsec_ban_status`.
+- **Real CrowdSec CI** — 21 BATS tests (integration + bot challenge) against CrowdSec v1.8.1; mock LAPI stack removed from CI.
+- **Hub AppSec harness** (local) — Run CrowdSec hub `.appsec-tests` against the module; see [docs/testing.md](docs/testing.md).
+
+### Changed
+
+- **Documentation** — Lean README; testing and configuration docs updated for new directives and CI layout.
+- **CI** — GitHub Actions runs `./scripts/test-bats-ci.sh` (integration + challenge only).
+
+### Fixed
+
+- **`NGX_CONF_1MORE`** on `crowdsec_trusted_proxies`, `crowdsec_bypass`, and `crowdsec_static_extensions` — multiple values in one directive now parse correctly.
+
 ## [0.3.2] - 2026-09-05
 
 Patch: AppSec POST body inspection no longer breaks `proxy_pass`.

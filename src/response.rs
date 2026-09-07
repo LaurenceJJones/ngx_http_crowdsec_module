@@ -8,8 +8,6 @@ use ngx::http::Request;
 pub enum HeaderFailureAction {
     /// Finalize with the header status and return `Ok(())`.
     Finalize,
-    /// Return `Err(())` without finalizing.
-    Error,
     /// For HEAD requests, finalize and return `Ok(())`; otherwise return `Err(())`.
     HeadOrError,
 }
@@ -53,7 +51,6 @@ pub fn send_chain_and_finalize(
                 finalize_request(request, header_status);
                 Ok(())
             }
-            HeaderFailureAction::Error => Err(()),
             HeaderFailureAction::HeadOrError => {
                 if request.header_only() {
                     finalize_request(request, header_status);
@@ -68,16 +65,6 @@ pub fn send_chain_and_finalize(
     let out_status = request.output_filter(unsafe { &mut *cl });
     finalize_request(request, out_status);
     Ok(())
-}
-
-/// Build a body chain, send it, and finalize the request.
-pub fn send_body_and_finalize(
-    request: &mut Request,
-    body: &str,
-    header_failure: HeaderFailureAction,
-) -> Result<(), ()> {
-    let cl = body_chain(request, body)?;
-    send_chain_and_finalize(request, cl, header_failure)
 }
 
 fn finalize_request(request: &mut Request, status: Status) {

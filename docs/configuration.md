@@ -25,20 +25,23 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_retry_interval` | http | `5` | Seconds between retries |
 | `crowdsec_poll_interval` | http, server | `10` | Seconds between successful LAPI stream polls |
 | `crowdsec_lapi_timeout` | http, server | `30` | LAPI HTTP timeout (seconds) |
-| `crowdsec_ban_template` | http, server, location | - | **Required** when `crowdsec on` and `ban_action` is `block` |
-| `crowdsec_ban_action` | http, server, location | `block` | `block` (403) or `redirect` |
+| `crowdsec_ban_template` | http, server, location | - | Optional HTML/JSON ban page when `ban_action` is `block` |
+| `crowdsec_ban_action` | http, server, location | `block` | `block` or `redirect` |
+| `crowdsec_ban_status` | http, server, location | `403` | Block-mode HTTP status (400–599; Lua `RET_CODE`) |
 | `crowdsec_ban_redirect_url` | http, server, location | - | Redirect target when `ban_action` is `redirect` |
 | `crowdsec_ban_redirect_code` | http, server, location | `302` | Redirect status: `301`–`308` |
+| `crowdsec_fallback_remediation` | http | `allow` | Unknown LAPI types: `allow` (ignore), `ban`, or `captcha` |
+| `crowdsec_unenforceable_action` | http, server, location | `allow` | When ban/captcha cannot be applied: `allow` or `block` (`crowdsec_ban_status`) |
 | `crowdsec_captcha_provider` | http, server, location | - | **Required for captcha.** `hcaptcha`, `recaptcha`, or `turnstile` |
 | `crowdsec_captcha_site_key` | http, server, location | - | Provider site key |
 | `crowdsec_captcha_secret_key` | http, server, location | - | Provider secret key |
 | `crowdsec_captcha_signing_key` | http, server, location | - | 64-char hex key (`openssl rand -hex 32`) |
 | `crowdsec_captcha_cookie_name` | http, server, location | `crowdsec_captcha` | Session cookie name |
 | `crowdsec_captcha_expiry` | http, server, location | `3600` | Session lifetime (seconds) |
-| `crowdsec_captcha_fail_open` | http, server, location | `on` | Allow on operational verification failure |
+| `crowdsec_captcha_fail_open` | http, server, location | `on` | Allow on provider verification failure (POST) |
 | `crowdsec_captcha_bind_ip` | http, server, location | `on` | Bind sessions to client IP |
 | `crowdsec_captcha_cookie_secure` | http, server, location | `auto` | `auto`, `on`, or `off` |
-| `crowdsec_captcha_template` | http, server, location | - | **Required** when captcha provider keys are configured |
+| `crowdsec_captcha_template` | http, server, location | - | Required when captcha keys are set and `unenforceable_action` is `block` |
 | `crowdsec_appsec_url` | http, server | - | AppSec agent base URL |
 | `crowdsec_appsec` | http, server, location | `off` | Enable AppSec inspection |
 | `crowdsec_appsec_always` | http, server, location | `off` | Run AppSec even when the client IP has a ban/captcha decision |
@@ -66,8 +69,9 @@ http {
     crowdsec_api_key your-bouncer-api-key;
     crowdsec_shm_size 16m;
 
-    # Required when crowdsec on (examples in templates/)
-    crowdsec_ban_template /etc/nginx/templates/default.html;
+    # Optional ban page (omit for bare crowdsec_ban_status response)
+    # crowdsec_ban_template /etc/nginx/templates/default.html;
+    # crowdsec_ban_status 403;
 
     # Optional captcha (generate signing key: openssl rand -hex 32)
     # crowdsec_captcha_provider turnstile;
@@ -101,6 +105,25 @@ http {
     }
 }
 ```
+
+## Remediation fallback
+
+Two layers cover cases where the bouncer should not blindly follow CrowdSec:
+
+| Situation | Directive | Default |
+|-----------|-----------|---------|
+| **Unknown LAPI type** (e.g. future `mfa`) | `crowdsec_fallback_remediation` | `allow` (ignore — do not store) |
+| **Known type but cannot enforce** (no template, missing captcha keys, send failure) | `crowdsec_unenforceable_action` | `allow` (pass request through) |
+
+```nginx
+http {
+    crowdsec_fallback_remediation allow;   # or ban / captcha (Lua FALLBACK_REMEDIATION)
+    crowdsec_unenforceable_action allow;   # or block (returns crowdsec_ban_status)
+    crowdsec_ban_status 403;
+}
+```
+
+`crowdsec_captcha_fail_open` remains separate: it applies only when the captcha **provider API** fails during POST verification.
 
 ## AppSec and bot challenge
 

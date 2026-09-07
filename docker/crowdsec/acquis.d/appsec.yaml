@@ -1,0 +1,7 @@
+# AppSec listener for integration / challenge test stacks.
+source: appsec
+listen_addr: 0.0.0.0:7422
+labels:
+  type: appsec
+appsec_configs:
+  - crowdsecurity/appsec-default

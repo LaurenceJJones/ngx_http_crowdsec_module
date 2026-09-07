@@ -3,6 +3,7 @@
 //! This module handles polling the CrowdSec LAPI decisions stream and
 //! updating the shared memory decision store.
 
+use crate::config::FallbackRemediation;
 use crate::lapi;
 use crate::log::cycle_log;
 use crate::shm::{self, CidrDecisionInfo, DecisionInfo, DecisionType, Origin};
@@ -48,6 +49,8 @@ pub struct StreamClientConfig {
     pub retry_interval_secs: u64,
     /// LAPI usage-metrics push interval (`0` = disabled). Default 900.
     pub usage_metrics_interval_secs: u64,
+    /// Unknown stream decision types: allow (skip), ban, or captcha.
+    pub fallback_remediation: FallbackRemediation,
 }
 
 impl Default for StreamClientConfig {
@@ -60,6 +63,7 @@ impl Default for StreamClientConfig {
             max_retries: 3,
             retry_interval_secs: 5,
             usage_metrics_interval_secs: 900,
+            fallback_remediation: FallbackRemediation::default(),
         }
     }
 }
@@ -128,7 +132,9 @@ impl StreamClient {
         // Remove deleted decisions
         for decision in deleted_decisions {
             if let Some(ref value) = decision.value {
-                let decision_type = DecisionType::from_str(&decision.decision_type);
+                let Some(decision_type) = self.resolve_decision_type(&decision.decision_type) else {
+                    continue;
+                };
 
                 // Try to parse as single IP first
                 if let Ok(ip) = value.parse::<IpAddr>() {
@@ -154,7 +160,9 @@ impl StreamClient {
         for decision in new_decisions {
             if let Some(ref value) = decision.value {
                 let duration_secs = decision.duration.as_ref().and_then(|d| parse_duration(d));
-                let decision_type = DecisionType::from_str(&decision.decision_type);
+                let Some(decision_type) = self.resolve_decision_type(&decision.decision_type) else {
+                    continue;
+                };
                 let origin = decision
                     .origin
                     .as_deref()
@@ -196,6 +204,30 @@ impl StreamClient {
                 }
             }
         }
+    }
+
+    fn resolve_decision_type(&self, raw_type: &str) -> Option<DecisionType> {
+        let mapped = self
+            .config
+            .fallback_remediation
+            .resolve_unknown_type(raw_type);
+        if mapped.is_none() && DecisionType::from_str(raw_type) == DecisionType::Unknown {
+            crowdsec_notice!(
+                cycle_log(),
+                "crowdsec: ignoring unknown remediation type '{}' (fallback_remediation allow)",
+                raw_type
+            );
+        } else if DecisionType::from_str(raw_type) == DecisionType::Unknown {
+            if let Some(dt) = mapped {
+                crowdsec_notice!(
+                    cycle_log(),
+                    "crowdsec: mapping unknown remediation type '{}' to {:?}",
+                    raw_type,
+                    dt
+                );
+            }
+        }
+        mapped
     }
 
     /// Check if the polling thread is running
@@ -390,6 +422,25 @@ fn parse_duration(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_unknown_decision_type() {
+        let client = StreamClient::new(StreamClientConfig {
+            fallback_remediation: FallbackRemediation::Ban,
+            ..Default::default()
+        });
+        assert_eq!(
+            client.resolve_decision_type("mfa"),
+            Some(DecisionType::Ban)
+        );
+        assert_eq!(
+            client.resolve_decision_type("ban"),
+            Some(DecisionType::Ban)
+        );
+
+        let client = StreamClient::new(StreamClientConfig::default());
+        assert_eq!(client.resolve_decision_type("mfa"), None);
+    }
 
     #[test]
     fn test_build_url() {

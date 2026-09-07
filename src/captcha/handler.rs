@@ -9,7 +9,6 @@ use crate::captcha::jwt::JwtManager;
 use crate::shm;
 use crate::template::{Template, TemplateVariables};
 use crate::response::{HeaderFailureAction, body_chain, send_chain_and_finalize};
-use ngx::core::Status;
 use ngx::ffi::ngx_http_request_t;
 use ngx::http::{HTTPStatus, Request};
 use ngx::ngx_log_debug_http;
