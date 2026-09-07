@@ -3,8 +3,12 @@
 //! Handles verification requests to hCaptcha, Turnstile, and reCAPTCHA APIs.
 
 use crate::captcha::config::CaptchaProvider;
+use crate::lapi;
 use serde::Deserialize;
+use std::sync::LazyLock;
 use std::time::Duration;
+
+static AGENT: LazyLock<ureq::Agent> = LazyLock::new(lapi::agent);
 
 /// Result of captcha verification
 #[derive(Debug, Clone, PartialEq)]
@@ -85,7 +89,8 @@ pub fn verify_captcha(
 
     // Make HTTP request (blocking - runs in NGINX worker)
     // Use a short timeout since this blocks the worker
-    let result = ureq::post(url)
+    let result = AGENT
+        .post(url)
         .set("Content-Type", "application/x-www-form-urlencoded")
         .timeout(Duration::from_secs(5))
         .send_string(&form_body);

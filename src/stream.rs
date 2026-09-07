@@ -6,6 +6,7 @@
 use crate::config::FallbackRemediation;
 use crate::lapi;
 use crate::log::cycle_log;
+use crate::realip::canonicalize_ip;
 use crate::shm::{self, CidrDecisionInfo, DecisionInfo, DecisionType, Origin};
 use crate::types::StreamResponse;
 use std::net::IpAddr;
@@ -113,7 +114,10 @@ impl StreamClient {
         let new_count = new_decisions.len();
         let deleted_count = deleted_decisions.len();
 
-        // Apply to shared memory
+        if startup {
+            shm::clear_all();
+        }
+
         self.apply_to_shm(&new_decisions, &deleted_decisions);
 
         Ok((new_count, deleted_count))
@@ -131,6 +135,9 @@ impl StreamClient {
     ) {
         // Remove deleted decisions
         for decision in deleted_decisions {
+            if decision.simulated == Some(true) {
+                continue;
+            }
             if let Some(ref value) = decision.value {
                 let Some(decision_type) = self.resolve_decision_type(&decision.decision_type) else {
                     continue;
@@ -138,7 +145,7 @@ impl StreamClient {
 
                 // Try to parse as single IP first
                 if let Ok(ip) = value.parse::<IpAddr>() {
-                    shm::remove_decision_type(&ip, decision_type);
+                    shm::remove_decision_type(&canonicalize_ip(ip), decision_type);
                 }
                 // Then try as CIDR range
                 else if let Some((network, family, prefix_len)) = shm::parse_cidr(value) {
@@ -158,6 +165,9 @@ impl StreamClient {
 
         // Add new decisions
         for decision in new_decisions {
+            if decision.simulated == Some(true) {
+                continue;
+            }
             if let Some(ref value) = decision.value {
                 let duration_secs = decision.duration.as_ref().and_then(|d| parse_duration(d));
                 let Some(decision_type) = self.resolve_decision_type(&decision.decision_type) else {
@@ -170,8 +180,8 @@ impl StreamClient {
                     .unwrap_or(Origin::Unknown);
                 let scenario = decision.scenario.as_deref();
 
-                // Try to parse as single IP first
                 if let Ok(ip) = value.parse::<IpAddr>() {
+                    let ip = canonicalize_ip(ip);
                     shm::add_decision(&DecisionInfo {
                         ip: &ip,
                         decision_type,
@@ -211,15 +221,16 @@ impl StreamClient {
             .config
             .fallback_remediation
             .resolve_unknown_type(raw_type);
-        if mapped.is_none() && DecisionType::from_str(raw_type) == DecisionType::Unknown {
-            crowdsec_notice!(
+        let unknown = DecisionType::from_str(raw_type) == DecisionType::Unknown;
+        if mapped.is_none() && unknown {
+            crowdsec_info!(
                 cycle_log(),
                 "crowdsec: ignoring unknown remediation type '{}' (fallback_remediation allow)",
                 raw_type
             );
-        } else if DecisionType::from_str(raw_type) == DecisionType::Unknown {
+        } else if unknown {
             if let Some(dt) = mapped {
-                crowdsec_notice!(
+                crowdsec_info!(
                     cycle_log(),
                     "crowdsec: mapping unknown remediation type '{}' to {:?}",
                     raw_type,
@@ -282,7 +293,10 @@ impl StreamClient {
                             retry_delay.as_secs(),
                             last_error.as_ref().unwrap()
                         );
-                        thread::sleep(retry_delay);
+                        interruptible_sleep(&self.running, retry_delay);
+                        if !self.running.load(Ordering::SeqCst) {
+                            return Err(last_error.unwrap());
+                        }
                     }
                 }
             }
@@ -295,6 +309,21 @@ impl StreamClient {
 
     /// Internal polling loop
     fn run_polling_loop(self) {
+        // Wait until this worker owns the poller role. On reload the previous
+        // generation's PID stays in SHM while that process is alive; new workers
+        // sleep here until it exits rather than overlapping LAPI/SHM writers.
+        while self.running.load(Ordering::SeqCst) {
+            if shm::try_become_poller() {
+                break;
+            }
+            interruptible_sleep(&self.running, Duration::from_millis(200));
+        }
+        if !self.running.load(Ordering::SeqCst) {
+            return;
+        }
+
+        crate::usage_metrics::record_startup();
+
         crowdsec_notice!(
             cycle_log(),
             "crowdsec: starting polling thread for LAPI at {}",
@@ -328,7 +357,7 @@ impl StreamClient {
 
         // Main polling loop
         while self.running.load(Ordering::SeqCst) {
-            thread::sleep(poll_duration);
+            interruptible_sleep(&self.running, poll_duration);
 
             if !self.running.load(Ordering::SeqCst) {
                 break;
@@ -338,7 +367,7 @@ impl StreamClient {
                 Ok((new, deleted)) => {
                     shm::metrics_inc_lapi_poll_ok();
                     if new > 0 || deleted > 0 {
-                        crowdsec_notice!(
+                        crowdsec_info!(
                             cycle_log(),
                             "crowdsec: stream update - {} new, {} deleted, {} total banned IPs",
                             new,
@@ -371,6 +400,15 @@ impl StreamClient {
         }
 
         crowdsec_notice!(cycle_log(), "crowdsec: polling thread stopped");
+    }
+}
+
+fn interruptible_sleep(running: &AtomicBool, total: Duration) {
+    let slice = Duration::from_millis(200);
+    let start = std::time::Instant::now();
+    while running.load(Ordering::Relaxed) && start.elapsed() < total {
+        let remaining = total.saturating_sub(start.elapsed());
+        thread::sleep(remaining.min(slice));
     }
 }
 

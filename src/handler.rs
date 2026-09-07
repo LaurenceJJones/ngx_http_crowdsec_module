@@ -2,15 +2,17 @@ use crate::captcha::cookie::{
     SameSite, build_clear_cookie_with_attrs, get_cookie, response_has_set_cookie,
     should_cookie_be_secure,
 };
-use crate::captcha::handler::{captcha_return_uri, send_captcha_page, send_see_other_redirect};
-use crate::captcha::{self, CaptchaHandler};
+use crate::captcha::handler::{
+    captcha_return_uri, captcha_session_valid, send_captcha_page, send_see_other_redirect,
+};
+use crate::captcha;
 use crate::config::{BanActionMode, FallbackRemediation, LocConfig, MainConfig, UnenforceableAction};
 use crate::realip;
 use crate::shm::{self, DecisionType, LookupResult};
 use crate::usage_metrics;
 use crate::template::{Template, TemplateVariables};
-use crate::response::{HeaderFailureAction, body_chain, send_chain_and_finalize};
-use ngx::core::{Buffer, Status};
+use crate::response::{HeaderFailureAction, body_chain, disable_keepalive, send_chain_and_finalize};
+use ngx::core::Status;
 use ngx::ffi::ngx_http_request_t;
 use ngx::http::{HTTPStatus, Method, Request};
 use ngx::ngx_log_debug_http;
@@ -27,10 +29,40 @@ pub enum HandlerResult {
     Error,
     /// Request has been fully handled (response sent and finalized)
     Done,
-    /// Captcha required - body read initiated (async)
-    CaptchaPending,
-    /// AppSec is waiting for the request body before calling the WAF
-    AppSecPending,
+    /// Captcha/AppSec is waiting for an async request-body read
+    BodyReadPending,
+}
+
+/// Packed into AppSec/captcha request ctx while a body read is in flight.
+#[repr(u8)]
+#[derive(PartialEq, Eq, Copy, Clone)]
+pub(crate) enum StoredPhaseResult {
+    Unset = 0,
+    Declined = 1,
+    Forbidden = 2,
+    Done = 3,
+    Error = 4,
+}
+
+impl StoredPhaseResult {
+    pub(crate) fn encode(result: HandlerResult) -> u8 {
+        (match result {
+            HandlerResult::Declined => Self::Declined,
+            HandlerResult::Forbidden => Self::Forbidden,
+            HandlerResult::Done => Self::Done,
+            HandlerResult::Error | HandlerResult::BodyReadPending => Self::Error,
+        }) as u8
+    }
+
+    pub(crate) fn decode(value: u8) -> Option<HandlerResult> {
+        match value {
+            x if x == Self::Declined as u8 => Some(HandlerResult::Declined),
+            x if x == Self::Forbidden as u8 => Some(HandlerResult::Forbidden),
+            x if x == Self::Done as u8 => Some(HandlerResult::Done),
+            x if x == Self::Error as u8 => Some(HandlerResult::Error),
+            _ => None,
+        }
+    }
 }
 
 impl From<HandlerResult> for Status {
@@ -40,9 +72,7 @@ impl From<HandlerResult> for Status {
             HandlerResult::Forbidden => Status::from(HTTPStatus::FORBIDDEN),
             HandlerResult::Error => Status::NGX_DECLINED, // Fail-open
             HandlerResult::Done => Status::NGX_DONE, // Request fully handled and finalized - don't touch it
-            HandlerResult::CaptchaPending | HandlerResult::AppSecPending => {
-                Status::NGX_DONE // Body read in progress
-            }
+            HandlerResult::BodyReadPending => Status::NGX_DONE,
         }
     }
 }
@@ -59,8 +89,9 @@ fn should_run_appsec_access(loc_conf: &LocConfig, lookup: &LookupResult) -> bool
     loc_conf.appsec_enabled == Some(true) && (!lookup.found || loc_conf.appsec_always == Some(true))
 }
 
-fn should_run_appsec_precontent(loc_conf: &LocConfig, lookup: &LookupResult) -> bool {
-    loc_conf.appsec_enabled == Some(true) && (!lookup.found || loc_conf.appsec_always == Some(true))
+fn record_ban_applied(client_ip: &IpAddr, lookup: &LookupResult) {
+    usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
+    shm::metrics_inc_http_ban();
 }
 
 /// Extract the client IP address from the NGINX request (socket peer, then trusted-proxy headers).
@@ -91,11 +122,8 @@ pub fn handle_access(
     loc_conf: &LocConfig,
     main_conf: &MainConfig,
 ) -> HandlerResult {
-    if let Some(outcome) = crate::metrics::try_serve_metrics(request, loc_conf) {
-        return match outcome {
-            crate::metrics::MetricsServeOutcome::Served => HandlerResult::Done,
-            crate::metrics::MetricsServeOutcome::Failed => HandlerResult::Error,
-        };
+    if let Some(result) = crate::metrics::try_serve_metrics(request, loc_conf) {
+        return result;
     }
 
     // Check if module is enabled
@@ -132,7 +160,8 @@ pub fn handle_access(
     let lookup = shm::lookup_ip(&client_ip);
 
     if should_run_appsec_access(loc_conf, &lookup) {
-        let appsec = crate::appsec::inspect_access(request, loc_conf, main_conf);
+        let shm_ban = lookup.found && lookup.decision_type == DecisionType::Ban;
+        let appsec = crate::appsec::inspect_access(request, loc_conf, main_conf, shm_ban);
         if !matches!(appsec, HandlerResult::Declined) {
             return appsec;
         }
@@ -146,14 +175,8 @@ pub fn handle_access(
 
     // Route based on decision type (Ban has priority over Captcha)
     match lookup.decision_type {
-        DecisionType::Ban => {
-            usage_metrics::record_dropped(&client_ip, lookup.origin, lookup.scenario_id);
-            handle_ban_decision(request, loc_conf, &client_ip, &lookup)
-        }
-        DecisionType::Captcha => {
-            usage_metrics::record_dropped(&client_ip, lookup.origin, lookup.scenario_id);
-            handle_captcha_decision(request, loc_conf, &client_ip)
-        }
+        DecisionType::Ban => handle_ban_decision(request, loc_conf, &client_ip, &lookup),
+        DecisionType::Captcha => handle_captcha_decision(request, loc_conf, &client_ip, &lookup),
         DecisionType::Unknown => handle_unknown_decision(request, loc_conf, main_conf, &client_ip, &lookup),
     }
 }
@@ -167,8 +190,8 @@ fn handle_ban_decision(
     if loc_conf.ban_action == Some(BanActionMode::Redirect) {
         if let Some(ref url) = loc_conf.ban_redirect_url {
             let code = loc_conf.ban_redirect_code.unwrap_or(302);
-            if send_ban_redirect(request, url, ban_redirect_status(code)).is_ok() {
-                shm::metrics_inc_http_ban();
+            if send_ban_redirect(request, url, HTTPStatus::from_u16(code).unwrap_or(HTTPStatus::MOVED_TEMPORARILY)).is_ok() {
+                record_ban_applied(client_ip, lookup);
                 return HandlerResult::Done;
             }
         } else {
@@ -179,20 +202,19 @@ fn handle_ban_decision(
         }
     }
     if is_static_asset_request(request, loc_conf) {
-        shm::metrics_inc_http_ban();
+        record_ban_applied(client_ip, lookup);
         return finish_block_ban(request, loc_conf);
     }
     let ban_status = ban_block_status(loc_conf);
     if let Some(ref template) = loc_conf.ban_template {
         if send_ban_response(request, template, ban_status, client_ip, lookup).is_ok() {
-            shm::metrics_inc_http_ban();
+            record_ban_applied(client_ip, lookup);
             return HandlerResult::Done;
         }
-    } else if send_block_response(request, ban_status).is_ok() {
-        shm::metrics_inc_http_ban();
+    } else if send_empty_response(request, ban_status).is_ok() {
+        record_ban_applied(client_ip, lookup);
         return HandlerResult::Done;
     }
-    shm::metrics_inc_http_ban();
     apply_unenforceable_action(request, loc_conf)
 }
 
@@ -210,44 +232,9 @@ fn handle_unknown_decision(
     );
     match main_conf.fallback_remediation_or_default() {
         FallbackRemediation::Allow => HandlerResult::Declined,
-        FallbackRemediation::Ban => {
-            usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
-            handle_ban_decision(request, loc_conf, client_ip, lookup)
-        }
-        FallbackRemediation::Captcha => {
-            usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
-            handle_captcha_decision(request, loc_conf, client_ip)
-        }
+        FallbackRemediation::Ban => handle_ban_decision(request, loc_conf, client_ip, lookup),
+        FallbackRemediation::Captcha => handle_captcha_decision(request, loc_conf, client_ip, lookup),
     }
-}
-
-/// PRECONTENT phase: AppSec inspection when the client sent a request body.
-pub fn handle_precontent(
-    request: &mut Request,
-    loc_conf: &LocConfig,
-    main_conf: &MainConfig,
-) -> HandlerResult {
-    if loc_conf.enabled != Some(true) {
-        return HandlerResult::Declined;
-    }
-
-    let client_ip = match get_client_ip(request, main_conf) {
-        Some(ip) => ip,
-        None => return HandlerResult::Error,
-    };
-
-    if !main_conf.bypass_cidrs.is_empty()
-        && crate::realip::ip_in_cidr_list(&client_ip, &main_conf.bypass_cidrs)
-    {
-        return HandlerResult::Declined;
-    }
-
-    let lookup = shm::lookup_ip(&client_ip);
-    if !should_run_appsec_precontent(loc_conf, &lookup) {
-        return HandlerResult::Declined;
-    }
-
-    crate::appsec::inspect_precontent(request, loc_conf, main_conf)
 }
 
 /// Handle a captcha decision for a client
@@ -255,7 +242,13 @@ pub(crate) fn handle_captcha_decision(
     request: &mut Request,
     loc_conf: &LocConfig,
     client_ip: &IpAddr,
+    lookup: &LookupResult,
 ) -> HandlerResult {
+    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
+    if let Some(result) = unsafe { captcha::body::resume_body_read(r) } {
+        return result;
+    }
+
     // For static assets like .ico, return 200 without body
     // This allows favicon to display on captcha page without sending HTML
     if is_static_asset_request(request, loc_conf) {
@@ -279,11 +272,7 @@ pub(crate) fn handle_captcha_decision(
         }
     };
 
-    // Create captcha handler
-    let handler = CaptchaHandler::new(&captcha_config);
-
-    // Check for existing valid session cookie
-    if handler.has_valid_session(request, client_ip) {
+    if captcha_session_valid(request, &captcha_config, client_ip) {
         // Static origins often only allow GET — never pass captcha POST through.
         if matches!(
             request.method(),
@@ -298,6 +287,8 @@ pub(crate) fn handle_captcha_decision(
         }
         return HandlerResult::Declined; // Valid session, allow GET/HEAD through
     }
+
+    usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
 
     // Handle based on request method
     match request.method() {
@@ -354,7 +345,7 @@ fn ban_block_status(loc_conf: &LocConfig) -> HTTPStatus {
 
 pub(crate) fn finish_block_ban(request: &mut Request, loc_conf: &LocConfig) -> HandlerResult {
     let status = ban_block_status(loc_conf);
-    if send_block_response(request, status).is_ok() {
+    if send_empty_response(request, status).is_ok() {
         HandlerResult::Done
     } else if status == HTTPStatus::FORBIDDEN {
         HandlerResult::Forbidden
@@ -364,11 +355,16 @@ pub(crate) fn finish_block_ban(request: &mut Request, loc_conf: &LocConfig) -> H
 }
 
 /// Minimal response for block-mode bans (no template body).
-pub(crate) fn send_block_response(request: &mut Request, status: HTTPStatus) -> Result<(), ()> {
-    send_empty_response(request, status)
+fn send_empty_response(request: &mut Request, status: HTTPStatus) -> Result<(), ()> {
+    disable_keepalive(request);
+    request.set_status(status);
+    request.set_content_length_n(1);
+    request.discard_request_body();
+    request.add_header_out("Content-Type", "text/plain");
+    let cl = body_chain(request, "\n")?;
+    send_chain_and_finalize(request, cl, HeaderFailureAction::Finalize)
 }
 
-/// Handle POST request for captcha verification
 fn handle_captcha_post(
     request: &mut Request,
     loc_conf: &LocConfig,
@@ -400,31 +396,19 @@ fn handle_captcha_post(
         );
     }
 
-    // Initiate async body reading - the callback will handle verification
-    let rc = unsafe {
-        captcha::body::initiate_body_read(
-            r,
-            captcha_config,
-            client_ip,
-            loc_conf.captcha_template.as_ref(),
-        )
-    };
-
-    // Check return code
-    if rc == ngx::ffi::NGX_DONE as ngx::ffi::ngx_int_t {
-        // Body read initiated or completed, request will be handled by callback
-        HandlerResult::CaptchaPending
-    } else if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx::ffi::ngx_int_t {
-        // Error occurred
+    // Initiate body reading. Always return BodyReadPending after starting the
+    // read (nginx mirror pattern); the callback applies allow/deny.
+    if loc_conf.captcha_template.is_none() {
         ngx_log_debug_http!(
             request,
-            "crowdsec: body read initiation failed with rc={}",
-            rc
+            "crowdsec: captcha POST requires crowdsec_captcha_template"
         );
-        HandlerResult::Error
-    } else {
-        // Body already handled (NGX_OK case - callback was called synchronously)
-        HandlerResult::CaptchaPending
+        return apply_unenforceable_action(request, loc_conf);
+    }
+
+    match unsafe { captcha::body::initiate_body_read(r, captcha_config, client_ip) } {
+        HandlerResult::Error => apply_unenforceable_action(request, loc_conf),
+        result => result,
     }
 }
 
@@ -433,22 +417,20 @@ fn handle_captcha_post(
 /// This adds a Set-Cookie header to the outgoing response to clear the cookie,
 /// but does not block the request - it continues normally.
 fn maybe_clear_stale_captcha_cookie(request: &mut Request, loc_conf: &LocConfig) {
-    // Get captcha config to know the cookie name
-    let captcha_config = match loc_conf.captcha_config() {
-        Some(cfg) => cfg,
-        None => return, // Captcha not configured, nothing to clear
-    };
+    if !loc_conf.captcha_is_configured() {
+        return;
+    }
+    let cookie_name = loc_conf.captcha_cookie_name();
 
-    // Check if the request has the captcha cookie
     let r: *const ngx_http_request_t = request.as_ref();
-    let has_cookie = unsafe { get_cookie(r, &captcha_config.cookie_name).is_some() };
+    let has_cookie = unsafe { get_cookie(r, cookie_name).is_some() };
 
-    if has_cookie && !response_has_set_cookie(request, &captcha_config.cookie_name) {
+    if has_cookie && !response_has_set_cookie(request, cookie_name) {
         let r: *const ngx_http_request_t = request.as_ref();
         let is_secure =
-            unsafe { should_cookie_be_secure(r, captcha_config.cookie_secure) };
+            unsafe { should_cookie_be_secure(r, loc_conf.captcha_cookie_secure.unwrap_or_default()) };
         let clear_cookie = build_clear_cookie_with_attrs(
-            &captcha_config.cookie_name,
+            cookie_name,
             "/",
             is_secure,
             true,
@@ -456,65 +438,6 @@ fn maybe_clear_stale_captcha_cookie(request: &mut Request, loc_conf: &LocConfig)
         );
         request.add_header_out("Set-Cookie", &clear_cookie);
     }
-}
-
-/// Send a minimal response with just a status code (effectively empty)
-///
-/// Used for static asset requests (.ico) where we don't want to send HTML pages
-fn send_empty_response(request: &mut Request, status: HTTPStatus) -> Result<(), ()> {
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-
-    // Disable keepalive to ensure connection closes cleanly
-    unsafe {
-        (*r).set_keepalive(0);
-    }
-
-    // Use a single newline as minimal body - truly empty bodies can cause issues
-    let body = b"\n";
-
-    request.set_status(status);
-    request.set_content_length_n(body.len());
-    request.discard_request_body();
-    request.add_header_out("Content-Type", "text/plain");
-
-    // Get pool for buffer allocation
-    let pool = request.pool();
-
-    // Create buffer with minimal body
-    let mut buffer = match pool.create_buffer_from_str(std::str::from_utf8(body).unwrap()) {
-        Some(buf) => buf,
-        None => return Err(()),
-    };
-    buffer.set_last_buf(true);
-    buffer.set_last_in_chain(true);
-
-    // Create chain link
-    let cl = unsafe {
-        let cl = ngx::ffi::ngx_alloc_chain_link(pool.as_ptr());
-        if cl.is_null() {
-            return Err(());
-        }
-        (*cl).buf = buffer.as_ngx_buf_mut();
-        (*cl).next = std::ptr::null_mut();
-        cl
-    };
-
-    // Send headers
-    let rc = request.send_header();
-    if rc != Status::NGX_OK {
-        unsafe {
-            ngx::ffi::ngx_http_finalize_request(r, rc.into());
-        }
-        return Ok(());
-    }
-
-    // Send body through output filter and finalize
-    unsafe {
-        let rc = ngx::ffi::ngx_http_output_filter(r, cl);
-        ngx::ffi::ngx_http_finalize_request(r, rc);
-    }
-
-    Ok(())
 }
 
 pub(crate) fn send_raw_response(
@@ -535,24 +458,11 @@ pub(crate) fn send_raw_response(
             request.add_header_out(name, value);
         }
     }
-    let pool = request.pool();
-    let mut buffer = pool.create_buffer_from_str(body).ok_or(())?;
-    buffer.set_last_buf(true);
-    buffer.set_last_in_chain(true);
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-    let cl = unsafe {
-        let cl = ngx::ffi::ngx_alloc_chain_link(pool.as_ptr());
-        if cl.is_null() {
-            return Err(());
-        }
-        (*cl).buf = buffer.as_ngx_buf_mut();
-        (*cl).next = std::ptr::null_mut();
-        cl
-    };
-    let rc = request.send_header();
-    if rc != Status::NGX_OK {
+    let cl = body_chain(request, body)?;
+    if request.send_header() != Status::NGX_OK {
         return Err(());
     }
+    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
     unsafe {
         let rc = ngx::ffi::ngx_http_output_filter(r, cl);
         ngx::ffi::ngx_http_finalize_request(r, rc);
@@ -560,28 +470,11 @@ pub(crate) fn send_raw_response(
     Ok(())
 }
 
-fn ban_redirect_status(code: u16) -> HTTPStatus {
-    match code {
-        301 => HTTPStatus::MOVED_PERMANENTLY,
-        303 => HTTPStatus::SEE_OTHER,
-        307 => HTTPStatus::TEMPORARY_REDIRECT,
-        308 => HTTPStatus::PERMANENT_REDIRECT,
-        _ => HTTPStatus::MOVED_TEMPORARILY,
-    }
-}
-
 /// Redirect response for ban remediation (`crowdsec_ban_action redirect`).
 fn send_ban_redirect(request: &mut Request, location: &str, status: HTTPStatus) -> Result<(), ()> {
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-
-    unsafe {
-        (*r).set_keepalive(0);
-    }
-
-    let body = b"\n";
-
+    disable_keepalive(request);
     request.set_status(status);
-    request.set_content_length_n(body.len());
+    request.set_content_length_n(1);
     request.discard_request_body();
     request.add_header_out("Location", location);
     request.add_header_out("Content-Type", "text/plain");
@@ -590,40 +483,8 @@ fn send_ban_redirect(request: &mut Request, location: &str, status: HTTPStatus) 
         "no-store, no-cache, must-revalidate, max-age=0",
     );
     request.add_header_out("Pragma", "no-cache");
-
-    let pool = request.pool();
-
-    let mut buffer = match pool.create_buffer_from_str(std::str::from_utf8(body).unwrap()) {
-        Some(buf) => buf,
-        None => return Err(()),
-    };
-    buffer.set_last_buf(true);
-    buffer.set_last_in_chain(true);
-
-    let cl = unsafe {
-        let cl = ngx::ffi::ngx_alloc_chain_link(pool.as_ptr());
-        if cl.is_null() {
-            return Err(());
-        }
-        (*cl).buf = buffer.as_ngx_buf_mut();
-        (*cl).next = std::ptr::null_mut();
-        cl
-    };
-
-    let rc = request.send_header();
-    if rc != Status::NGX_OK {
-        unsafe {
-            ngx::ffi::ngx_http_finalize_request(r, rc.into());
-        }
-        return Ok(());
-    }
-
-    unsafe {
-        let rc = ngx::ffi::ngx_http_output_filter(r, cl);
-        ngx::ffi::ngx_http_finalize_request(r, rc);
-    }
-
-    Ok(())
+    let cl = body_chain(request, "\n")?;
+    send_chain_and_finalize(request, cl, HeaderFailureAction::Finalize)
 }
 
 /// Send a ban response with rendered template

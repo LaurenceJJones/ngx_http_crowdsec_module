@@ -51,13 +51,13 @@ Verify symbols on [docs.rs/ngx/0.5.1](https://docs.rs/ngx/0.5.1/ngx/) or registr
 | Phase | Role |
 |-------|------|
 | **ACCESS** | IP ban/captcha routing; **AppSec** (headers + request body via `inspect_access`) |
-| **PRECONTENT** | Captcha POST verification only; AppSec `inspect_precontent` is a no-op |
+| **PRECONTENT** | Not registered. AppSec and captcha POST run in **ACCESS** |
 
 **AppSec + request bodies** (`src/appsec.rs`, `src/request_body.rs`):
 
 - Body reads run in **ACCESS**, not PRECONTENT, so `proxy_pass` keeps the correct content handler.
-- **Sync** body read: return `HandlerResult` from the phase handler (no `finalize_allow` in the handler).
-- **Async** body callback on allow: **`finalize_allow`** restores `clcf->handler` into `r->content_handler` then `ngx_http_core_run_phases` — **never** `ngx_http_finalize_request(NGX_DECLINED)` alone (that clears `content_handler` and breaks `proxy_pass`).
+- After `ngx_http_read_client_request_body` returns OK/AGAIN, call **`ngx_http_finalize_request(NGX_DONE)`** and return **`NGX_DONE`** from ACCESS (balances `r->main->count++`; see nginx `mirror` module). Skipping this leaks request pools on every AppSec/captcha POST.
+- Body callback on allow: **`finalize_allow`** restores `clcf->handler` into `r->content_handler` then `ngx_http_core_run_phases`. ACCESS re-entry must return the stored result — **never** `ngx_http_finalize_request(NGX_DECLINED)` (that clears `content_handler` and breaks `proxy_pass`).
 
 Key files: `appsec.rs`, `handler.rs`, `request_body.rs`, `captcha/body.rs`, `shm.rs`, `stream.rs`.
 

@@ -5,35 +5,29 @@
 //! Exposed series include HTTP/captcha counters, LAPI poll counters, `crowdsec_lapi_stream_last_success_unixtime`, and cache entry gauge.
 
 use crate::config::LocConfig;
+use crate::handler::HandlerResult;
 use crate::shm;
 use crate::response::{HeaderFailureAction, body_chain, disable_keepalive, send_chain_and_finalize};
 use ngx::http::{HTTPStatus, Method, Request};
 
-/// Result of attempting to serve `/metrics`-style Prometheus text.
-pub enum MetricsServeOutcome {
-    Served,
-    Failed,
-}
-
-/// If `crowdsec_metrics` is enabled for this location, send `text/plain` Prometheus metrics and
-/// return [`MetricsServeOutcome::Served`]. Otherwise return `None` so normal CrowdSec handling runs.
-pub fn try_serve_metrics(
-    request: &mut Request,
-    loc_conf: &LocConfig,
-) -> Option<MetricsServeOutcome> {
+/// If `crowdsec_metrics` is enabled for this location, send Prometheus text and
+/// return a terminal [`HandlerResult`]. Otherwise return `None`.
+pub fn try_serve_metrics(request: &mut Request, loc_conf: &LocConfig) -> Option<HandlerResult> {
     if loc_conf.metrics_enabled != Some(true) {
         return None;
     }
 
-    match request.method() {
-        Method::GET | Method::HEAD => {}
-        _ => {
-            let _ = send_method_not_allowed(request);
-            return Some(MetricsServeOutcome::Served);
-        }
+    if !matches!(request.method(), Method::GET | Method::HEAD) {
+        let _ = send_text_response(
+            request,
+            HTTPStatus::NOT_ALLOWED,
+            "text/plain",
+            "method not allowed\n",
+        );
+        return Some(HandlerResult::Done);
     }
 
-    let (lookups, bans, captcha, bypass, poll_ok, poll_err, lapi_last_ok_unix, entries) =
+    let (lookups, bans, captcha, bypass, poll_ok, poll_err, lapi_last_ok_unix, entries, evictions) =
         shm::metrics_prometheus_snapshot();
 
     let body = format!(
@@ -58,10 +52,13 @@ pub fn try_serve_metrics(
          # HELP crowdsec_lapi_stream_last_success_unixtime Unix time in seconds of the last successful LAPI stream poll (0 if none yet).\n\
          # TYPE crowdsec_lapi_stream_last_success_unixtime gauge\n\
          crowdsec_lapi_stream_last_success_unixtime {}\n\
-         # HELP crowdsec_decision_cache_entries Current IP/CIDR rows in the decision shared-memory cache.\n\
+         # HELP crowdsec_decision_cache_entries Non-expired IP/CIDR rows in the decision shared-memory cache.\n\
          # TYPE crowdsec_decision_cache_entries gauge\n\
-         crowdsec_decision_cache_entries {}\n",
-        lookups, bans, captcha, bypass, poll_ok, poll_err, lapi_last_ok_unix, entries
+         crowdsec_decision_cache_entries {}\n\
+         # HELP crowdsec_decision_cache_evictions_total Clock-hand evictions from the decision cache.\n\
+         # TYPE crowdsec_decision_cache_evictions_total counter\n\
+         crowdsec_decision_cache_evictions_total {}\n",
+        lookups, bans, captcha, bypass, poll_ok, poll_err, lapi_last_ok_unix, entries, evictions
     );
 
     if send_text_response(
@@ -72,19 +69,10 @@ pub fn try_serve_metrics(
     )
     .is_ok()
     {
-        Some(MetricsServeOutcome::Served)
+        Some(HandlerResult::Done)
     } else {
-        Some(MetricsServeOutcome::Failed)
+        Some(HandlerResult::Error)
     }
-}
-
-fn send_method_not_allowed(request: &mut Request) -> Result<(), ()> {
-    send_text_response(
-        request,
-        HTTPStatus::NOT_ALLOWED,
-        "text/plain",
-        "method not allowed\n",
-    )
 }
 
 fn send_text_response(

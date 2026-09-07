@@ -15,52 +15,41 @@ use ngx::ngx_log_debug_http;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-/// Captcha handler combining session validation logic
-pub struct CaptchaHandler<'a> {
-    config: &'a CaptchaConfig,
-    jwt_manager: JwtManager,
+/// True if the request has a valid captcha session cookie.
+pub fn captcha_session_valid(
+    request: &mut Request,
+    config: &CaptchaConfig,
+    client_ip: &IpAddr,
+) -> bool {
+    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
+    let Some(token) = (unsafe { get_cookie(r, &config.cookie_name) }) else {
+        return false;
+    };
+    let ip_to_check = config.bind_ip.then(|| client_ip.to_string());
+    match JwtManager::new(config.signing_key).verify_and_validate(&token, ip_to_check.as_deref()) {
+        Ok(_) => true,
+        Err(e) => {
+            ngx_log_debug_http!(request, "crowdsec: invalid captcha session token: {}", e);
+            false
+        }
+    }
 }
 
-impl<'a> CaptchaHandler<'a> {
-    /// Create a new captcha handler
-    pub fn new(config: &'a CaptchaConfig) -> Self {
-        Self {
-            config,
-            jwt_manager: JwtManager::new(config.signing_key),
-        }
-    }
-
-    /// Check if the request has a valid captcha session cookie
-    pub fn has_valid_session(&self, request: &mut Request, client_ip: &IpAddr) -> bool {
-        let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-
-        // Try to get the captcha cookie
-        let cookie_value = unsafe { get_cookie(r, &self.config.cookie_name) };
-
-        let token = match cookie_value {
-            Some(t) => t,
-            None => return false,
-        };
-
-        // Determine IP to check based on bind_ip setting
-        let ip_to_check = if self.config.bind_ip {
-            Some(client_ip.to_string())
-        } else {
-            None
-        };
-
-        // Verify the JWT token
-        match self
-            .jwt_manager
-            .verify_and_validate(&token, ip_to_check.as_deref())
-        {
-            Ok(_claims) => true,
-            Err(e) => {
-                ngx_log_debug_http!(request, "crowdsec: invalid captcha session token: {}", e);
-                false
-            }
-        }
-    }
+/// Variables shared by GET captcha pages and POST error re-renders.
+pub fn captcha_template_vars(
+    config: &CaptchaConfig,
+    client_ip: &IpAddr,
+    form_action: String,
+    error_message: Option<&str>,
+) -> TemplateVariables {
+    let mut vars = TemplateVariables::new();
+    vars.client_ip = Some(client_ip.to_string());
+    vars.captcha_site_key = Some(config.site_key.clone());
+    vars.captcha_script_url = Some(config.provider.script_url().to_string());
+    vars.captcha_div_class = Some(config.provider.div_class().to_string());
+    vars.captcha_error = error_message.map(|s| s.to_string());
+    vars.form_action = Some(form_action);
+    vars
 }
 
 /// Send a captcha challenge page
@@ -71,24 +60,11 @@ pub fn send_captcha_page(
     client_ip: &IpAddr,
     error_message: Option<&str>,
 ) -> Result<(), ()> {
-    // Build template variables
-    let mut vars = TemplateVariables::new();
-    vars.client_ip = Some(client_ip.to_string());
-
-    // Get URI and method
+    let mut vars = captcha_template_vars(config, client_ip, captcha_return_uri(request), error_message);
     if let Ok(uri_str) = request.path().to_str() {
         vars.request_uri = Some(uri_str.to_string());
     }
     vars.request_method = Some(request.method().as_str().to_string());
-
-    // Add captcha-specific variables
-    vars.captcha_site_key = Some(config.site_key.clone());
-    vars.captcha_script_url = Some(config.provider.script_url().to_string());
-    vars.captcha_div_class = Some(config.provider.div_class().to_string());
-    vars.captcha_error = error_message.map(|s| s.to_string());
-
-    // Form action is the current URI (include query string)
-    vars.form_action = Some(captcha_return_uri(request));
 
     // Render captcha page from the configured template file (required at config time).
     let tpl = template.ok_or(())?;

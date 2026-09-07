@@ -66,9 +66,10 @@ impl TrustedCidr {
     }
 
     pub fn contains(&self, ip: &IpAddr) -> bool {
+        let ip = canonicalize_ip(*ip);
         match (self, ip) {
             (TrustedCidr::V4 { network, mask }, IpAddr::V4(v4)) => {
-                (u32::from(*v4) & *mask) == (*network & *mask)
+                (u32::from(v4) & *mask) == (*network & *mask)
             }
             (TrustedCidr::V6 { network, mask }, IpAddr::V6(v6)) => {
                 (u128::from_be_bytes(v6.octets()) & *mask) == (*network & *mask)
@@ -77,6 +78,14 @@ impl TrustedCidr {
                 false
             }
         }
+    }
+}
+
+/// Map IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to IPv4 so dual-stack sockets match LAPI IPv4 decisions.
+pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        IpAddr::V4(_) => ip,
     }
 }
 
@@ -116,22 +125,20 @@ fn parse_forwarded_token(tok: &str) -> Option<IpAddr> {
     if t.starts_with('[') {
         let end = t.find(']')?;
         let inner = t[1..end].split('%').next()?;
-        return inner.parse().ok();
+        return inner.parse().ok().map(canonicalize_ip);
     }
     // Zone id: fe80::1%eth0
     let no_zone = t.split('%').next()?;
-    if no_zone.contains(':') {
-        return no_zone.parse().ok();
-    }
-    // IPv4 or IPv4:port
     if let Ok(ip) = no_zone.parse::<IpAddr>() {
-        return Some(ip);
+        return Some(canonicalize_ip(ip));
     }
-    if let Some(colon) = no_zone.rfind(':') {
-        no_zone[..colon].parse().ok()
-    } else {
-        None
+    // IPv4:port (a single colon — IPv6 already parsed above)
+    if let Some((host, port)) = no_zone.rsplit_once(':') {
+        if !host.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) {
+            return host.parse().ok().map(canonicalize_ip);
+        }
     }
+    None
 }
 
 /// Split `X-Forwarded-For` value into a left-to-right chain of addresses.
@@ -190,7 +197,11 @@ pub fn get_effective_client_ip(
     let socket_ip = socket_peer_ip(request)?;
     let hname = real_ip_header.unwrap_or("X-Forwarded-For");
     let hval = header_value_ci(request, hname);
-    Some(resolve_client_ip(socket_ip, trusted, hval))
+    Some(canonicalize_ip(resolve_client_ip(
+        canonicalize_ip(socket_ip),
+        trusted,
+        hval,
+    )))
 }
 
 fn socket_peer_ip(request: &Request) -> Option<IpAddr> {
@@ -270,6 +281,21 @@ mod tests {
         let s = "2001:db8::1, 10.0.0.1";
         let c = parse_forwarded_chain(s);
         assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn parse_ipv4_with_port() {
+        let c = parse_forwarded_chain("1.2.3.4:1234, 10.0.0.1");
+        assert_eq!(c[0], "1.2.3.4".parse::<IpAddr>().unwrap());
+        assert_eq!(c[1], "10.0.0.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn canonicalize_mapped_v6() {
+        let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert_eq!(canonicalize_ip(mapped), "10.0.0.1".parse::<IpAddr>().unwrap());
+        let t = TrustedCidr::parse("10.0.0.0/8").unwrap();
+        assert!(t.contains(&mapped));
     }
 
     #[test]

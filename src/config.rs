@@ -17,6 +17,41 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// Default shared memory size (1MB)
 pub const DEFAULT_SHM_SIZE: usize = 1024 * 1024;
 
+fn parse_on_off(s: &str) -> Option<bool> {
+    if s.eq_ignore_ascii_case("on") {
+        Some(true)
+    } else if s.eq_ignore_ascii_case("off") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn set_flag_on_off(
+    cf: *mut ngx_conf_t,
+    slot: &mut Option<bool>,
+    dir: &'static str,
+) -> *mut c_char {
+    unsafe {
+        let cf_ref = &*cf;
+        let args = cf_ref.args();
+        if args.len() < 2 {
+            return NGX_CONF_ERROR;
+        }
+        let value_str = match NgxStr::from_ngx_str(args[1]).to_str() {
+            Ok(s) => s,
+            Err(_) => return NGX_CONF_ERROR,
+        };
+        match parse_on_off(value_str) {
+            Some(v) => {
+                *slot = Some(v);
+                NGX_CONF_OK
+            }
+            None => cf_ref.error(dir, &ConfValueError("must be on or off")),
+        }
+    }
+}
+
 /// Main configuration (http block level) for CrowdSec module
 #[derive(Debug, Default)]
 pub struct MainConfig {
@@ -237,6 +272,22 @@ impl LocConfig {
         })
     }
 
+    /// True when captcha keys are present (no secret clone).
+    pub fn captcha_is_configured(&self) -> bool {
+        self.captcha_provider.is_some()
+            && self.captcha_site_key.is_some()
+            && self.captcha_secret_key.is_some()
+            && self
+                .captcha_signing_key
+                .is_some_and(|k| k != [0u8; 32])
+    }
+
+    pub fn captcha_cookie_name(&self) -> &str {
+        self.captcha_cookie_name
+            .as_deref()
+            .unwrap_or("crowdsec_captcha")
+    }
+
     /// Validate location config when `crowdsec on`. Called after merge inheritance.
     pub fn validate_enforcement(&self) -> Result<(), &'static str> {
         if self.enabled != Some(true) {
@@ -338,9 +389,7 @@ impl LocConfig {
         if self.bot_challenge_enabled.is_none() {
             self.bot_challenge_enabled = prev.bot_challenge_enabled;
         }
-        if self.metrics_enabled.is_none() {
-            self.metrics_enabled = prev.metrics_enabled;
-        }
+        // crowdsec_metrics is location-only: do not inherit `on` to every child.
 
         self.validate_enforcement()
     }
@@ -393,25 +442,7 @@ pub extern "C" fn ngx_http_crowdsec_set_enable(
     conf: *mut c_void,
 ) -> *mut c_char {
     let conf = unsafe { &mut *(conf as *mut LocConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        // args[0] is the directive name, args[1] is the value
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                // Invalid UTF-8
-                return NGX_CONF_ERROR;
-            }
-        };
-
-        // Mark as explicitly set
-        conf.enabled = Some(value_str.eq_ignore_ascii_case("on"));
-    }
-
-    NGX_CONF_OK
+    set_flag_on_off(cf, &mut conf.enabled, "crowdsec")
 }
 
 /// Directive handler for `crowdsec_url <url>;`
@@ -924,6 +955,10 @@ fn parse_size(s: &str) -> Option<usize> {
 static TEMPLATE_CACHE: LazyLock<Mutex<HashMap<String, Arc<Template>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn lock_template_cache() -> std::sync::MutexGuard<'static, HashMap<String, Arc<Template>>> {
+    TEMPLATE_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Directive handler for `crowdsec_ban_template <path>;`
 ///
 /// # Safety
@@ -948,7 +983,7 @@ pub extern "C" fn ngx_http_crowdsec_set_ban_template(
         };
 
         // Check cache first to avoid re-parsing the same file
-        let mut cache = TEMPLATE_CACHE.lock().unwrap();
+        let mut cache = lock_template_cache();
 
         let template = match cache.get(path_str) {
             Some(cached_template) => {
@@ -1175,22 +1210,7 @@ pub extern "C" fn ngx_http_crowdsec_set_metrics(
     conf: *mut c_void,
 ) -> *mut c_char {
     let conf = unsafe { &mut *(conf as *mut LocConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                return NGX_CONF_ERROR;
-            }
-        };
-
-        conf.metrics_enabled = Some(value_str.eq_ignore_ascii_case("on"));
-    }
-
-    NGX_CONF_OK
+    set_flag_on_off(cf, &mut conf.metrics_enabled, "crowdsec_metrics")
 }
 
 /// Directive handler for `crowdsec_captcha_provider hcaptcha|turnstile|recaptcha;`
@@ -1422,20 +1442,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_fail_open(
     conf: *mut c_void,
 ) -> *mut c_char {
     let conf = unsafe { &mut *(conf as *mut LocConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => return NGX_CONF_ERROR,
-        };
-
-        conf.captcha_fail_open = Some(value_str.eq_ignore_ascii_case("on"));
-    }
-
-    NGX_CONF_OK
+    set_flag_on_off(cf, &mut conf.captcha_fail_open, "crowdsec_captcha_fail_open")
 }
 
 /// Directive handler for `crowdsec_unenforceable_action allow|block;`
@@ -1520,20 +1527,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_bind_ip(
     conf: *mut c_void,
 ) -> *mut c_char {
     let conf = unsafe { &mut *(conf as *mut LocConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => return NGX_CONF_ERROR,
-        };
-
-        conf.captcha_bind_ip = Some(value_str.eq_ignore_ascii_case("on"));
-    }
-
-    NGX_CONF_OK
+    set_flag_on_off(cf, &mut conf.captcha_bind_ip, "crowdsec_captcha_bind_ip")
 }
 
 /// Directive handler for `crowdsec_captcha_cookie_secure auto|on|off;`
@@ -1601,7 +1595,7 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_template(
         };
 
         // Check cache first (reuse same cache as ban templates)
-        let mut cache = TEMPLATE_CACHE.lock().unwrap();
+        let mut cache = lock_template_cache();
 
         let template = match cache.get(path_str) {
             Some(cached_template) => Arc::clone(cached_template),
@@ -1852,7 +1846,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_metrics on|off; — Prometheus text (dedicated location; pair with crowdsec off;)
     ngx_command_t {
         name: ngx_string!("crowdsec_metrics"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (ngx::ffi::NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_metrics),
         conf: NGX_HTTP_LOC_CONF_OFFSET,
         offset: 0,
@@ -1861,7 +1855,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_url <url>; - LAPI URL at main config level
     ngx_command_t {
         name: ngx_string!("crowdsec_url"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_url),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1870,7 +1864,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_api_key <key>; - API key at main config level
     ngx_command_t {
         name: ngx_string!("crowdsec_api_key"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_api_key),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1888,7 +1882,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_trusted_proxies <cidr> ... | off;
     ngx_command_t {
         name: ngx_string!("crowdsec_trusted_proxies"),
-        type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF) as ngx_uint_t | NGX_CONF_1MORE as ngx_uint_t) as ngx_uint_t,
+        type_: ((NGX_HTTP_MAIN_CONF) as ngx_uint_t | NGX_CONF_1MORE as ngx_uint_t) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_trusted_proxies),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1897,7 +1891,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_real_ip_header <header-name>;
     ngx_command_t {
         name: ngx_string!("crowdsec_real_ip_header"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_real_ip_header),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1906,7 +1900,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_bypass <cidr> ... | off;
     ngx_command_t {
         name: ngx_string!("crowdsec_bypass"),
-        type_: ((NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF) as ngx_uint_t | NGX_CONF_1MORE as ngx_uint_t) as ngx_uint_t,
+        type_: ((NGX_HTTP_MAIN_CONF) as ngx_uint_t | NGX_CONF_1MORE as ngx_uint_t) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_bypass),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1915,7 +1909,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_max_retries <number>; - Maximum retries for initial connection (default: 3)
     ngx_command_t {
         name: ngx_string!("crowdsec_max_retries"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_max_retries),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1924,7 +1918,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_retry_interval <seconds>; - Retry interval in seconds (default: 5)
     ngx_command_t {
         name: ngx_string!("crowdsec_retry_interval"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_retry_interval),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1933,7 +1927,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_poll_interval <seconds>; - delay between successful LAPI stream polls (default: 10)
     ngx_command_t {
         name: ngx_string!("crowdsec_poll_interval"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_poll_interval),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1942,7 +1936,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_usage_metrics_interval <seconds>|off; - LAPI usage metrics push interval (default: 900)
     ngx_command_t {
         name: ngx_string!("crowdsec_usage_metrics_interval"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_usage_metrics_interval),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
@@ -1951,7 +1945,7 @@ pub static mut NGX_HTTP_CROWDSEC_COMMANDS: [ngx_command_t; 41] = [
     // crowdsec_lapi_timeout <seconds>; - HTTP timeout per LAPI request (default: 30)
     ngx_command_t {
         name: ngx_string!("crowdsec_lapi_timeout"),
-        type_: (NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_crowdsec_set_lapi_timeout),
         conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,

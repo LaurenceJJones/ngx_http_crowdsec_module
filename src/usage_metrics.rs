@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::net::IpAddr;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BUCKETS: usize = 512;
@@ -29,11 +29,15 @@ const USAGE_METRICS_SHM_SIZE: usize =
 const KIND_PROCESSED: u8 = 1;
 const KIND_DROPPED: u8 = 2;
 const KIND_ACTIVE: u8 = 3;
+const USAGE_MAGIC: u32 = u32::from_le_bytes(*b"CsU1");
+const USAGE_LAYOUT_VERSION: u32 = 1;
 
 static USAGE_SHM_ZONE: AtomicPtr<ngx_shm_zone_t> = AtomicPtr::new(ptr::null_mut());
 
 #[repr(C)]
 struct UsageMetricsHeader {
+    magic: u32,
+    layout_version: u32,
     startup_unix_secs: AtomicU64,
     last_push_unix_secs: AtomicU64,
     bucket_count: u32,
@@ -46,7 +50,7 @@ struct UsageBucket {
     kind: u8,
     ip_type: u8,
     origin_len: u8,
-    _pad: u8,
+    ready: AtomicU8,
     origin: [u8; ORIGIN_MAX],
 }
 
@@ -124,7 +128,11 @@ fn header_ptr() -> Option<*mut UsageMetricsHeader> {
     }
     unsafe {
         let data = (*zone).data.cast::<UsageMetricsHeader>();
-        if data.is_null() { None } else { Some(data) }
+        if data.is_null() { None } else if (*data).magic != USAGE_MAGIC || (*data).layout_version != USAGE_LAYOUT_VERSION {
+            None
+        } else {
+            Some(data)
+        }
     }
 }
 
@@ -133,48 +141,19 @@ fn buckets_ptr(header: *mut UsageMetricsHeader) -> *mut UsageBucket {
 }
 
 fn bucket_inc(key: BucketKey, delta: u64) {
-    let Some(header) = header_ptr() else {
-        return;
-    };
-    let hash = key.hash();
-    let buckets = buckets_ptr(header);
-    let count = unsafe { (*header).bucket_count as usize };
-    let mut idx = (hash as usize) % count;
-    let start = idx;
-
-    loop {
-        let bucket = unsafe { &*buckets.add(idx) };
-        let existing = bucket.key_hash.load(Ordering::Acquire);
-        if existing == hash {
-            bucket.value.fetch_add(delta, Ordering::Relaxed);
-            return;
-        }
-        if existing == 0 {
-            if bucket
-                .key_hash
-                .compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                unsafe {
-                    let b = &mut *buckets.add(idx);
-                    b.kind = key.kind;
-                    b.ip_type = key.ip_type;
-                    b.origin_len = key.origin_len;
-                    b.origin = key.origin;
-                    b.value.store(delta, Ordering::Release);
-                }
-                return;
-            }
-        }
-        idx = (idx + 1) % count;
-        if idx == start {
-            crowdsec_warn!(cycle_log(), "crowdsec: usage metrics bucket table full");
-            return;
-        }
-    }
+    bucket_write(key, BucketOp::Inc(delta));
 }
 
 fn bucket_set(key: BucketKey, value: u64) {
+    bucket_write(key, BucketOp::Set(value));
+}
+
+enum BucketOp {
+    Inc(u64),
+    Set(u64),
+}
+
+fn bucket_write(key: BucketKey, op: BucketOp) {
     let Some(header) = header_ptr() else {
         return;
     };
@@ -188,8 +167,27 @@ fn bucket_set(key: BucketKey, value: u64) {
         let bucket = unsafe { &*buckets.add(idx) };
         let existing = bucket.key_hash.load(Ordering::Acquire);
         if existing == hash {
-            bucket.value.store(value, Ordering::Release);
-            return;
+            let mut spins = 0u32;
+            while bucket.ready.load(Ordering::Acquire) == 0 && spins < 1024 {
+                std::hint::spin_loop();
+                spins += 1;
+            }
+            if bucket.ready.load(Ordering::Acquire) != 0
+                && bucket.kind == key.kind
+                && bucket.ip_type == key.ip_type
+                && bucket.origin_len == key.origin_len
+                && bucket.origin[..key.origin_len as usize] == key.origin[..key.origin_len as usize]
+            {
+                match op {
+                    BucketOp::Inc(delta) => {
+                        bucket.value.fetch_add(delta, Ordering::Relaxed);
+                    }
+                    BucketOp::Set(value) => {
+                        bucket.value.store(value, Ordering::Release);
+                    }
+                }
+                return;
+            }
         }
         if existing == 0 {
             if bucket
@@ -197,19 +195,26 @@ fn bucket_set(key: BucketKey, value: u64) {
                 .compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                let initial = match op {
+                    BucketOp::Inc(delta) | BucketOp::Set(delta) => delta,
+                };
                 unsafe {
                     let b = &mut *buckets.add(idx);
                     b.kind = key.kind;
                     b.ip_type = key.ip_type;
                     b.origin_len = key.origin_len;
                     b.origin = key.origin;
-                    b.value.store(value, Ordering::Release);
+                    b.value.store(initial, Ordering::Release);
+                    b.ready.store(1, Ordering::Release);
                 }
                 return;
             }
         }
         idx = (idx + 1) % count;
         if idx == start {
+            if matches!(op, BucketOp::Inc(_)) {
+                crowdsec_warn!(cycle_log(), "crowdsec: usage metrics bucket table full");
+            }
             return;
         }
     }
@@ -268,13 +273,14 @@ fn clear_kind_buckets(kind: u8) {
     let count = unsafe { (*header).bucket_count as usize };
     for i in 0..count {
         let bucket = unsafe { &*buckets.add(i) };
-        if bucket.key_hash.load(Ordering::Acquire) == 0 {
+        if bucket.key_hash.load(Ordering::Acquire) == 0 || bucket.ready.load(Ordering::Acquire) == 0 {
             continue;
         }
         if bucket.kind == kind {
             unsafe {
                 let b = &mut *buckets.add(i);
                 b.key_hash.store(0, Ordering::Release);
+                b.ready.store(0, Ordering::Release);
                 b.value.store(0, Ordering::Release);
             }
         }
@@ -367,7 +373,7 @@ fn collect_items() -> Vec<(BucketKey, u64)> {
     let mut out = Vec::new();
     for i in 0..count {
         let bucket = unsafe { &*buckets.add(i) };
-        if bucket.key_hash.load(Ordering::Acquire) == 0 {
+        if bucket.key_hash.load(Ordering::Acquire) == 0 || bucket.ready.load(Ordering::Acquire) == 0 {
             continue;
         }
         let value = bucket.value.load(Ordering::Relaxed);
@@ -617,8 +623,17 @@ unsafe extern "C" fn usage_metrics_zone_init(
 ) -> ngx_int_t {
     unsafe {
         if !data.is_null() {
-            (*shm_zone).data = data;
-            return ngx::ffi::NGX_OK as ngx::ffi::ngx_int_t;
+            let old = data.cast::<UsageMetricsHeader>();
+            if (*old).magic == USAGE_MAGIC && (*old).layout_version == USAGE_LAYOUT_VERSION {
+                (*shm_zone).data = data;
+                return ngx::ffi::NGX_OK as ngx::ffi::ngx_int_t;
+            }
+            crowdsec_error!(
+                cycle_log(),
+                "crowdsec: usage-metrics shared memory is incompatible with this module. \
+                 Perform a full nginx restart after upgrading, not only `reload`."
+            );
+            return ngx::ffi::NGX_ERROR as ngx::ffi::ngx_int_t;
         }
 
         let shpool = (*shm_zone).shm.addr as *mut ngx_slab_pool_t;
@@ -642,6 +657,8 @@ unsafe extern "C" fn usage_metrics_zone_init(
         ptr::write(
             p.cast::<UsageMetricsHeader>(),
             UsageMetricsHeader {
+                magic: USAGE_MAGIC,
+                layout_version: USAGE_LAYOUT_VERSION,
                 startup_unix_secs: AtomicU64::new(0),
                 last_push_unix_secs: AtomicU64::new(0),
                 bucket_count: MAX_BUCKETS as u32,

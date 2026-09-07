@@ -7,22 +7,27 @@ use crate::captcha::config::CaptchaConfig;
 use crate::captcha::cookie::{SameSite, build_set_cookie, should_cookie_be_secure};
 use crate::captcha::jwt::JwtManager;
 use crate::captcha::verifier::{VerifyResult, parse_captcha_response, verify_captcha};
+use crate::handler::{HandlerResult, StoredPhaseResult};
 use crate::request_body::{
-    BodyExtractResult, extract_request_body_limited, get_content_length,
-    get_request_log, initiate_body_read as start_body_read,
+    BodyExtractResult, CAPTCHA_POST_CTX_MAGIC, extract_request_body_limited, finalize_allow,
+    finish_access_body_read, get_content_length, get_request_log, initiate_body_read as start_body_read,
+    module_ctx_slot, request_ctx_magic,
 };
-use crate::template::{Template, TemplateVariables};
+use crate::captcha::handler::{captcha_return_uri, captcha_template_vars};
+use crate::template::Template;
 use ngx::ffi::{
     NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_buf_t, ngx_http_finalize_request, ngx_http_request_t,
     ngx_int_t, ngx_palloc,
 };
+use ngx::http::Request;
 use ngx::ngx_log_debug;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::ptr;
 
 /// Context stored in the request for captcha POST handling
 #[repr(C)]
 pub struct CaptchaPostContext {
+    pub magic: u32,
     /// Client IP address (stored as string for simplicity)
     pub client_ip: [u8; 64],
     pub client_ip_len: usize,
@@ -47,39 +52,36 @@ pub struct CaptchaPostContext {
     pub fail_open: bool,
     /// Cookie Secure flag setting
     pub cookie_secure: crate::captcha::config::CookieSecure,
-    /// Custom template (null if using default)
-    pub template: *const Template,
+    /// Outcome stored so ACCESS re-entry after `finalize_allow` does not re-read the body.
+    pub stored_result: u8,
 }
 
 impl CaptchaPostContext {
     /// Create context from captcha config
-    pub fn from_config(
-        config: &CaptchaConfig,
-        client_ip: &IpAddr,
-        template: Option<&Arc<Template>>,
-    ) -> Self {
+    pub fn from_config(config: &CaptchaConfig, client_ip: &IpAddr) -> Self {
         let ip_str = client_ip.to_string();
         let ip_bytes = ip_str.as_bytes();
         let mut client_ip_arr = [0u8; 64];
-        let ip_len = ip_bytes.len().min(63);
+        let ip_len = ip_bytes.len().min(client_ip_arr.len());
         client_ip_arr[..ip_len].copy_from_slice(&ip_bytes[..ip_len]);
 
         let secret_bytes = config.secret_key.as_bytes();
         let mut secret_arr = [0u8; 256];
-        let secret_len = secret_bytes.len().min(255);
+        let secret_len = secret_bytes.len().min(secret_arr.len());
         secret_arr[..secret_len].copy_from_slice(&secret_bytes[..secret_len]);
 
         let site_bytes = config.site_key.as_bytes();
         let mut site_arr = [0u8; 256];
-        let site_len = site_bytes.len().min(255);
+        let site_len = site_bytes.len().min(site_arr.len());
         site_arr[..site_len].copy_from_slice(&site_bytes[..site_len]);
 
         let cookie_bytes = config.cookie_name.as_bytes();
         let mut cookie_arr = [0u8; 64];
-        let cookie_len = cookie_bytes.len().min(63);
+        let cookie_len = cookie_bytes.len().min(cookie_arr.len());
         cookie_arr[..cookie_len].copy_from_slice(&cookie_bytes[..cookie_len]);
 
         Self {
+            magic: CAPTCHA_POST_CTX_MAGIC,
             client_ip: client_ip_arr,
             client_ip_len: ip_len,
             provider: config.provider,
@@ -94,26 +96,29 @@ impl CaptchaPostContext {
             bind_ip: config.bind_ip,
             fail_open: config.fail_open,
             cookie_secure: config.cookie_secure,
-            template: template
-                .map(|t| t.as_ref() as *const _)
-                .unwrap_or(std::ptr::null()),
+            stored_result: StoredPhaseResult::Unset as u8,
         }
     }
 
+    fn bounded_str<'a>(buf: &'a [u8], len: usize, fallback: &'a str) -> &'a str {
+        let len = len.min(buf.len());
+        std::str::from_utf8(&buf[..len]).unwrap_or(fallback)
+    }
+
     fn client_ip_str(&self) -> &str {
-        std::str::from_utf8(&self.client_ip[..self.client_ip_len]).unwrap_or("unknown")
+        Self::bounded_str(&self.client_ip, self.client_ip_len, "unknown")
     }
 
     fn secret_key_str(&self) -> &str {
-        std::str::from_utf8(&self.secret_key[..self.secret_key_len]).unwrap_or("")
+        Self::bounded_str(&self.secret_key, self.secret_key_len, "")
     }
 
     fn site_key_str(&self) -> &str {
-        std::str::from_utf8(&self.site_key[..self.site_key_len]).unwrap_or("")
+        Self::bounded_str(&self.site_key, self.site_key_len, "")
     }
 
     fn cookie_name_str(&self) -> &str {
-        std::str::from_utf8(&self.cookie_name[..self.cookie_name_len]).unwrap_or("crowdsec_captcha")
+        Self::bounded_str(&self.cookie_name, self.cookie_name_len, "crowdsec_captcha")
     }
 
     fn to_config(&self) -> CaptchaConfig {
@@ -129,11 +134,59 @@ impl CaptchaPostContext {
             cookie_secure: self.cookie_secure,
         }
     }
+
+    fn store_result(&mut self, result: HandlerResult) {
+        self.stored_result = StoredPhaseResult::encode(result);
+    }
+
+    fn take_result(&self) -> Option<HandlerResult> {
+        StoredPhaseResult::decode(self.stored_result)
+    }
+
+    /// Store the outcome (for ACCESS re-entry) then allow, deny, or leave a sent response.
+    unsafe fn finish(
+        &self,
+        r: *mut ngx_http_request_t,
+        ctx_ptr: *mut *mut std::ffi::c_void,
+        result: HandlerResult,
+    ) {
+        unsafe {
+            let ctx_mut = *ctx_ptr as *mut CaptchaPostContext;
+            if !ctx_mut.is_null() {
+                (*ctx_mut).store_result(result);
+            }
+            match result {
+                HandlerResult::Declined | HandlerResult::Error => finalize_allow(r),
+                HandlerResult::Forbidden => {
+                    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+                }
+                HandlerResult::Done | HandlerResult::BodyReadPending => {}
+            }
+        }
+    }
 }
 
-/// Initiate async body reading for captcha POST
+/// Resume ACCESS after a captcha body callback (stored result or still waiting).
 ///
-/// Returns NGX_DONE if body reading was initiated, or an error status
+/// # Safety
+/// Valid NGINX request pointer.
+pub unsafe fn resume_body_read(r: *mut ngx_http_request_t) -> Option<HandlerResult> {
+    unsafe {
+        if request_ctx_magic(r) != Some(CAPTCHA_POST_CTX_MAGIC) {
+            return None;
+        }
+        let ctx = *module_ctx_slot(r) as *const CaptchaPostContext;
+        match (*ctx).take_result() {
+            Some(result) => Some(result),
+            None => Some(HandlerResult::BodyReadPending),
+        }
+    }
+}
+
+/// Initiate ACCESS-phase body reading for captcha POST.
+///
+/// After OK/AGAIN, balance the extra request count (`finish_access_body_read`) and
+/// return `BodyReadPending`. The callback applies the outcome (same as nginx mirror).
 ///
 /// # Safety
 /// Requires valid NGINX request pointer and module reference
@@ -141,19 +194,11 @@ pub unsafe fn initiate_body_read(
     r: *mut ngx_http_request_t,
     config: &CaptchaConfig,
     client_ip: &IpAddr,
-    template: Option<&Arc<Template>>,
-) -> ngx_int_t {
+) -> HandlerResult {
     unsafe {
-        if template.is_none() {
-            ngx_log_debug!(
-                get_request_log(r),
-                "crowdsec: captcha POST requires crowdsec_captcha_template"
-            );
-            return NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t;
-        }
-
-        // Allocate context from request pool
-        let ctx = ngx_palloc((*r).pool, std::mem::size_of::<CaptchaPostContext>())
+        // Allocate context from the main request pool (ctx is stored on main->ctx).
+        let main_r = if (*r).main.is_null() { r } else { (*r).main };
+        let ctx = ngx_palloc((*main_r).pool, std::mem::size_of::<CaptchaPostContext>())
             as *mut CaptchaPostContext;
 
         if ctx.is_null() {
@@ -161,21 +206,17 @@ pub unsafe fn initiate_body_read(
                 get_request_log(r),
                 "crowdsec: failed to allocate captcha context"
             );
-            return NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t;
+            return HandlerResult::Error;
         }
 
-        // Initialize context
-        let context = CaptchaPostContext::from_config(config, client_ip, template);
-        std::ptr::write(ctx, context);
+        std::ptr::write(ctx, CaptchaPostContext::from_config(config, client_ip));
 
         let rc = start_body_read(r, ctx.cast(), captcha_body_handler);
-        if rc == ngx::ffi::NGX_AGAIN as ngx_int_t {
-            ngx::ffi::NGX_DONE as ngx_int_t
-        } else if rc >= ngx::ffi::NGX_HTTP_SPECIAL_RESPONSE as ngx_int_t {
-            rc
-        } else {
-            ngx::ffi::NGX_DONE as ngx_int_t
+        if finish_access_body_read(r, rc) {
+            return HandlerResult::BodyReadPending;
         }
+
+        HandlerResult::Error
     }
 }
 
@@ -188,35 +229,48 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
         let log = get_request_log(r);
         ngx_log_debug!(log, "crowdsec: captcha body handler called");
 
-        // Get our context from the request
-        let main_r = (*r).main;
-        let module = &raw const crate::ngx_http_crowdsec_module;
-        let ctx_ptr = (*main_r).ctx.wrapping_add((*module).ctx_index as usize);
+        let main_r = if (*r).main.is_null() { r } else { (*r).main };
+        let ctx_ptr = module_ctx_slot(r);
         let ctx = *ctx_ptr as *const CaptchaPostContext;
 
-        if ctx.is_null() {
-            ngx_log_debug!(log, "crowdsec: captcha context is null in body handler");
+        if ctx.is_null() || (*ctx).magic != CAPTCHA_POST_CTX_MAGIC {
+            ngx_log_debug!(log, "crowdsec: captcha context is invalid in body handler");
             ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
             return;
         }
 
         let context = &*ctx;
+        let finish = |result: HandlerResult| context.finish(r, ctx_ptr, result);
 
-        // Reconstruct config from context
         let config = context.to_config();
         let client_ip_str = context.client_ip_str();
 
-        // Parse client IP
         let client_ip: IpAddr = match client_ip_str.parse() {
             Ok(ip) => ip,
             Err(_) => {
                 ngx_log_debug!(log, "crowdsec: failed to parse client IP from context");
-                ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+                finish(HandlerResult::Error);
                 return;
             }
         };
 
-        // Extract body (bounded; chunked uploads without Content-Length are rejected)
+        let request = Request::from_ngx_http_request(main_r);
+        let uri = captcha_return_uri(&request);
+        let template = match crate::crowdsec_loc_conf(&request).and_then(|l| l.captcha_template.as_ref())
+        {
+            Some(t) => t.clone(),
+            None => {
+                ngx_log_debug!(log, "crowdsec: captcha template missing in body handler");
+                finish(HandlerResult::Error);
+                return;
+            }
+        };
+
+        let send_error = |msg: &str| {
+            send_captcha_error_page(r, &template, &config, &client_ip, &uri, msg);
+            finish(HandlerResult::Done);
+        };
+
         let body = match extract_request_body_limited(
             r,
             MAX_CAPTCHA_BODY_SIZE as usize,
@@ -224,46 +278,25 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
         ) {
             BodyExtractResult::Ok(body) => body,
             _ => {
-                send_captcha_error_page(
-                    r,
-                    context,
-                    &config,
-                    &client_ip,
-                    "Request too large or unreadable.",
-                );
+                send_error("Request too large or unreadable.");
                 return;
             }
         };
         ngx_log_debug!(log, "crowdsec: extracted body, {} bytes", body.len());
 
         if body.is_empty() {
-            // No body - show error
-            send_captcha_error_page(
-                r,
-                context,
-                &config,
-                &client_ip,
-                "No form data received. Please try again.",
-            );
+            send_error("No form data received. Please try again.");
             return;
         }
 
-        // Parse captcha response from body
         let captcha_response = match parse_captcha_response(&body, config.provider) {
             Some(resp) => resp,
             None => {
-                send_captcha_error_page(
-                    r,
-                    context,
-                    &config,
-                    &client_ip,
-                    "Captcha response not found. Please complete the challenge.",
-                );
+                send_error("Captcha response not found. Please complete the challenge.");
                 return;
             }
         };
 
-        // Verify with provider
         let result = verify_captcha(
             config.provider,
             &config.secret_key,
@@ -279,7 +312,6 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
                     log,
                     "crowdsec: captcha verified successfully, creating token"
                 );
-                // Create session token
                 let jwt_manager = JwtManager::new(config.signing_key);
 
                 let ip_for_token = if config.bind_ip {
@@ -287,9 +319,6 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
                 } else {
                     None
                 };
-
-                // Get URI for redirect
-                let uri = get_request_uri(r);
 
                 let claims = crate::captcha::jwt::CaptchaClaims::new(
                     ip_for_token.as_deref(),
@@ -300,30 +329,23 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
                 match jwt_manager.create_token(&claims) {
                     Ok(token) => {
                         ngx_log_debug!(log, "crowdsec: token created, sending redirect to {}", uri);
-                        // Send redirect with cookie
                         send_success_redirect(r, &config, &token, &uri);
                         ngx_log_debug!(log, "crowdsec: redirect sent");
+                        finish(HandlerResult::Done);
                     }
                     Err(e) => {
                         ngx_log_debug!(log, "crowdsec: failed to create session token: {}", e);
-                        send_captcha_error_page(
-                            r,
-                            context,
-                            &config,
-                            &client_ip,
-                            "Internal error. Please try again.",
-                        );
+                        send_error("Internal error. Please try again.");
                     }
                 }
             }
             VerifyResult::Failed(reason) => {
                 ngx_log_debug!(log, "crowdsec: captcha verification failed: {}", reason);
                 let error_msg = format!("Verification failed: {}. Please try again.", reason);
-                send_captcha_error_page(r, context, &config, &client_ip, &error_msg);
+                send_error(&error_msg);
             }
             VerifyResult::Error(err) => {
                 if config.fail_open {
-                    // Check if it's a network/timeout error
                     if matches!(
                         err,
                         crate::captcha::verifier::VerifyError::NetworkError(_)
@@ -336,18 +358,11 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
                             client_ip,
                             err
                         );
-                        // Allow the request - finalize with declined
-                        ngx_http_finalize_request(r, ngx::ffi::NGX_DECLINED as ngx_int_t);
+                        finish(HandlerResult::Declined);
                         return;
                     }
                 }
-                send_captcha_error_page(
-                    r,
-                    context,
-                    &config,
-                    &client_ip,
-                    "Verification service unavailable. Please try again.",
-                );
+                send_error("Verification service unavailable. Please try again.");
             }
         }
     }
@@ -361,6 +376,57 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
 ///
 /// We send a minimal HTML body through the output filter (same as error page)
 /// to properly "claim" the response and prevent NGINX's content phase from running.
+unsafe fn send_buffered_response(
+    r: *mut ngx_http_request_t,
+    status: usize,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) {
+    unsafe {
+        (*r).set_keepalive(0);
+        (*r).headers_out.status = status as ngx::ffi::ngx_uint_t;
+        (*r).headers_out.content_length_n = body.len() as i64;
+        for (name, value) in headers {
+            add_header(r, name, value);
+        }
+
+        let body_data = ngx_palloc((*r).pool, body.len()) as *mut u8;
+        if body_data.is_null() {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+            return;
+        }
+        std::ptr::copy_nonoverlapping(body.as_ptr(), body_data, body.len());
+
+        let buf = ngx_palloc((*r).pool, std::mem::size_of::<ngx_buf_t>()) as *mut ngx_buf_t;
+        if buf.is_null() {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+            return;
+        }
+        std::ptr::write_bytes(buf, 0, 1);
+        (*buf).pos = body_data;
+        (*buf).last = body_data.add(body.len());
+        (*buf).set_memory(1);
+        (*buf).set_last_buf(1);
+        (*buf).set_last_in_chain(1);
+
+        let cl = ngx::ffi::ngx_alloc_chain_link((*r).pool);
+        if cl.is_null() {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+            return;
+        }
+        (*cl).buf = buf;
+        (*cl).next = std::ptr::null_mut();
+
+        let rc = ngx::ffi::ngx_http_send_header(r);
+        if rc == ngx::ffi::NGX_ERROR as ngx_int_t || rc > ngx::ffi::NGX_OK as ngx_int_t {
+            ngx_http_finalize_request(r, rc);
+            return;
+        }
+        let rc = ngx::ffi::ngx_http_output_filter(r, cl);
+        ngx_http_finalize_request(r, rc);
+    }
+}
+
 unsafe fn send_success_redirect(
     r: *mut ngx_http_request_t,
     config: &CaptchaConfig,
@@ -368,9 +434,6 @@ unsafe fn send_success_redirect(
     redirect_uri: &str,
 ) {
     unsafe {
-        // CRITICAL: Disable keepalive to fix body callback context issue
-        (*r).set_keepalive(0);
-
         let is_secure = should_cookie_be_secure(r, config.cookie_secure);
         let cookie = build_set_cookie(
             &config.cookie_name,
@@ -381,152 +444,45 @@ unsafe fn send_success_redirect(
             true,
             SameSite::Lax,
         );
-
-        // Minimal redirect body - browsers follow Location header regardless
-        let body = b"Redirecting...";
-
-        // Set 303 redirect status with body
-        (*r).headers_out.status = 303;
-        (*r).headers_out.content_length_n = body.len() as i64;
-
-        add_header(r, "Location", redirect_uri);
-        add_header(r, "Set-Cookie", &cookie);
-        add_header(r, "Content-Type", "text/plain");
-        add_header(r, "Cache-Control", "no-store, no-cache, must-revalidate");
-
-        // Allocate body buffer (same pattern as working error page)
-        let body_data = ngx_palloc((*r).pool, body.len()) as *mut u8;
-        if body_data.is_null() {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
-            return;
-        }
-        std::ptr::copy_nonoverlapping(body.as_ptr(), body_data, body.len());
-
-        // Create buffer
-        let buf = ngx_palloc((*r).pool, std::mem::size_of::<ngx_buf_t>()) as *mut ngx_buf_t;
-        if buf.is_null() {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
-            return;
-        }
-        std::ptr::write_bytes(buf, 0, 1);
-        (*buf).pos = body_data;
-        (*buf).last = body_data.add(body.len());
-        (*buf).set_memory(1);
-        (*buf).set_last_buf(1);
-        (*buf).set_last_in_chain(1);
-
-        // Create chain link
-        let cl = ngx::ffi::ngx_alloc_chain_link((*r).pool);
-        if cl.is_null() {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
-            return;
-        }
-        (*cl).buf = buf;
-        (*cl).next = std::ptr::null_mut();
-
-        // Send headers
-        let rc = ngx::ffi::ngx_http_send_header(r);
-        if rc == ngx::ffi::NGX_ERROR as ngx_int_t || rc > ngx::ffi::NGX_OK as ngx_int_t {
-            ngx_http_finalize_request(r, rc);
-            return;
-        }
-
-        // Send body through output filter (same as error page)
-        let rc = ngx::ffi::ngx_http_output_filter(r, cl);
-        ngx_http_finalize_request(r, rc);
+        send_buffered_response(
+            r,
+            303,
+            &[
+                ("Location", redirect_uri),
+                ("Set-Cookie", &cookie),
+                ("Content-Type", "text/plain"),
+                ("Cache-Control", "no-store, no-cache, must-revalidate"),
+            ],
+            b"Redirecting...",
+        );
     }
 }
 
-/// Send a captcha error page using raw FFI
 unsafe fn send_captcha_error_page(
     r: *mut ngx_http_request_t,
-    context: &CaptchaPostContext,
-    config: &CaptchaConfig,
-    client_ip: &IpAddr,
-    error_message: &str,
-) {
-    unsafe {
-        if context.template.is_null() {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
-            return;
-        }
-
-        let uri = get_request_uri(r);
-        let template = &*context.template;
-        let body = render_captcha_page(template, config, client_ip, &uri, Some(error_message));
-
-        // Set status code (200 for captcha challenge)
-        (*r).headers_out.status = 200;
-        (*r).headers_out.content_length_n = body.len() as i64;
-
-        // Add headers
-        add_header(r, "Content-Type", "text/html; charset=utf-8");
-        add_header(
-            r,
-            "Cache-Control",
-            "no-store, no-cache, must-revalidate, max-age=0",
-        );
-        add_header(r, "Pragma", "no-cache");
-
-        // Allocate body buffer
-        let body_data = ngx_palloc((*r).pool, body.len()) as *mut u8;
-        if body_data.is_null() {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
-            return;
-        }
-        std::ptr::copy_nonoverlapping(body.as_ptr(), body_data, body.len());
-
-        // Create buffer
-        let buf = ngx_palloc((*r).pool, std::mem::size_of::<ngx_buf_t>()) as *mut ngx_buf_t;
-        if buf.is_null() {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
-            return;
-        }
-        std::ptr::write_bytes(buf, 0, 1);
-        (*buf).pos = body_data;
-        (*buf).last = body_data.add(body.len());
-        (*buf).set_memory(1);
-        (*buf).set_last_buf(1);
-        (*buf).set_last_in_chain(1);
-
-        // Create chain link
-        let cl = ngx::ffi::ngx_alloc_chain_link((*r).pool);
-        if cl.is_null() {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
-            return;
-        }
-        (*cl).buf = buf;
-        (*cl).next = std::ptr::null_mut();
-
-        // Send headers
-        let rc = ngx::ffi::ngx_http_send_header(r);
-        if rc == ngx::ffi::NGX_ERROR as ngx_int_t || rc > ngx::ffi::NGX_OK as ngx_int_t {
-            ngx_http_finalize_request(r, rc);
-            return;
-        }
-
-        // Send body
-        let rc = ngx::ffi::ngx_http_output_filter(r, cl);
-        ngx_http_finalize_request(r, rc);
-    }
-}
-
-/// Render a captcha page from a configured template file.
-fn render_captcha_page(
     template: &Template,
     config: &CaptchaConfig,
     client_ip: &IpAddr,
     form_action: &str,
-    error_message: Option<&str>,
-) -> Vec<u8> {
-    let mut vars = TemplateVariables::new();
-    vars.client_ip = Some(client_ip.to_string());
-    vars.captcha_site_key = Some(config.site_key.clone());
-    vars.captcha_script_url = Some(config.provider.script_url().to_string());
-    vars.captcha_div_class = Some(config.provider.div_class().to_string());
-    vars.captcha_error = error_message.map(|s| s.to_string());
-    vars.form_action = Some(form_action.to_string());
-    template.render(&vars).into_bytes()
+    error_message: &str,
+) {
+    unsafe {
+        let vars = captcha_template_vars(config, client_ip, form_action.to_string(), Some(error_message));
+        let body = template.render(&vars).into_bytes();
+        send_buffered_response(
+            r,
+            200,
+            &[
+                ("Content-Type", "text/html; charset=utf-8"),
+                (
+                    "Cache-Control",
+                    "no-store, no-cache, must-revalidate, max-age=0",
+                ),
+                ("Pragma", "no-cache"),
+            ],
+            &body,
+        );
+    }
 }
 
 /// Add a header to the response
@@ -537,36 +493,20 @@ unsafe fn add_header(r: *mut ngx_http_request_t, name: &str, value: &str) {
         if h.is_null() {
             return;
         }
+        ptr::write_bytes(h, 0, 1);
 
-        // Allocate and copy name
         let name_data = ngx_palloc((*r).pool, name.len()) as *mut u8;
-        if !name_data.is_null() {
-            std::ptr::copy_nonoverlapping(name.as_ptr(), name_data, name.len());
-            (*h).key.data = name_data;
-            (*h).key.len = name.len();
-        }
-
-        // Allocate and copy value
         let value_data = ngx_palloc((*r).pool, value.len()) as *mut u8;
-        if !value_data.is_null() {
-            std::ptr::copy_nonoverlapping(value.as_ptr(), value_data, value.len());
-            (*h).value.data = value_data;
-            (*h).value.len = value.len();
+        if name_data.is_null() || value_data.is_null() {
+            return;
         }
-
+        std::ptr::copy_nonoverlapping(name.as_ptr(), name_data, name.len());
+        std::ptr::copy_nonoverlapping(value.as_ptr(), value_data, value.len());
+        (*h).key.data = name_data;
+        (*h).key.len = name.len();
+        (*h).value.data = value_data;
+        (*h).value.len = value.len();
         (*h).hash = 1;
-    }
-}
-
-/// Get the request URI as a string (path + query args).
-unsafe fn get_request_uri(r: *mut ngx_http_request_t) -> String {
-    unsafe {
-        let unparsed = &(*r).unparsed_uri;
-        if unparsed.data.is_null() || unparsed.len == 0 {
-            return "/".to_string();
-        }
-        let data = std::slice::from_raw_parts(unparsed.data, unparsed.len);
-        std::str::from_utf8(data).unwrap_or("/").to_string()
     }
 }
 
@@ -625,9 +565,41 @@ pub unsafe fn is_body_size_acceptable(r: *const ngx_http_request_t) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::captcha::config::{CaptchaProvider, CookieSecure};
+    use crate::request_body::CAPTCHA_POST_CTX_MAGIC;
 
     #[test]
     fn test_max_body_size() {
         assert_eq!(MAX_CAPTCHA_BODY_SIZE, 65536);
+    }
+
+    fn sample_config() -> CaptchaConfig {
+        CaptchaConfig {
+            provider: CaptchaProvider::Turnstile,
+            site_key: "site".into(),
+            secret_key: "secret".into(),
+            signing_key: [7u8; 32],
+            cookie_name: "crowdsec_captcha".into(),
+            expiry_secs: 1800,
+            fail_open: true,
+            bind_ip: false,
+            cookie_secure: CookieSecure::Auto,
+        }
+    }
+
+    #[test]
+    fn captcha_post_context_magic_and_bounds() {
+        let ip: IpAddr = "2001:db8::1".parse().unwrap();
+        let ctx = CaptchaPostContext::from_config(&sample_config(), &ip);
+        assert_eq!(ctx.magic, CAPTCHA_POST_CTX_MAGIC);
+        assert_eq!(ctx.client_ip_str(), "2001:db8::1");
+        assert_eq!(ctx.secret_key_str(), "secret");
+        assert_eq!(ctx.take_result(), None);
+
+        let mut ctx = ctx;
+        ctx.client_ip_len = 10_000;
+        assert_eq!(ctx.client_ip_str().len(), ctx.client_ip.len());
+        ctx.store_result(HandlerResult::Done);
+        assert_eq!(ctx.take_result(), Some(HandlerResult::Done));
     }
 }

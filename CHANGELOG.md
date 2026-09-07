@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-07
+
+Patch: AppSec/captcha POST body reads no longer leak nginx worker memory, plus lifecycle and lookup fixes.
+
+Upgrade requires a **full `nginx` restart** (not reload): metrics SHM is layout-versioned, and the body-read count fix lives in the ACCESS path.
+
+### Fixed
+
+- AppSec/captcha ACCESS body reads now call `ngx_http_finalize_request(NGX_DONE)` after `ngx_http_read_client_request_body` (nginx mirror pattern), so request pools and connections are freed. Previously every POST with a body leaked worker RSS.
+- Captcha POST ctx is magic-checked; the template is read from location conf instead of a raw pointer.
+- Stream `startup=true` replaces the decision cache (`clear_all`) so LAPI unbans are not stale after reload.
+- IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`) match IPv4 bans, bypass, and trusted proxies.
+- Poller thread is joined on worker exit; SHM rwlock is reset on zone reuse only when the previous poller PID is gone. Every worker runs a standby poller thread so reload does not overlap two LAPI writers.
+- `crowdsec_captcha_bind_ip on` rejects JWT `sub=anonymous` tokens.
+- Internal `/crowdsec-internal/challenge/*` denies when AppSec is unconfigured instead of passing to origin.
+- Captcha body-read errors honor `crowdsec_unenforceable_action`.
+- Usage-metrics `dropped` and Prometheus `http_ban` count remediations actually applied (not captcha passes / unenforceable allow). AppSec bans increment `http_ban`.
+- Invalid `on`/`off` flag values fail `nginx -t`. `crowdsec_metrics` is location-only and does not inherit.
+- XFF `host:port` tokens parse; all `Cookie` headers are scanned.
+- AppSec body context is allocated from the main request pool.
+
+### Changed
+
+- PRECONTENT CrowdSec handler is no longer registered (AppSec body inspect is ACCESS-only).
+- Internal cleanup: shared body-read result packing, one captcha FFI send path, unused SHM wrappers and one-shot helpers removed.
+- Simulated LAPI decisions are skipped. Stream deltas log at `info`, not `notice`.
+- Prometheus `crowdsec_decision_cache_entries` is non-expired rows; added `crowdsec_decision_cache_evictions_total`.
+- Metrics and usage-metrics SHM zones are layout-versioned.
+
 ## [0.4.0] - 2026-09-07
 
 Minor release: Lua bouncer remediation parity, optional ban templates, and real CrowdSec CI.

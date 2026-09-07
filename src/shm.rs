@@ -31,6 +31,9 @@ const SHM_MAGIC: u32 = u32::from_le_bytes(*b"CsD1");
 /// Reload reuses the zone pointer only when this matches; otherwise require a full restart.
 const SHM_LAYOUT_VERSION: u32 = 3;
 
+const METRICS_MAGIC: u32 = u32::from_le_bytes(*b"CsM1");
+const METRICS_LAYOUT_VERSION: u32 = 1;
+
 /// Percentage of SHM to use for entries (rest is overhead)
 const USABLE_MEMORY_PERCENT: usize = 70;
 
@@ -67,10 +70,12 @@ pub const DECISION_BIT_CAPTCHA: u8 = 0b0000_0010;
 
 impl DecisionType {
     pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "ban" => DecisionType::Ban,
-            "captcha" => DecisionType::Captcha,
-            _ => DecisionType::Unknown,
+        if s.eq_ignore_ascii_case("ban") {
+            DecisionType::Ban
+        } else if s.eq_ignore_ascii_case("captcha") {
+            DecisionType::Captcha
+        } else {
+            DecisionType::Unknown
         }
     }
 
@@ -124,13 +129,18 @@ pub enum Origin {
 
 impl Origin {
     pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "crowdsec" => Origin::Crowdsec,
-            "cscli" | "cscli-import" => Origin::Cscli,
-            "capi" => Origin::Capi,
-            "console" => Origin::Console,
-            "lists" => Origin::Lists,
-            _ => Origin::Unknown,
+        if s.eq_ignore_ascii_case("crowdsec") {
+            Origin::Crowdsec
+        } else if s.eq_ignore_ascii_case("cscli") || s.eq_ignore_ascii_case("cscli-import") {
+            Origin::Cscli
+        } else if s.eq_ignore_ascii_case("capi") {
+            Origin::Capi
+        } else if s.eq_ignore_ascii_case("console") {
+            Origin::Console
+        } else if s.eq_ignore_ascii_case("lists") {
+            Origin::Lists
+        } else {
+            Origin::Unknown
         }
     }
 
@@ -503,6 +513,8 @@ pub unsafe fn decisions_zone_early_request(
 /// Prometheus-style counters in a tiny separate zone (does not change `ShmData` layout).
 #[repr(C)]
 pub struct MetricsShm {
+    pub magic: u32,
+    pub layout_version: u32,
     pub http_lookups: AtomicU64,
     pub http_bans: AtomicU64,
     pub http_captcha: AtomicU64,
@@ -562,10 +574,10 @@ fn hash_cidr(family: u8, prefix_len: u8, network: &[u8]) -> u32 {
     hash ^= prefix_len as u32;
     hash = hash.wrapping_mul(FNV_PRIME);
 
-    // Hash network bytes
+    // Hash network bytes (callers must pass a slice long enough for `family`)
     let len = if family == 4 { 4 } else { 16 };
     for i in 0..len {
-        hash ^= network[i] as u32;
+        hash ^= u32::from(*network.get(i).unwrap_or(&0));
         hash = hash.wrapping_mul(FNV_PRIME);
     }
 
@@ -672,12 +684,19 @@ unsafe extern "C" fn decisions_shm_zone_init(
         if !data.is_null() {
             if decision_shm_layout_matches(data) {
                 (*shm_zone).data = data;
-                // The previous generation's poller exits after new workers start. Reset
-                // its claim now so one of the new workers can take over immediately.
                 let shm_data = data as *mut ShmData;
                 let poller_atomic = &*((&(*shm_data).poller_pid) as *const ngx_atomic_t
                     as *const std::sync::atomic::AtomicIsize);
-                poller_atomic.store(0, Ordering::SeqCst);
+                let pid = poller_atomic.load(Ordering::SeqCst);
+                // Keep the previous generation's poller claim while that PID is
+                // still alive so two pollers cannot overlap. New workers wait
+                // in the polling thread until `try_become_poller` succeeds.
+                if pid == 0 || !process_alive(pid as i32) {
+                    poller_atomic.store(0, Ordering::SeqCst);
+                    // Previous generation's poller is gone; drop a stale write lock
+                    // so lookups cannot spin forever after a mid-lock crash/kill.
+                    (*shm_data).lock = 0;
+                }
                 return NGX_OK as ngx_int_t;
             }
             crowdsec_error!(
@@ -797,7 +816,19 @@ unsafe fn get_scenarios(shm_data: *mut ShmData) -> *mut ShmScenario {
 unsafe fn prefix_is_present(shm_data: *mut ShmData, prefix: u8) -> bool {
     unsafe {
         let prefix = prefix as usize;
+        if prefix / 64 >= (*shm_data).cidr_prefixes.len() {
+            return false;
+        }
         ((*shm_data).cidr_prefixes[prefix / 64] & (1u64 << (prefix % 64))) != 0
+    }
+}
+
+#[inline]
+fn cidr_params_valid(family: u8, prefix_len: u8, network: &[u8]) -> bool {
+    match family {
+        4 => prefix_len <= 32 && network.len() >= 4,
+        6 => prefix_len <= 128 && network.len() >= 16,
+        _ => false,
     }
 }
 
@@ -805,6 +836,9 @@ unsafe fn prefix_is_present(shm_data: *mut ShmData, prefix: u8) -> bool {
 unsafe fn mark_prefix_present(shm_data: *mut ShmData, prefix: u8) {
     unsafe {
         let prefix = prefix as usize;
+        if prefix / 64 >= (*shm_data).cidr_prefixes.len() {
+            return;
+        }
         (*shm_data).cidr_prefixes[prefix / 64] |= 1u64 << (prefix % 64);
     }
 }
@@ -1133,11 +1167,6 @@ unsafe fn lookup_cidr_v6(
     }
 }
 
-/// Check if an IP is banned (convenience wrapper for lookup_ip)
-pub fn is_banned(ip: &IpAddr) -> bool {
-    lookup_ip(ip).found
-}
-
 /// Add a decision for an individual IP to shared memory
 /// If the IP already has decisions, the new decision type is added to the bitmask
 /// and the expiry is extended if the new one is longer
@@ -1243,6 +1272,10 @@ pub fn add_decision(info: &DecisionInfo) {
 /// Add a CIDR range decision to shared memory
 /// If the CIDR already has decisions, the new decision type is added to the bitmask
 pub fn add_cidr_decision(info: &CidrDecisionInfo) {
+    if !cidr_params_valid(info.family, info.prefix_len, info.network) {
+        return;
+    }
+
     let shm_data = match get_shm_data() {
         Some(data) => data,
         None => return,
@@ -1312,7 +1345,12 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         new_entry.flags = FLAG_IS_CIDR;
 
         let len = if info.family == 4 { 4 } else { 16 };
-        new_entry.addr[..len].copy_from_slice(&info.network[..len]);
+        if let Some(bytes) = info.network.get(..len) {
+            new_entry.addr[..len].copy_from_slice(bytes);
+        } else {
+            ngx_rwlock_unlock(&mut (*shm_data).lock);
+            return;
+        }
 
         // Find vacant slot
         let slot = match find_vacant_slot(entries, capacity, hash) {
@@ -1334,17 +1372,6 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
 
         ngx_rwlock_unlock(&mut (*shm_data).lock);
     }
-}
-
-/// Add a banned IP to shared memory (legacy compatibility wrapper)
-pub fn add_ban(ip: &IpAddr, duration_secs: Option<i64>) {
-    add_decision(&DecisionInfo {
-        ip,
-        decision_type: DecisionType::Ban,
-        origin: Origin::Unknown,
-        scenario: None,
-        duration_secs,
-    });
 }
 
 /// Remove a specific decision type for an IP from shared memory
@@ -1373,33 +1400,6 @@ pub fn remove_decision_type(ip: &IpAddr, decision_type: DecisionType) {
                 entry.mark_tombstone();
                 (*shm_data).count = (*shm_data).count.saturating_sub(1);
             }
-            (*shm_data).version += 1;
-        }
-
-        ngx_rwlock_unlock(&mut (*shm_data).lock);
-    }
-}
-
-/// Remove a decision for an IP from shared memory (removes all decision types)
-pub fn remove_decision(ip: &IpAddr) {
-    let shm_data = match get_shm_data() {
-        Some(data) => data,
-        None => return,
-    };
-
-    unsafe {
-        ngx_rwlock_wlock(&mut (*shm_data).lock);
-
-        let entries = get_entries(shm_data);
-        let capacity = (*shm_data).capacity;
-        let hash = hash_ip(ip);
-
-        let (idx, found) = find_slot_ip(entries, capacity, hash, ip);
-
-        if found {
-            let entry = &mut *entries.add(idx as usize);
-            entry.mark_tombstone();
-            (*shm_data).count = (*shm_data).count.saturating_sub(1);
             (*shm_data).version += 1;
         }
 
@@ -1441,38 +1441,6 @@ pub fn remove_cidr_decision_type(
 
         ngx_rwlock_unlock(&mut (*shm_data).lock);
     }
-}
-
-/// Remove a CIDR range decision from shared memory (removes all decision types)
-pub fn remove_cidr_decision(family: u8, prefix_len: u8, network: &[u8]) {
-    let shm_data = match get_shm_data() {
-        Some(data) => data,
-        None => return,
-    };
-
-    unsafe {
-        ngx_rwlock_wlock(&mut (*shm_data).lock);
-
-        let entries = get_entries(shm_data);
-        let capacity = (*shm_data).capacity;
-        let hash = hash_cidr(family, prefix_len, network);
-
-        let (idx, found) = find_slot_cidr(entries, capacity, hash, family, prefix_len, network);
-
-        if found {
-            let entry = &mut *entries.add(idx as usize);
-            entry.mark_tombstone();
-            (*shm_data).count = (*shm_data).count.saturating_sub(1);
-            (*shm_data).version += 1;
-        }
-
-        ngx_rwlock_unlock(&mut (*shm_data).lock);
-    }
-}
-
-/// Remove a banned IP from shared memory (legacy compatibility wrapper)
-pub fn remove_ban(ip: &IpAddr) {
-    remove_decision(ip);
 }
 
 /// Clear all entries from shared memory
@@ -1537,7 +1505,35 @@ pub fn count_active_decisions_by_origin() -> Vec<(Origin, u16, u8, u64)> {
         .collect()
 }
 
-/// Get current count of entries (IPs + CIDRs)
+/// Count of non-expired hash slots (active decisions). Occupancy is [`get_count`].
+pub fn get_active_count() -> u32 {
+    let shm_data = match get_shm_data() {
+        Some(data) => data,
+        None => return 0,
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    unsafe {
+        ngx_rwlock_rlock(&mut (*shm_data).lock);
+        let entries = get_entries(shm_data);
+        let capacity = (*shm_data).capacity;
+        let mut n = 0u32;
+        for idx in 0..capacity as usize {
+            let entry = &*entries.add(idx);
+            if !entry.is_vacant() && entry.has_decisions() && !entry.is_expired_at(now) {
+                n += 1;
+            }
+        }
+        ngx_rwlock_unlock(&mut (*shm_data).lock);
+        n
+    }
+}
+
+/// Get current count of hash slots in use (IPs + CIDRs, including expired).
 pub fn get_count() -> u32 {
     let shm_data = match get_shm_data() {
         Some(data) => data,
@@ -1549,21 +1545,6 @@ pub fn get_count() -> u32 {
         let count = (*shm_data).count;
         ngx_rwlock_unlock(&mut (*shm_data).lock);
         count
-    }
-}
-
-/// Get hash table capacity
-pub fn get_capacity() -> u32 {
-    let shm_data = match get_shm_data() {
-        Some(data) => data,
-        None => return 0,
-    };
-
-    unsafe {
-        ngx_rwlock_rlock(&mut (*shm_data).lock);
-        let capacity = (*shm_data).capacity;
-        ngx_rwlock_unlock(&mut (*shm_data).lock);
-        capacity
     }
 }
 
@@ -1651,15 +1632,11 @@ pub fn release_poller() {
 /// Parse a CIDR string like "192.168.1.0/24" or "2001:db8::/32"
 /// Returns (network_bytes, family, prefix_len)
 pub fn parse_cidr(cidr: &str) -> Option<([u8; 16], u8, u8)> {
-    let parts: Vec<&str> = cidr.split('/').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let prefix_len: u8 = parts[1].parse().ok()?;
+    let (addr_s, prefix_s) = cidr.split_once('/')?;
+    let prefix_len: u8 = prefix_s.parse().ok()?;
 
     // Try IPv4 first
-    if let Ok(v4) = parts[0].parse::<Ipv4Addr>() {
+    if let Ok(v4) = addr_s.parse::<Ipv4Addr>() {
         if prefix_len > 32 {
             return None;
         }
@@ -1670,7 +1647,7 @@ pub fn parse_cidr(cidr: &str) -> Option<([u8; 16], u8, u8)> {
     }
 
     // Try IPv6
-    if let Ok(v6) = parts[0].parse::<Ipv6Addr>() {
+    if let Ok(v6) = addr_s.parse::<Ipv6Addr>() {
         if prefix_len > 128 {
             return None;
         }
@@ -1725,8 +1702,17 @@ unsafe extern "C" fn metrics_zone_init(
 ) -> ngx_int_t {
     unsafe {
         if !data.is_null() {
-            (*shm_zone).data = data;
-            return NGX_OK as ngx_int_t;
+            let old = data.cast::<MetricsShm>();
+            if (*old).magic == METRICS_MAGIC && (*old).layout_version == METRICS_LAYOUT_VERSION {
+                (*shm_zone).data = data;
+                return NGX_OK as ngx_int_t;
+            }
+            crowdsec_error!(
+                cycle_log(),
+                "crowdsec: metrics shared memory is incompatible with this module. \
+                 Perform a full nginx restart after upgrading, not only `reload`."
+            );
+            return ngx::ffi::NGX_ERROR as ngx_int_t;
         }
 
         let shpool = (*shm_zone).shm.addr as *mut ngx_slab_pool_t;
@@ -1747,6 +1733,8 @@ unsafe extern "C" fn metrics_zone_init(
         ptr::write(
             p.cast::<MetricsShm>(),
             MetricsShm {
+                magic: METRICS_MAGIC,
+                layout_version: METRICS_LAYOUT_VERSION,
                 http_lookups: AtomicU64::new(0),
                 http_bans: AtomicU64::new(0),
                 http_captcha: AtomicU64::new(0),
@@ -1762,44 +1750,33 @@ unsafe extern "C" fn metrics_zone_init(
     NGX_OK as ngx_int_t
 }
 
-#[inline]
-pub fn metrics_inc_http_lookup() {
+fn metrics_add(counter: impl FnOnce(&MetricsShm) -> &AtomicU64) {
     let Some(p) = get_metrics_shm() else {
         return;
     };
     unsafe {
-        (*p).http_lookups.fetch_add(1, Ordering::Relaxed);
+        counter(&*p).fetch_add(1, Ordering::Relaxed);
     }
+}
+
+#[inline]
+pub fn metrics_inc_http_lookup() {
+    metrics_add(|m| &m.http_lookups);
 }
 
 #[inline]
 pub fn metrics_inc_http_ban() {
-    let Some(p) = get_metrics_shm() else {
-        return;
-    };
-    unsafe {
-        (*p).http_bans.fetch_add(1, Ordering::Relaxed);
-    }
+    metrics_add(|m| &m.http_bans);
 }
 
 #[inline]
 pub fn metrics_inc_http_captcha() {
-    let Some(p) = get_metrics_shm() else {
-        return;
-    };
-    unsafe {
-        (*p).http_captcha.fetch_add(1, Ordering::Relaxed);
-    }
+    metrics_add(|m| &m.http_captcha);
 }
 
 #[inline]
 pub fn metrics_inc_http_bypass() {
-    let Some(p) = get_metrics_shm() else {
-        return;
-    };
-    unsafe {
-        (*p).http_bypass.fetch_add(1, Ordering::Relaxed);
-    }
+    metrics_add(|m| &m.http_bypass);
 }
 
 #[inline]
@@ -1820,18 +1797,13 @@ pub fn metrics_inc_lapi_poll_ok() {
 
 #[inline]
 pub fn metrics_inc_lapi_poll_err() {
-    let Some(p) = get_metrics_shm() else {
-        return;
-    };
-    unsafe {
-        (*p).lapi_poll_err.fetch_add(1, Ordering::Relaxed);
-    }
+    metrics_add(|m| &m.lapi_poll_err);
 }
 
 /// Snapshot for Prometheus exposition (best-effort relaxed reads).
-pub fn metrics_prometheus_snapshot() -> (u64, u64, u64, u64, u64, u64, u64, u32) {
+pub fn metrics_prometheus_snapshot() -> (u64, u64, u64, u64, u64, u64, u64, u32, u32) {
     let Some(p) = get_metrics_shm() else {
-        return (0, 0, 0, 0, 0, 0, 0, get_count());
+        return (0, 0, 0, 0, 0, 0, 0, get_active_count(), get_eviction_count());
     };
     unsafe {
         (
@@ -1842,7 +1814,8 @@ pub fn metrics_prometheus_snapshot() -> (u64, u64, u64, u64, u64, u64, u64, u32)
             (*p).lapi_poll_ok.load(Ordering::Relaxed),
             (*p).lapi_poll_err.load(Ordering::Relaxed),
             (*p).lapi_last_success_unix_secs.load(Ordering::Relaxed),
-            get_count(),
+            get_active_count(),
+            get_eviction_count(),
         )
     }
 }
@@ -1903,6 +1876,17 @@ mod tests {
 
         let (_, family, prefix) = parse_cidr("2001:db8::1/128").unwrap();
         assert_eq!((family, prefix), (6, 128));
+    }
+
+    #[test]
+    fn cidr_params_reject_short_or_bad_family() {
+        assert!(cidr_params_valid(4, 24, &[192, 168, 1, 0]));
+        assert!(!cidr_params_valid(4, 24, &[192, 168, 1]));
+        assert!(!cidr_params_valid(4, 33, &[192, 168, 1, 0]));
+        assert!(cidr_params_valid(6, 32, &[0u8; 16]));
+        assert!(!cidr_params_valid(6, 32, &[0u8; 15]));
+        assert!(!cidr_params_valid(6, 129, &[0u8; 16]));
+        assert!(!cidr_params_valid(0, 24, &[192, 168, 1, 0]));
     }
 
     #[test]

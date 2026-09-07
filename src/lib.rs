@@ -25,12 +25,11 @@ mod usage_metrics;
 
 use config::{DEFAULT_SHM_SIZE, LocConfig, MainConfig, NGX_HTTP_CROWDSEC_COMMANDS};
 use conf::{ConfValueError, NgxConfExt};
-use handler::{handle_access, handle_precontent};
+use handler::handle_access;
 use ngx::core::Status;
 use ngx::ffi::{
     NGX_HTTP_MODULE, NGX_OK, ngx_array_push, ngx_conf_t, ngx_cycle_t, ngx_http_handler_pt,
-    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE,
-    ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE, ngx_int_t, ngx_module_t,
+    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t,
 };
 use ngx::http::{
     HttpModule, HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError,
@@ -84,22 +83,6 @@ http_request_handler!(
             None => return Status::NGX_DECLINED,
         };
         Status::from(handle_access(request, loc_conf, main_conf))
-    }
-);
-
-// PRECONTENT phase handler - AppSec body inspection
-http_request_handler!(
-    crowdsec_precontent_handler,
-    |request: &mut ngx::http::Request| {
-        let loc_conf = match Module::location_conf(request) {
-            Some(c) => c,
-            None => return Status::NGX_DECLINED,
-        };
-        let main_conf = match Module::main_conf(request) {
-            Some(c) => c,
-            None => return Status::NGX_DECLINED,
-        };
-        Status::from(handle_precontent(request, loc_conf, main_conf))
     }
 );
 
@@ -218,15 +201,6 @@ impl HttpModule for Module {
 
             *handler = Some(crowdsec_access_handler);
 
-            let precontent = ngx_array_push(
-                &mut cmcf.phases[ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE as usize].handlers,
-            ) as *mut ngx_http_handler_pt;
-
-            if precontent.is_null() {
-                return Status::NGX_ERROR.into();
-            }
-
-            *precontent = Some(crowdsec_precontent_handler);
             Status::NGX_OK.into()
         }
     }
@@ -234,9 +208,8 @@ impl HttpModule for Module {
 
 /// Worker process initialization callback
 ///
-/// Only the first worker to call this will start the polling thread.
-/// All workers share the same shared memory for decision data.
-/// Uses atomic CAS in shared memory to elect a single poller across all workers.
+/// Every worker starts a polling thread. Shared-memory CAS elects a single
+/// LAPI poller; the other threads wait so they can take over after reload.
 ///
 /// # Safety
 /// This function is called by NGINX and must follow C calling conventions.
@@ -250,15 +223,9 @@ pub unsafe extern "C" fn ngx_http_crowdsec_init_worker(_cycle: *mut ngx_cycle_t)
         return NGX_OK as ngx_int_t;
     };
 
-    // Try to claim poller role using atomic CAS in shared memory
-    // Only one worker across all processes will succeed
-    if !shm::try_become_poller() {
-        // Another worker already claimed the poller role
-        return NGX_OK as ngx_int_t;
-    }
-
-    // This worker won the election - start polling thread.
-    usage_metrics::record_startup();
+    // Every worker starts a polling thread. Only the elected poller talks to
+    // LAPI; the others wait so they can take over after reload without a gap
+    // and without two writers overlapping.
     let client = StreamClient::new(config);
     let handle = client.spawn_polling_thread();
     *POLLING_HANDLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
@@ -272,33 +239,29 @@ pub unsafe extern "C" fn ngx_http_crowdsec_init_worker(_cycle: *mut ngx_cycle_t)
 /// This function is called by NGINX and must follow C calling conventions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ngx_http_crowdsec_exit_worker(_cycle: *mut ngx_cycle_t) {
-    // Only the poller worker ships stream polls and usage metrics.
-    if !shm::is_poller() {
-        return;
+    if shm::is_poller() {
+        if let Some(config) = GLOBAL_CONFIG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            usage_metrics::flush_on_shutdown(
+                &config.url,
+                &config.api_key,
+                config.timeout_secs,
+                config.usage_metrics_interval_secs,
+            );
+        }
     }
 
-    if let Some(config) = GLOBAL_CONFIG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-    {
-        usage_metrics::flush_on_shutdown(
-            &config.url,
-            &config.api_key,
-            config.timeout_secs,
-            config.usage_metrics_interval_secs,
-        );
-    }
-
-    // Signal polling thread to stop
+    // Join the polling/standby thread before nginx destroys the cycle pool.
     if let Some((handle, running)) = POLLING_HANDLE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take()
     {
         running.store(false, Ordering::SeqCst);
-        // Don't join - let the thread terminate naturally
-        let _ = handle;
+        let _ = handle.join();
     }
     shm::release_poller();
 }
@@ -440,5 +403,16 @@ mod tests {
         };
 
         assert!(child.merge(&parent).is_ok());
+    }
+
+    #[test]
+    fn merge_does_not_inherit_metrics_enabled() {
+        let parent = LocConfig {
+            metrics_enabled: Some(true),
+            ..Default::default()
+        };
+        let mut child = LocConfig::default();
+        child.merge(&parent).unwrap();
+        assert_eq!(child.metrics_enabled, None);
     }
 }

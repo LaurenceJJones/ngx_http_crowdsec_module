@@ -17,14 +17,14 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec` | http, server, location | `off` | Enable/disable CrowdSec checking |
 | `crowdsec_url` | http | - | CrowdSec LAPI URL (required) |
 | `crowdsec_api_key` | http | - | Bouncer API key (required) |
-| `crowdsec_trusted_proxies` | http, server | - | Optional. CIDRs of reverse proxies; client IP from forwarded header (see [Client IP](#client-ip-behind-a-reverse-proxy)) |
-| `crowdsec_real_ip_header` | http, server | `X-Forwarded-For` | Header read when `crowdsec_trusted_proxies` is set |
-| `crowdsec_bypass` | http, server | - | CIDRs that skip enforcement (resolved client IP) |
+| `crowdsec_trusted_proxies` | http | - | Optional. CIDRs of reverse proxies; client IP from forwarded header (see [Client IP](#client-ip-behind-a-reverse-proxy)) |
+| `crowdsec_real_ip_header` | http | `X-Forwarded-For` | Header read when `crowdsec_trusted_proxies` is set |
+| `crowdsec_bypass` | http | - | CIDRs that skip enforcement (resolved client IP) |
 | `crowdsec_shm_size` | http | `1m` | Shared memory for decision cache |
 | `crowdsec_max_retries` | http | `3` | Startup connection retries |
 | `crowdsec_retry_interval` | http | `5` | Seconds between retries |
-| `crowdsec_poll_interval` | http, server | `10` | Seconds between successful LAPI stream polls |
-| `crowdsec_lapi_timeout` | http, server | `30` | LAPI HTTP timeout (seconds) |
+| `crowdsec_poll_interval` | http | `10` | Seconds between successful LAPI stream polls |
+| `crowdsec_lapi_timeout` | http | `30` | LAPI HTTP timeout (seconds) |
 | `crowdsec_ban_template` | http, server, location | - | Optional HTML/JSON ban page when `ban_action` is `block` |
 | `crowdsec_ban_action` | http, server, location | `block` | `block` or `redirect` |
 | `crowdsec_ban_status` | http, server, location | `403` | Block-mode HTTP status (400–599; Lua `RET_CODE`) |
@@ -42,18 +42,18 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_captcha_bind_ip` | http, server, location | `on` | Bind sessions to client IP |
 | `crowdsec_captcha_cookie_secure` | http, server, location | `auto` | `auto`, `on`, or `off` |
 | `crowdsec_captcha_template` | http, server, location | - | Required when captcha keys are set and `unenforceable_action` is `block` |
-| `crowdsec_appsec_url` | http, server | - | AppSec agent base URL |
+| `crowdsec_appsec_url` | http | - | AppSec agent base URL |
 | `crowdsec_appsec` | http, server, location | `off` | Enable AppSec inspection |
 | `crowdsec_appsec_always` | http, server, location | `off` | Run AppSec even when the client IP has a ban/captcha decision |
 | `crowdsec_static_extensions` | http, server, location | `.ico` | File extensions that skip HTML ban/captcha pages (e.g. `.css`, `.js`); use `off` to disable |
-| `crowdsec_appsec_api_key` | http, server | - | Defaults to `crowdsec_api_key` |
-| `crowdsec_appsec_timeout` | http, server, location | `1000` | AppSec timeout (ms) |
-| `crowdsec_appsec_max_body_size` | http, server, location | `10m` | Max body forwarded to AppSec |
+| `crowdsec_appsec_api_key` | http | - | Defaults to `crowdsec_api_key` |
+| `crowdsec_appsec_timeout` | http | `1000` | AppSec timeout (ms). **Blocks the NGINX worker** for this long on each AppSec call. |
+| `crowdsec_appsec_max_body_size` | http | `10m` | Max body forwarded to AppSec |
 | `crowdsec_appsec_failure_action` | http, server, location | `passthrough` | Action when AppSec is unreachable |
-| `crowdsec_appsec_drop_unreadable_body` | http, server, location | `off` | Reject bodies that cannot be buffered |
+| `crowdsec_appsec_drop_unreadable_body` | http | `off` | Reject bodies that cannot be buffered |
 | `crowdsec_bot_challenge` | http, server, location | `off` | CrowdSec 1.8 bot challenge (experimental) |
-| `crowdsec_usage_metrics_interval` | http, server | `900` | Push bouncer metrics to LAPI (`POST /v1/usage-metrics`); `off` disables. Pending counters are flushed on worker shutdown (reload/stop). |
-| `crowdsec_metrics` | http, server, location | `off` | Expose Prometheus metrics at this location |
+| `crowdsec_usage_metrics_interval` | http | `900` | Push bouncer metrics to LAPI (`POST /v1/usage-metrics`); `off` disables. Pending counters are flushed on worker shutdown (reload/stop). |
+| `crowdsec_metrics` | location | `off` | Expose Prometheus metrics at **this** location only (does not inherit). Pair with `crowdsec off`. |
 
 ## Full example
 
@@ -138,7 +138,7 @@ crowdsec_appsec_failure_action passthrough;
 crowdsec_bot_challenge on;  # experimental — CrowdSec 1.8
 ```
 
-POST/PUT/PATCH/DELETE bodies are inspected in the **PRECONTENT** phase; bodyless GET/HEAD use the access phase. Any other method (including GET) with a `Content-Length` or chunked body is also read in PRECONTENT and forwarded to the agent with the original verb in `X-Crowdsec-Appsec-Verb`, so core rulesets can flag non-standard requests such as GET with a body. Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin.
+Request bodies (POST/PUT/PATCH/DELETE, and any method with a body) are inspected in the **ACCESS** phase so `proxy_pass` keeps the correct content handler. Keep `crowdsec_appsec_timeout` in the tens of milliseconds if you cannot accept a blocked worker; captcha provider verify is also synchronous on the worker (5s timeout). Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin. IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`) are treated as IPv4 for bans, bypass, and trusted proxies.
 
 ## Client IP behind a reverse proxy
 
@@ -198,10 +198,10 @@ NGINX master
   └── shared memory (decision cache, metrics)
         ▲
   workers ──► one elected poller streams LAPI /v1/decisions/stream
-        └── access / precontent handlers check each request
+        └── access handlers check each request
 ```
 
-After a module upgrade that changes the SHM layout, a full **stop/start** (not reload) may be required. See troubleshooting in the main README.
+After a module upgrade that changes the SHM layout, a full **stop/start** (not reload) may be required. The `cidr_prefixes` bitmap in the decision zone never shrinks after deletes (stale bits only skip empty prefix walks). See troubleshooting in the main README.
 
 ## Troubleshooting
 

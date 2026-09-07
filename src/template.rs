@@ -19,8 +19,7 @@ fn escape_html(s: &str) -> String {
 }
 
 /// Escape a string for safe inclusion in JSON string values
-/// Escapes quotes, backslashes, and control characters
-fn escape_json(s: &str) -> String {
+pub(crate) fn escape_json(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -37,13 +36,6 @@ fn escape_json(s: &str) -> String {
         }
     }
     result
-}
-
-/// Escape a string for safe inclusion in XML content
-/// Similar to HTML escaping
-fn escape_xml(s: &str) -> String {
-    // XML escaping is the same as HTML for our purposes
-    escape_html(s)
 }
 
 /// Escape mode for variable substitution
@@ -203,7 +195,7 @@ impl Template {
                     let escaped = match self.escape_mode {
                         EscapeMode::Html => escape_html(value),
                         EscapeMode::Json => escape_json(value),
-                        EscapeMode::Xml => escape_xml(value),
+                        EscapeMode::Xml => escape_html(value),
                         EscapeMode::None => value.to_string(),
                     };
                     result.push_str(&escaped);

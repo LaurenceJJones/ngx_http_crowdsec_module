@@ -53,12 +53,12 @@ impl CaptchaClaims {
     fn to_json(&self) -> String {
         // Manual JSON serialization to avoid serde dependency overhead
         let uri_part = match &self.uri {
-            Some(u) => format!(r#","uri":"{}""#, escape_json_string(u)),
+            Some(u) => format!(r#","uri":"{}""#, crate::template::escape_json(u)),
             None => String::new(),
         };
         format!(
             r#"{{"sub":"{}","iat":{},"exp":{},"typ":"{}","nonce":"{}"{}}}"#,
-            escape_json_string(&self.sub),
+            crate::template::escape_json(&self.sub),
             self.iat,
             self.exp,
             self.typ,
@@ -98,23 +98,6 @@ fn generate_nonce() -> String {
 /// Encode bytes as lowercase hex string
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// Escape a string for JSON (handles quotes and backslashes)
-fn escape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_control() => result.push_str(&format!("\\u{:04x}", c as u32)),
-            _ => result.push(c),
-        }
-    }
-    result
 }
 
 /// Extract a string value from JSON by key (simple parser)
@@ -302,9 +285,9 @@ impl JwtManager {
             return Err(JwtError::Expired);
         }
 
-        // Check IP binding if client_ip is provided and claims have a specific IP
+        // When bind_ip is on, `client_ip` is Some — require an exact match (reject anonymous).
         if let Some(ip) = client_ip {
-            if claims.sub != "anonymous" && claims.sub != ip {
+            if claims.sub != ip {
                 return Err(JwtError::IpMismatch);
             }
         }
@@ -416,20 +399,16 @@ mod tests {
         let claims = CaptchaClaims::new(None, 3600, None);
         let token = manager.create_token(&claims).unwrap();
 
-        // Any IP should pass for anonymous tokens
+        // bind_ip on: anonymous tokens must not match a concrete client IP
         let result = manager.verify_and_validate(&token, Some("192.168.1.1"));
-        assert!(result.is_ok());
+        assert_eq!(result, Err(JwtError::IpMismatch));
 
         let result = manager.verify_and_validate(&token, Some("10.0.0.1"));
-        assert!(result.is_ok());
-    }
+        assert_eq!(result, Err(JwtError::IpMismatch));
 
-    #[test]
-    fn test_json_string_escape() {
-        assert_eq!(escape_json_string("hello"), "hello");
-        assert_eq!(escape_json_string("say \"hi\""), "say \\\"hi\\\"");
-        assert_eq!(escape_json_string("back\\slash"), "back\\\\slash");
-        assert_eq!(escape_json_string("line\nbreak"), "line\\nbreak");
+        // bind_ip off: no client IP to check
+        let result = manager.verify_and_validate(&token, None);
+        assert!(result.is_ok());
     }
 
     #[test]

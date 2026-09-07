@@ -1,19 +1,24 @@
 //! Shared helpers for reading client request bodies before the upstream handler runs.
 //!
-//! NGINX's access phase executes before the body is buffered. PRECONTENT handlers
-//! (AppSec POST bodies, captcha verification) use [`initiate_body_read`].
+//! NGINX's access phase executes before the body is buffered. ACCESS-phase
+//! AppSec/captcha POST handlers use [`initiate_body_read`].
 
+use ngx::core::Status;
 use ngx::ffi::{
     ngx_buf_t, ngx_chain_t, ngx_http_core_loc_conf_t, ngx_http_core_module,
-    ngx_http_core_run_phases, ngx_http_read_client_request_body, ngx_http_request_t, ngx_int_t,
+    ngx_http_core_run_phases, ngx_http_finalize_request, ngx_http_read_client_request_body,
+    ngx_http_request_t, ngx_int_t,
 };
 use ngx::ngx_log_debug;
-use std::ffi::CStr;
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::Read;
 
 /// Magic stored in [`super::appsec::AppSecBodyContext`].
 pub const APPSEC_BODY_CTX_MAGIC: u32 = 0xA990_5EC1;
+
+/// Magic stored in [`super::captcha::body::CaptchaPostContext`].
+pub const CAPTCHA_POST_CTX_MAGIC: u32 = 0x4350_4F53;
 
 /// Result of extracting a request body after NGINX has read it.
 #[derive(Debug, PartialEq, Eq)]
@@ -110,22 +115,67 @@ pub unsafe fn extract_request_body_limited(
     }
 }
 
+/// Module request-context slot on the main request.
+///
+/// # Safety
+/// Valid NGINX request pointer.
+pub unsafe fn module_ctx_slot(r: *mut ngx_http_request_t) -> *mut *mut c_void {
+    unsafe {
+        let main_r = if (*r).main.is_null() { r } else { (*r).main };
+        let module = &raw const crate::ngx_http_crowdsec_module;
+        (*main_r).ctx.wrapping_add((*module).ctx_index as usize)
+    }
+}
+
+/// First word of the module request ctx, if set (`AppSecBodyContext` / `CaptchaPostContext` magic).
+///
+/// # Safety
+/// Valid NGINX request pointer.
+pub unsafe fn request_ctx_magic(r: *mut ngx_http_request_t) -> Option<u32> {
+    unsafe {
+        if r.is_null() {
+            return None;
+        }
+        let slot = *module_ctx_slot(r);
+        if slot.is_null() {
+            return None;
+        }
+        Some(*(slot as *const u32))
+    }
+}
+
 /// Start asynchronous client body reading; invokes `callback` when complete.
 ///
 /// # Safety
 /// Valid NGINX request pointer. `ctx` is stored in the module request context slot.
 pub unsafe fn initiate_body_read(
     r: *mut ngx_http_request_t,
-    ctx: *mut std::ffi::c_void,
+    ctx: *mut c_void,
     callback: unsafe extern "C" fn(*mut ngx_http_request_t),
 ) -> ngx_int_t {
     unsafe {
-        let main_r = (*r).main;
-        let module = &raw const crate::ngx_http_crowdsec_module;
-        let ctx_ptr = (*main_r).ctx.wrapping_add((*module).ctx_index as usize);
-        *ctx_ptr = ctx;
-
+        *module_ctx_slot(r) = ctx;
         ngx_http_read_client_request_body(r, Some(callback))
+    }
+}
+
+/// Balance `r->main->count++` from [`ngx_http_read_client_request_body`] in ACCESS.
+///
+/// Matches nginx `ngx_http_mirror_module`: after OK/AGAIN, call
+/// `ngx_http_finalize_request(NGX_DONE)` and return `true` so the phase handler
+/// can return `NGX_DONE`. The body callback applies allow/deny. Special responses
+/// already decremented the count in nginx core — callers must not use this helper.
+///
+/// # Safety
+/// Valid NGINX request pointer. `rc` is the return from [`initiate_body_read`].
+pub unsafe fn finish_access_body_read(r: *mut ngx_http_request_t, rc: ngx_int_t) -> bool {
+    unsafe {
+        if rc == ngx::ffi::NGX_OK as ngx_int_t || rc == ngx::ffi::NGX_AGAIN as ngx_int_t {
+            ngx_http_finalize_request(r, Status::NGX_DONE.into());
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -181,7 +231,11 @@ unsafe fn read_temp_file_body(
             return BodyExtractResult::Unreadable;
         }
 
-        let path = match CStr::from_ptr(name.data.cast()).to_str() {
+        let path_bytes = std::slice::from_raw_parts(name.data, name.len);
+        if path_bytes.contains(&0) {
+            return BodyExtractResult::Unreadable;
+        }
+        let path = match std::str::from_utf8(path_bytes) {
             Ok(p) => p,
             Err(_) => return BodyExtractResult::Unreadable,
         };

@@ -44,12 +44,19 @@ pub unsafe fn get_cookie(request: *const ngx_http_request_t, name: &str) -> Opti
             return None;
         }
 
-        let header = &*cookie_header;
-        if header.hash != 0 && !header.value.data.is_null() && header.value.len > 0 {
-            let cookie_data = std::slice::from_raw_parts(header.value.data, header.value.len);
-            if let Ok(cookie_str) = std::str::from_utf8(cookie_data) {
-                return parse_cookie_value(cookie_str, name);
+        // cookies is an ngx_table_elt_t linked list (`elt->next`); scan every Cookie header.
+        let mut cookie_header = headers_in.cookie;
+        while !cookie_header.is_null() {
+            let header = &*cookie_header;
+            if header.hash != 0 && !header.value.data.is_null() && header.value.len > 0 {
+                let cookie_data = std::slice::from_raw_parts(header.value.data, header.value.len);
+                if let Ok(cookie_str) = std::str::from_utf8(cookie_data) {
+                    if let Some(value) = parse_cookie_value(cookie_str, name) {
+                        return Some(value);
+                    }
+                }
             }
+            cookie_header = header.next;
         }
 
         None
@@ -82,17 +89,7 @@ pub fn build_set_cookie(
 ) -> String {
     let mut cookie = format!("{}={}; Max-Age={}; Path={}", name, value, max_age, path);
 
-    if secure {
-        cookie.push_str("; Secure");
-    }
-
-    if http_only {
-        cookie.push_str("; HttpOnly");
-    }
-
-    cookie.push_str("; SameSite=");
-    cookie.push_str(same_site.as_str());
-
+    cookie.push_str(&cookie_attr_suffix(secure, http_only, same_site));
     cookie
 }
 
@@ -108,19 +105,21 @@ pub fn build_clear_cookie_with_attrs(
         "{}=; Max-Age=0; Path={}; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
         name, path
     );
-
-    if secure {
-        cookie.push_str("; Secure");
-    }
-
-    if http_only {
-        cookie.push_str("; HttpOnly");
-    }
-
-    cookie.push_str("; SameSite=");
-    cookie.push_str(same_site.as_str());
-
+    cookie.push_str(&cookie_attr_suffix(secure, http_only, same_site));
     cookie
+}
+
+fn cookie_attr_suffix(secure: bool, http_only: bool, same_site: SameSite) -> String {
+    let mut s = String::new();
+    if secure {
+        s.push_str("; Secure");
+    }
+    if http_only {
+        s.push_str("; HttpOnly");
+    }
+    s.push_str("; SameSite=");
+    s.push_str(same_site.as_str());
+    s
 }
 
 /// Returns true if `headers_out` already has a Set-Cookie for `name`.
