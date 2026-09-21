@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-21
+
+Patch: bump `rustls` 0.23.43 → 0.23.45 so `cargo audit` passes ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285) / GHSA-2mjx-qc3c-rqvc). TLS 1.3 handshake messages packed across a key change in the same record are now rejected. Transitive via `ureq`; no module API change. Full restart is **not** required if you already restarted for 0.5.0.
+
 ## [0.5.0] - 2026-09-21
 
 Minor: AppSec and captcha-provider HTTP run on nginx's native thread pool (workers no longer block on `ureq`), ban and captcha deadlines expire independently, and an AppSec `captcha` action is applied as a ban.

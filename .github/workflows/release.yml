@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   packages: write
+  checks: write
 
 env:
   IMAGE: ghcr.io/laurencejjones/ngx-http-crowdsec-module
