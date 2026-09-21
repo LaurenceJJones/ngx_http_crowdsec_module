@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 type HmacSha256 = Hmac<Sha256>;
 
 /// JWT claims for captcha session
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CaptchaClaims {
     /// Subject - the client IP address (if bind_ip enabled) or "anonymous"
     pub sub: String,
@@ -49,42 +49,13 @@ impl CaptchaClaims {
         }
     }
 
-    /// Serialize claims to JSON
+    /// Serialize claims using the same JSON implementation as LAPI.
     fn to_json(&self) -> String {
-        // Manual JSON serialization to avoid serde dependency overhead
-        let uri_part = match &self.uri {
-            Some(u) => format!(r#","uri":"{}""#, crate::template::escape_json(u)),
-            None => String::new(),
-        };
-        format!(
-            r#"{{"sub":"{}","iat":{},"exp":{},"typ":"{}","nonce":"{}"{}}}"#,
-            crate::template::escape_json(&self.sub),
-            self.iat,
-            self.exp,
-            self.typ,
-            self.nonce,
-            uri_part
-        )
+        serde_json::to_string(self).expect("captcha claims contain only JSON-compatible values")
     }
 
-    /// Parse claims from JSON
     fn from_json(json: &str) -> Option<Self> {
-        // Simple JSON parsing without full serde
-        let sub = extract_json_string(json, "sub")?;
-        let iat = extract_json_number(json, "iat")?;
-        let exp = extract_json_number(json, "exp")?;
-        let typ = extract_json_string(json, "typ")?;
-        let nonce = extract_json_string(json, "nonce")?;
-        let uri = extract_json_string(json, "uri");
-
-        Some(Self {
-            sub,
-            iat,
-            exp,
-            typ,
-            uri,
-            nonce,
-        })
+        serde_json::from_str(json).ok()
     }
 }
 
@@ -98,79 +69,6 @@ fn generate_nonce() -> String {
 /// Encode bytes as lowercase hex string
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// Extract a string value from JSON by key (simple parser)
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!(r#""{}":""#, key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = &json[start..];
-
-    // Find closing quote, handling escapes
-    let mut end = 0;
-    let mut escaped = false;
-    for (i, c) in rest.chars().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if c == '\\' {
-            escaped = true;
-            continue;
-        }
-        if c == '"' {
-            end = i;
-            break;
-        }
-    }
-
-    let value = &rest[..end];
-    Some(unescape_json_string(value))
-}
-
-/// Extract a number value from JSON by key
-fn extract_json_number(json: &str, key: &str) -> Option<i64> {
-    let pattern = format!(r#""{}":"#, key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = &json[start..];
-
-    // Find end of number
-    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-')?;
-    rest[..end].parse().ok()
-}
-
-/// Unescape a JSON string value
-fn unescape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('"') => result.push('"'),
-                Some('\\') => result.push('\\'),
-                Some('n') => result.push('\n'),
-                Some('r') => result.push('\r'),
-                Some('t') => result.push('\t'),
-                Some('u') => {
-                    // Parse \uXXXX
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                        if let Some(c) = char::from_u32(code) {
-                            result.push(c);
-                        }
-                    }
-                }
-                Some(other) => {
-                    result.push('\\');
-                    result.push(other);
-                }
-                None => result.push('\\'),
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }
 
 /// JWT error types
@@ -299,6 +197,17 @@ impl JwtManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_and_escaped_uri_roundtrip() {
+        let manager = JwtManager::new([42; 32]);
+        for uri in ["/é", "/日本語", "/😀", "/quote\"\\\\"] {
+            let claims = CaptchaClaims::new(Some("192.0.2.1"), 3600, Some(uri));
+            let token = manager.create_token(&claims).unwrap();
+            assert_eq!(manager.verify_token(&token).unwrap(), claims);
+        }
+        assert!(CaptchaClaims::from_json("{}").is_none());
+    }
 
     #[test]
     fn test_claims_creation() {

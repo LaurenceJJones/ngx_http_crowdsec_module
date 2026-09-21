@@ -47,10 +47,10 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_appsec_always` | http, server, location | `off` | Run AppSec even when the client IP has a ban/captcha decision |
 | `crowdsec_static_extensions` | http, server, location | `.ico` | File extensions that skip HTML ban/captcha pages (e.g. `.css`, `.js`); use `off` to disable |
 | `crowdsec_appsec_api_key` | http | - | Defaults to `crowdsec_api_key` |
-| `crowdsec_appsec_timeout` | http | `1000` | AppSec timeout (ms). **Blocks the NGINX worker** for this long on each AppSec call. |
+| `crowdsec_appsec_timeout` | http | `1000` | AppSec timeout (ms). Runs on nginx's `default` thread pool; does not block the request event loop. |
 | `crowdsec_appsec_max_body_size` | http | `10m` | Max body forwarded to AppSec |
-| `crowdsec_appsec_failure_action` | http, server, location | `passthrough` | Action when AppSec is unreachable |
-| `crowdsec_appsec_drop_unreadable_body` | http | `off` | Reject bodies that cannot be buffered |
+| `crowdsec_appsec_failure_action` | http, server, location | `passthrough` | When AppSec is unreachable or returns a non-403 error: `passthrough` or `deny` (`deny` uses the ban template / `crowdsec_ban_action`) |
+| `crowdsec_appsec_drop_unreadable_body` | http | `off` | When `on`, unreadable bodies are denied with the ban template |
 | `crowdsec_bot_challenge` | http, server, location | `off` | CrowdSec 1.8 bot challenge (experimental) |
 | `crowdsec_usage_metrics_interval` | http | `900` | Push bouncer metrics to LAPI (`POST /v1/usage-metrics`); `off` disables. Pending counters are flushed on worker shutdown (reload/stop). |
 | `crowdsec_metrics` | location | `off` | Expose Prometheus metrics at **this** location only (does not inherit). Pair with `crowdsec off`. |
@@ -138,7 +138,13 @@ crowdsec_appsec_failure_action passthrough;
 crowdsec_bot_challenge on;  # experimental — CrowdSec 1.8
 ```
 
-Request bodies (POST/PUT/PATCH/DELETE, and any method with a body) are inspected in the **PRECONTENT** phase so `proxy_pass` keeps the correct content handler. Keep `crowdsec_appsec_timeout` in the tens of milliseconds if you cannot accept a blocked worker; captcha provider verify is also synchronous on the worker (5s timeout). Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin. IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`) are treated as IPv4 for bans, bypass, and trusted proxies.
+Request bodies (POST/PUT/PATCH/DELETE, and any method with a body) are inspected in the **PRECONTENT** phase so `proxy_pass` keeps the correct content handler. AppSec and captcha-provider HTTP calls run on nginx's native `default` thread pool; they do not block its request event loop. The module requires nginx built with `--with-threads` (check `nginx -V`). Captcha-provider calls have a five-second timeout; AppSec uses `crowdsec_appsec_timeout`.
+
+The pool can be sized with nginx's main-context directive, for example `thread_pool default threads=4 max_queue=128;` outside `http {}`. A full queue uses the configured AppSec/captcha failure policy. Queue wait is additional to the HTTP timeout, so bound the queue for your workload.
+
+AppSec `captcha` responses are treated as bans: solving a stream captcha never bypasses a WAF rule. Captcha verification is supported only for LAPI stream decisions. Once verified, all application methods and bodies pass through normally; only the verification submission receives a 303 redirect.
+
+Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin. IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`) are treated as IPv4 for bans, bypass, and trusted proxies.
 
 ## Client IP behind a reverse proxy
 
@@ -242,7 +248,7 @@ cscli bouncers list
 grep 'decisions/stream' /var/log/crowdsec.log | tail -5
 
 # Prometheus (if crowdsec_metrics is enabled on a location)
-curl -s http://127.0.0.1/metrics | grep crowdsec_lapi_poll
+curl -s http://127.0.0.1/crowdsec-metrics | grep -E 'crowdsec_lapi_stream|crowdsec_appsec_'
 ```
 
 Look for `ngx_http_crowdsec_module/<version>` as the User-Agent on stream and usage-metrics requests (not `ureq`).

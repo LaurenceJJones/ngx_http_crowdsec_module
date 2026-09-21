@@ -132,6 +132,7 @@ impl MainConfig {
 pub enum AppSecFailureAction {
     #[default]
     Passthrough,
+    /// Fail closed: same ban page / redirect as an AppSec `ban` verdict.
     Deny,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

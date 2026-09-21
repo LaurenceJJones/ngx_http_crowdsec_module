@@ -1,0 +1,54 @@
+# Build libngx_http_crowdsec_module.so against Debian 13 (trixie) apt nginx 1.26.x.
+# Matches hosts like Debian 13 + nginx/1.26.3 (Debian).
+#
+# Usage: scripts/build-debian-trixie-module.sh
+
+FROM debian:trixie AS builder
+ARG RUST_VERSION=1.98.0
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    libpcre2-dev \
+    zlib1g-dev \
+    clang \
+    llvm \
+    dpkg-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain "${RUST_VERSION}"
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+RUN rustc --version
+
+# Trixie uses deb822 sources; enable deb-src so `apt-get source nginx` works.
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources; \
+    else \
+      echo 'deb-src http://deb.debian.org/debian trixie main' >> /etc/apt/sources.list; \
+    fi
+
+WORKDIR /usr/src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx-dev \
+    && apt-get source nginx \
+    && src="$(find /usr/src -maxdepth 1 -type d -name 'nginx-*' | head -1)" \
+    && test -n "$src" \
+    && mv "$src" /usr/src/nginx-src \
+    && cd /usr/src/nginx-src \
+    && ./configure --with-compat --with-threads --with-cc-opt="-fPIC" --with-ld-opt="-fPIC"
+
+ENV NGINX_SOURCE_DIR=/usr/src/nginx-src
+ENV NGINX_BUILD_DIR=/usr/src/nginx-src/objs
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock* ./
+COPY src ./src
+COPY tests/unit ./tests/unit
+
+RUN cargo build --release --locked

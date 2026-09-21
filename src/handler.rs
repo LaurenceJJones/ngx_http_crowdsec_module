@@ -3,7 +3,7 @@ use crate::captcha::cookie::{
     should_cookie_be_secure,
 };
 use crate::captcha::handler::{
-    captcha_return_uri, captcha_session_valid, send_captcha_page, send_see_other_redirect,
+    captcha_session_valid, send_captcha_page,
 };
 use crate::captcha;
 use crate::config::{BanActionMode, FallbackRemediation, LocConfig, MainConfig, UnenforceableAction};
@@ -182,6 +182,12 @@ pub fn handle_precontent(
         return HandlerResult::Declined;
     }
 
+    // A deferred stream captcha may have followed AppSec in this phase. Its
+    // completion must not run AppSec (and then verification) a second time.
+    if let Some(result) = unsafe { captcha::body::resume_body_read(r) } {
+        return result;
+    }
+
     let client_ip = match get_client_ip(request, main_conf) {
         Some(ip) => ip,
         None => return HandlerResult::Error,
@@ -323,19 +329,7 @@ pub(crate) fn handle_captcha_decision(
     };
 
     if captcha_session_valid(request, &captcha_config, client_ip) {
-        // Static origins often only allow GET — never pass captcha POST through.
-        if matches!(
-            request.method(),
-            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-        ) {
-            let uri = captcha_return_uri(request);
-            return if send_see_other_redirect(request, &uri).is_ok() {
-                HandlerResult::Done
-            } else {
-                HandlerResult::Forbidden
-            };
-        }
-        return HandlerResult::Declined; // Valid session, allow GET/HEAD through
+        return HandlerResult::Declined;
     }
 
     usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);

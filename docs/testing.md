@@ -10,11 +10,11 @@ docker build -f docker/Dockerfile -t nginx-crowdsec:test .
 ./scripts/test-bats-ci.sh
 ```
 
-Same command as [.github/workflows/ci.yml](../.github/workflows/ci.yml). Expect **21 BATS tests** (~5–8 min).
+Same command as [.github/workflows/ci.yml](../.github/workflows/ci.yml). Expect **24 BATS tests** (~5–8 min).
 
 | Tier | Script | Stack | Tests |
 |------|--------|-------|-------|
-| Integration | `scripts/test-bats-integration.sh` | CrowdSec v1.8.1 + AppSec | 19 |
+| Integration | `scripts/test-bats-integration.sh` | CrowdSec v1.8.1 + AppSec | 22 |
 | Challenge | `scripts/test-bats-challenge.sh` | Bot-challenge collection | 2 |
 
 Run one tier: `./scripts/test-bats-integration.sh` or `./scripts/test-bats-challenge.sh`.
@@ -37,9 +37,21 @@ Run one tier: `./scripts/test-bats-integration.sh` or `./scripts/test-bats-chall
 
 Tests live under `tests/bats/{integration,challenge}/`. Shared helpers: `tests/lib/`.
 
+### Rust and request-lifecycle checks
+
+Run the pure Rust tests locally without nginx headers or linking:
+
+```bash
+cargo test -p crowdsec-unit-tests --locked
+```
+
+This workspace member imports the production source files directly and shares the root lockfile. It executes JWT, template, provider, protocol, and independent decision-expiry tests.
+
+The Docker builder also runs `python3 tests/regression.py` against a real, single-worker nginx and local mock services. It checks valid captcha-session writes, AppSec captcha bans, slow verification, client disconnects, IP/CIDR expiry, metrics during uploads, and reloads. These regressions use no host bind mounts.
+
 ### Other checks (CI)
 
-- `cargo check --tests` in the Docker builder stage
+- `cargo check --tests` for nginx-dependent test targets in the Docker builder stage
 - `cargo audit` on dependencies
 
 ---
@@ -107,6 +119,6 @@ Target config: `docker/nginx.hubtest.conf`, `docker/compose.hubtest.yml`.
 
 | Layer | Scope | Where | Status |
 |-------|--------|-------|--------|
-| CI BATS | Feature smoke + real CrowdSec paths | GitHub Actions | 21/21 pass |
+| CI BATS | Feature smoke + real CrowdSec paths | GitHub Actions | 24/24 pass |
 | Hub catalog | Rules with nuclei tests defined | Local | 95% (210/222 rules) |
 | Hub execution | AppSec blocks all positive probes | Local | **100% (211/211)** |

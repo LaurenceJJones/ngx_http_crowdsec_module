@@ -87,8 +87,7 @@ pub fn verify_captcha(
         url_encode(remote_ip),
     );
 
-    // Make HTTP request (blocking - runs in NGINX worker)
-    // Use a short timeout since this blocks the worker
+    // Called on nginx's native thread pool, never on the request event loop.
     let result = AGENT
         .post(url)
         .set("Content-Type", "application/x-www-form-urlencoded")

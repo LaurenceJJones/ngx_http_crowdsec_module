@@ -11,6 +11,7 @@ mod appsec;
 mod captcha;
 mod conf;
 mod config;
+mod expiry;
 mod lapi;
 mod handler;
 mod metrics;
@@ -20,6 +21,7 @@ mod response;
 pub mod shm;
 mod stream;
 mod template;
+mod thread_task;
 mod types;
 mod usage_metrics;
 
@@ -138,6 +140,9 @@ impl HttpModule for Module {
 
     unsafe extern "C" fn postconfiguration(cf: *mut ngx_conf_t) -> ngx_int_t {
         unsafe {
+            if !thread_task::configure(cf) {
+                return Status::NGX_ERROR.into();
+            }
             // Get the main configuration
             let conf = match Self::main_conf_mut(&mut *cf) {
                 Some(c) => c,
@@ -263,6 +268,16 @@ pub unsafe extern "C" fn ngx_http_crowdsec_init_worker(_cycle: *mut ngx_cycle_t)
 /// This function is called by NGINX and must follow C calling conventions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ngx_http_crowdsec_exit_worker(_cycle: *mut ngx_cycle_t) {
+    // Join the polling/standby thread before nginx destroys the cycle pool.
+    if let Some((handle, running)) = POLLING_HANDLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        running.store(false, Ordering::SeqCst);
+        let _ = handle.join();
+    }
+
     if shm::is_poller() {
         if let Some(config) = GLOBAL_CONFIG
             .lock()
@@ -278,15 +293,6 @@ pub unsafe extern "C" fn ngx_http_crowdsec_exit_worker(_cycle: *mut ngx_cycle_t)
         }
     }
 
-    // Join the polling/standby thread before nginx destroys the cycle pool.
-    if let Some((handle, running)) = POLLING_HANDLE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-    {
-        running.store(false, Ordering::SeqCst);
-        let _ = handle.join();
-    }
     shm::release_poller();
 }
 

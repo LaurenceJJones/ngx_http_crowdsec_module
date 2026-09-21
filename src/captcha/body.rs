@@ -5,15 +5,15 @@
 
 use crate::captcha::config::CaptchaConfig;
 use crate::captcha::cookie::{SameSite, build_set_cookie, should_cookie_be_secure};
+use crate::captcha::handler::{captcha_return_uri, captcha_template_vars};
 use crate::captcha::jwt::JwtManager;
 use crate::captcha::verifier::{VerifyResult, parse_captcha_response, verify_captcha};
 use crate::handler::{HandlerResult, StoredPhaseResult};
 use crate::request_body::{
     BodyExtractResult, CAPTCHA_POST_CTX_MAGIC, extract_request_body_limited, finalize_allow,
-    finish_phase_body_read, get_content_length, get_request_log, initiate_body_read as start_body_read,
-    module_ctx_slot, request_ctx_magic,
+    finish_phase_body_read, get_content_length, get_request_log,
+    initiate_body_read as start_body_read, module_ctx_slot, request_ctx_magic,
 };
-use crate::captcha::handler::{captcha_return_uri, captcha_template_vars};
 use crate::template::Template;
 use ngx::ffi::{
     NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_buf_t, ngx_http_finalize_request, ngx_http_request_t,
@@ -151,6 +151,9 @@ impl CaptchaPostContext {
         result: HandlerResult,
     ) {
         unsafe {
+            if matches!(result, HandlerResult::Done | HandlerResult::BodyReadPending) {
+                return;
+            }
             let ctx_mut = *ctx_ptr as *mut CaptchaPostContext;
             if !ctx_mut.is_null() {
                 (*ctx_mut).store_result(result);
@@ -256,26 +259,22 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
 
         let request = Request::from_ngx_http_request(main_r);
         let uri = captcha_return_uri(&request);
-        let template = match crate::crowdsec_loc_conf(&request).and_then(|l| l.captcha_template.as_ref())
-        {
-            Some(t) => t.clone(),
-            None => {
-                ngx_log_debug!(log, "crowdsec: captcha template missing in body handler");
-                finish(HandlerResult::Error);
-                return;
-            }
-        };
+        let template =
+            match crate::crowdsec_loc_conf(&request).and_then(|l| l.captcha_template.as_ref()) {
+                Some(t) => t.clone(),
+                None => {
+                    ngx_log_debug!(log, "crowdsec: captcha template missing in body handler");
+                    finish(HandlerResult::Error);
+                    return;
+                }
+            };
 
         let send_error = |msg: &str| {
             send_captcha_error_page(r, &template, &config, &client_ip, &uri, msg);
             finish(HandlerResult::Done);
         };
 
-        let body = match extract_request_body_limited(
-            r,
-            MAX_CAPTCHA_BODY_SIZE as usize,
-            false,
-        ) {
+        let body = match extract_request_body_limited(r, MAX_CAPTCHA_BODY_SIZE as usize, false) {
             BodyExtractResult::Ok(body) => body,
             _ => {
                 send_error("Request too large or unreadable.");
@@ -297,14 +296,72 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
             }
         };
 
-        let result = verify_captcha(
-            config.provider,
-            &config.secret_key,
-            &captcha_response,
-            client_ip_str,
+        let provider = config.provider;
+        let secret = config.secret_key.clone();
+        let remote_ip = client_ip_str.to_string();
+        let posted = crate::thread_task::post(
+            r,
+            move || verify_captcha(provider, &secret, &captcha_response, &remote_ip),
+            |r, result| {
+                complete_verification(r, result.unwrap_or_else(|_| verification_unavailable()));
+            },
         );
+        if posted.is_err() {
+            complete_verification(r, verification_unavailable());
+        }
+    }
+}
 
-        ngx_log_debug!(log, "crowdsec: verification result: {:?}", result);
+fn verification_unavailable() -> VerifyResult {
+    VerifyResult::Error(crate::captcha::verifier::VerifyError::NetworkError(
+        "verification thread pool unavailable".to_string(),
+    ))
+}
+
+unsafe fn complete_verification(r: *mut ngx_http_request_t, result: VerifyResult) {
+    unsafe {
+        let log = get_request_log(r);
+        let main_r = if (*r).main.is_null() { r } else { (*r).main };
+        let ctx_ptr = module_ctx_slot(r);
+        let ctx = *ctx_ptr as *const CaptchaPostContext;
+
+        if ctx.is_null() || (*ctx).magic != CAPTCHA_POST_CTX_MAGIC {
+            ngx_log_debug!(log, "crowdsec: captcha context is invalid in body handler");
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+            return;
+        }
+
+        let context = &*ctx;
+        let finish = |result: HandlerResult| context.finish(r, ctx_ptr, result);
+
+        let config = context.to_config();
+        let client_ip_str = context.client_ip_str();
+
+        let client_ip: IpAddr = match client_ip_str.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                ngx_log_debug!(log, "crowdsec: failed to parse client IP from context");
+                finish(HandlerResult::Error);
+                return;
+            }
+        };
+
+        let request = Request::from_ngx_http_request(main_r);
+        let uri = captcha_return_uri(&request);
+        let template =
+            match crate::crowdsec_loc_conf(&request).and_then(|l| l.captcha_template.as_ref()) {
+                Some(t) => t.clone(),
+                None => {
+                    ngx_log_debug!(log, "crowdsec: captcha template missing in body handler");
+                    finish(HandlerResult::Error);
+                    return;
+                }
+            };
+
+        let send_error = |msg: &str| {
+            send_captcha_error_page(r, &template, &config, &client_ip, &uri, msg);
+            finish(HandlerResult::Done);
+        };
 
         match result {
             VerifyResult::Success => {
@@ -467,7 +524,12 @@ unsafe fn send_captcha_error_page(
     error_message: &str,
 ) {
     unsafe {
-        let vars = captcha_template_vars(config, client_ip, form_action.to_string(), Some(error_message));
+        let vars = captcha_template_vars(
+            config,
+            client_ip,
+            form_action.to_string(),
+            Some(error_message),
+        );
         let body = template.render(&vars).into_bytes();
         send_buffered_response(
             r,

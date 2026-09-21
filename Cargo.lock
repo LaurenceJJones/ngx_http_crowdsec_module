@@ -125,6 +125,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crowdsec-unit-tests"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "hmac",
+ "rand",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq 2.12.1",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -502,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "ngx_http_crowdsec_module"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "base64",
  "form_urlencoded",

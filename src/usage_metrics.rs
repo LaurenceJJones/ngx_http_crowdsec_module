@@ -141,19 +141,6 @@ fn buckets_ptr(header: *mut UsageMetricsHeader) -> *mut UsageBucket {
 }
 
 fn bucket_inc(key: BucketKey, delta: u64) {
-    bucket_write(key, BucketOp::Inc(delta));
-}
-
-fn bucket_set(key: BucketKey, value: u64) {
-    bucket_write(key, BucketOp::Set(value));
-}
-
-enum BucketOp {
-    Inc(u64),
-    Set(u64),
-}
-
-fn bucket_write(key: BucketKey, op: BucketOp) {
     let Some(header) = header_ptr() else {
         return;
     };
@@ -178,14 +165,7 @@ fn bucket_write(key: BucketKey, op: BucketOp) {
                 && bucket.origin_len == key.origin_len
                 && bucket.origin[..key.origin_len as usize] == key.origin[..key.origin_len as usize]
             {
-                match op {
-                    BucketOp::Inc(delta) => {
-                        bucket.value.fetch_add(delta, Ordering::Relaxed);
-                    }
-                    BucketOp::Set(value) => {
-                        bucket.value.store(value, Ordering::Release);
-                    }
-                }
+                bucket.value.fetch_add(delta, Ordering::Relaxed);
                 return;
             }
         }
@@ -195,16 +175,13 @@ fn bucket_write(key: BucketKey, op: BucketOp) {
                 .compare_exchange(0, hash, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                let initial = match op {
-                    BucketOp::Inc(delta) | BucketOp::Set(delta) => delta,
-                };
                 unsafe {
                     let b = &mut *buckets.add(idx);
                     b.kind = key.kind;
                     b.ip_type = key.ip_type;
                     b.origin_len = key.origin_len;
                     b.origin = key.origin;
-                    b.value.store(initial, Ordering::Release);
+                    b.value.store(delta, Ordering::Release);
                     b.ready.store(1, Ordering::Release);
                 }
                 return;
@@ -212,9 +189,7 @@ fn bucket_write(key: BucketKey, op: BucketOp) {
         }
         idx = (idx + 1) % count;
         if idx == start {
-            if matches!(op, BucketOp::Inc(_)) {
-                crowdsec_warn!(cycle_log(), "crowdsec: usage metrics bucket table full");
-            }
+            crowdsec_warn!(cycle_log(), "crowdsec: usage metrics bucket table full");
             return;
         }
     }
@@ -262,39 +237,6 @@ pub fn record_startup() {
             .startup_unix_secs
             .compare_exchange(0, unix_now(), Ordering::SeqCst, Ordering::SeqCst)
             .ok();
-    }
-}
-
-fn clear_kind_buckets(kind: u8) {
-    let Some(header) = header_ptr() else {
-        return;
-    };
-    let buckets = buckets_ptr(header);
-    let count = unsafe { (*header).bucket_count as usize };
-    for i in 0..count {
-        let bucket = unsafe { &*buckets.add(i) };
-        if bucket.key_hash.load(Ordering::Acquire) == 0 || bucket.ready.load(Ordering::Acquire) == 0 {
-            continue;
-        }
-        if bucket.kind == kind {
-            unsafe {
-                let b = &mut *buckets.add(i);
-                b.key_hash.store(0, Ordering::Release);
-                b.ready.store(0, Ordering::Release);
-                b.value.store(0, Ordering::Release);
-            }
-        }
-    }
-}
-
-fn refresh_active_decisions() {
-    clear_kind_buckets(KIND_ACTIVE);
-    for (origin, scenario_id, ip_type, count) in shm::count_active_decisions_by_origin() {
-        let label = origin_label(origin, scenario_id);
-        bucket_set(
-            BucketKey::from_labels(KIND_ACTIVE, ip_type, &label),
-            count,
-        );
     }
 }
 
@@ -388,6 +330,14 @@ fn collect_items() -> Vec<(BucketKey, u64)> {
             value,
         ));
     }
+    // Gauges are computed per upload; only cumulative counters occupy SHM.
+    let mut active = HashMap::new();
+    for (origin, scenario_id, ip_type, count) in shm::count_active_decisions_by_origin() {
+        let label = origin_label(origin, scenario_id);
+        let key = BucketKey::from_labels(KIND_ACTIVE, ip_type, &label);
+        *active.entry(key).or_insert(0) += count;
+    }
+    out.extend(active);
     out
 }
 
@@ -407,13 +357,15 @@ fn reset_after_push(items: &[(BucketKey, u64)]) {
         let start = idx;
         loop {
             let bucket = unsafe { &*buckets.add(idx) };
-            if bucket.key_hash.load(Ordering::Acquire) == hash {
-                if key.kind == KIND_PROCESSED {
-                    bucket.value.fetch_sub(*value, Ordering::Relaxed);
-                } else if key.kind == KIND_DROPPED {
-                    bucket.key_hash.store(0, Ordering::Release);
-                    bucket.value.store(0, Ordering::Release);
-                }
+            if bucket.key_hash.load(Ordering::Acquire) == hash
+                && bucket.ready.load(Ordering::Acquire) != 0
+                && bucket.kind == key.kind
+                && bucket.ip_type == key.ip_type
+                && bucket.origin_len == key.origin_len
+                && bucket.origin == key.origin
+            {
+                // Keep increments received while the HTTP upload was in flight.
+                bucket.value.fetch_sub(*value, Ordering::Relaxed);
                 break;
             }
             idx = (idx + 1) % count;
@@ -424,10 +376,10 @@ fn reset_after_push(items: &[(BucketKey, u64)]) {
     }
 }
 
-fn build_payload(window_secs: u64, now: u64, startup: u64, os_name: &str, os_version: &str) -> String {
+fn build_payload(items: &[(BucketKey, u64)], window_secs: u64, now: u64, startup: u64, os_name: &str, os_version: &str) -> String {
     let mut metric_items = Vec::new();
 
-    for (key, value) in collect_items() {
+    for &(key, value) in items {
         let ip_label = ip_type_label(key.ip_type).to_string();
         let origin = std::str::from_utf8(&key.origin[..key.origin_len as usize])
             .unwrap_or("")
@@ -513,8 +465,6 @@ pub fn push_to_lapi(
         return Ok(());
     };
 
-    refresh_active_decisions();
-
     let now = unix_now();
     let startup = unsafe {
         header
@@ -542,7 +492,7 @@ pub fn push_to_lapi(
     }
 
     let (os_name, os_version) = read_os_info();
-    let body = build_payload(window, now, startup, &os_name, &os_version);
+    let body = build_payload(&items, window, now, startup, &os_name, &os_version);
     let url = format!(
         "{}/v1/usage-metrics",
         lapi_url.trim_end_matches('/')
@@ -720,7 +670,7 @@ mod tests {
 
     #[test]
     fn payload_serializes_feature_flags_array() {
-        let json = build_payload(900, 1_700_000_000, 1_699_999_000, "Fedora", "43");
+        let json = build_payload(&[], 900, 1_700_000_000, 1_699_999_000, "Fedora", "43");
         assert!(json.contains("\"feature_flags\":[]"));
         assert!(json.contains("\"type\":\"nginx-module\""));
         assert!(json.contains("/v1/usage-metrics") == false);

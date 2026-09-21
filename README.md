@@ -85,7 +85,7 @@ AppSec, captcha, templates, proxies: [docs/configuration.md](docs/configuration.
 docker build -f docker/Dockerfile -t nginx-crowdsec .
 ```
 
-From source: set `NGINX_SOURCE_DIR` / `NGINX_BUILD_DIR`, then `cargo build --release`. See [docker/Dockerfile](docker/Dockerfile).
+From source: nginx must be configured with `--with-threads`; set `NGINX_SOURCE_DIR` / `NGINX_BUILD_DIR`, then `cargo build --release`. See [docker/Dockerfile](docker/Dockerfile). Upgrading to the new per-remediation expiry layout requires a full nginx restart.
 
 ## License
 

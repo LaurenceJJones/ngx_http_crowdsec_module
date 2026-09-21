@@ -29,10 +29,10 @@ const SHM_MAGIC: u32 = u32::from_le_bytes(*b"CsD1");
 
 /// Increment when `ShmData` / `ShmHashEntry` / string table layout changes incompatibly.
 /// Reload reuses the zone pointer only when this matches; otherwise require a full restart.
-const SHM_LAYOUT_VERSION: u32 = 3;
+const SHM_LAYOUT_VERSION: u32 = 4;
 
 const METRICS_MAGIC: u32 = u32::from_le_bytes(*b"CsM1");
-const METRICS_LAYOUT_VERSION: u32 = 1;
+const METRICS_LAYOUT_VERSION: u32 = 2;
 
 /// Percentage of SHM to use for entries (rest is overhead)
 const USABLE_MEMORY_PERCENT: usize = 70;
@@ -232,7 +232,7 @@ impl ShmScenario {
 /// Hash table entry for IP decisions
 /// Stores both individual IPs and CIDR ranges in the same table
 /// Supports multiple decision types per IP via bitmask
-/// Size: 48 bytes (includes alignment padding for i64)
+/// Size: 56 bytes (includes independent remediation deadlines).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ShmHashEntry {
@@ -253,9 +253,8 @@ pub struct ShmHashEntry {
     pub _pad: [u8; 3],
     /// IP address bytes (network address for CIDR)
     pub addr: [u8; 16],
-    /// Expiration timestamp (seconds since epoch), 0 = no expiry
-    /// This is the maximum expiry across all active decision types
-    pub expires: i64,
+    /// Independent ban/captcha deadlines; zero means no expiry.
+    pub expires: crate::expiry::DecisionExpiry,
     /// Scenario ID (index into scenario table), 0 = no scenario
     pub scenario_id: u16,
 }
@@ -271,7 +270,7 @@ impl ShmHashEntry {
             prefix_len: 0,
             _pad: [0; 3],
             addr: [0; 16],
-            expires: 0,
+            expires: crate::expiry::DecisionExpiry::empty(),
             scenario_id: 0,
         }
     }
@@ -364,11 +363,12 @@ impl ShmHashEntry {
         Origin::from_u8(self.origin)
     }
 
+    pub fn decision_type_at(&self, now: i64) -> DecisionType {
+        DecisionType::from_bitmask(self.expires.active_mask(self.decision_types, now))
+    }
+
     pub fn is_expired_at(&self, now: i64) -> bool {
-        if self.expires == 0 {
-            return false; // No expiry
-        }
-        now > self.expires
+        self.expires.active_mask(self.decision_types, now) == 0
     }
 }
 
@@ -459,7 +459,10 @@ impl DecisionsSharedZone {
     ///
     /// # Safety
     /// Valid `ngx_conf_t` from NGINX configuration parsing.
-    pub unsafe fn request(&mut self, cf: *mut ngx::ffi::ngx_conf_t) -> Result<*mut ngx_shm_zone_t, ()> {
+    pub unsafe fn request(
+        &mut self,
+        cf: *mut ngx::ffi::ngx_conf_t,
+    ) -> Result<*mut ngx_shm_zone_t, ()> {
         unsafe {
             match self {
                 Self::Configured(size) => {
@@ -529,6 +532,9 @@ pub struct MetricsShm {
     pub lapi_poll_err: AtomicU64,
     /// Unix seconds when the stream poller last completed a successful LAPI poll (`0` = never).
     pub lapi_last_success_unix_secs: AtomicU64,
+    pub appsec_requests: AtomicU64,
+    pub appsec_blocks: AtomicU64,
+    pub appsec_errors: AtomicU64,
 }
 
 static METRICS_SHM_ZONE: AtomicPtr<ngx_shm_zone_t> = AtomicPtr::new(ptr::null_mut());
@@ -764,7 +770,10 @@ unsafe extern "C" fn decisions_shm_zone_init(
         let scenarios_size = scenario_size * MAX_SCENARIOS;
         let scenarios_ptr = ngx_slab_alloc_locked(shpool, scenarios_size);
         if scenarios_ptr.is_null() {
-            crowdsec_error!(cycle_log(), "crowdsec: failed to allocate SHM scenario table");
+            crowdsec_error!(
+                cycle_log(),
+                "crowdsec: failed to allocate SHM scenario table"
+            );
             return ngx::ffi::NGX_ERROR as ngx_int_t;
         }
 
@@ -1085,7 +1094,7 @@ pub fn lookup_ip(ip: &IpAddr) -> LookupResult {
             if !entry.is_expired_at(now) {
                 let result = LookupResult {
                     found: true,
-                    decision_type: entry.decision_type(),
+                    decision_type: entry.decision_type_at(now),
                     origin: entry.origin(),
                     scenario_id: entry.scenario_id,
                 };
@@ -1128,7 +1137,7 @@ unsafe fn lookup_cidr_v4(
                 if !entry.is_expired_at(now) {
                     return LookupResult {
                         found: true,
-                        decision_type: entry.decision_type(),
+                        decision_type: entry.decision_type_at(now),
                         origin: entry.origin(),
                         scenario_id: entry.scenario_id,
                     };
@@ -1168,7 +1177,7 @@ unsafe fn lookup_cidr_v6(
                 if !entry.is_expired_at(now) {
                     return LookupResult {
                         found: true,
-                        decision_type: entry.decision_type(),
+                        decision_type: entry.decision_type_at(now),
                         origin: entry.origin(),
                         scenario_id: entry.scenario_id,
                     };
@@ -1224,12 +1233,9 @@ pub fn add_decision(info: &DecisionInfo) {
         if found {
             // Merge with existing entry - add decision type to bitmask
             let entry = &mut *entries.add(idx as usize);
+            entry.expires.merge(entry.decision_types, decision_bit, expires);
             entry.decision_types |= decision_bit;
             entry.origin = info.origin as u8;
-            // Keep the longer expiry
-            if expires > entry.expires {
-                entry.expires = expires;
-            }
             // Update scenario if provided
             if scenario_id != 0 {
                 entry.scenario_id = scenario_id;
@@ -1244,7 +1250,7 @@ pub fn add_decision(info: &DecisionInfo) {
         new_entry.hash = hash;
         new_entry.decision_types = decision_bit;
         new_entry.origin = info.origin as u8;
-        new_entry.expires = expires;
+        new_entry.expires.merge(0, decision_bit, expires);
         new_entry.scenario_id = scenario_id;
         new_entry.flags = 0;
 
@@ -1338,11 +1344,9 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         if found {
             // Merge with existing entry - add decision type to bitmask
             let entry = &mut *entries.add(idx as usize);
+            entry.expires.merge(entry.decision_types, decision_bit, expires);
             entry.decision_types |= decision_bit;
             entry.origin = info.origin as u8;
-            if expires > entry.expires {
-                entry.expires = expires;
-            }
             if scenario_id != 0 {
                 entry.scenario_id = scenario_id;
             }
@@ -1358,7 +1362,7 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
         new_entry.prefix_len = info.prefix_len;
         new_entry.decision_types = decision_bit;
         new_entry.origin = info.origin as u8;
-        new_entry.expires = expires;
+        new_entry.expires.merge(0, decision_bit, expires);
         new_entry.scenario_id = scenario_id;
         new_entry.flags = FLAG_IS_CIDR;
 
@@ -1376,7 +1380,10 @@ pub fn add_cidr_decision(info: &CidrDecisionInfo) {
             None => match evict_clock(shm_data) {
                 Some(evicted) => evicted,
                 None => {
-                    crowdsec_warn!(cycle_log(), "crowdsec: hash table full, cannot add CIDR entry");
+                    crowdsec_warn!(
+                        cycle_log(),
+                        "crowdsec: hash table full, cannot add CIDR entry"
+                    );
                     ngx_rwlock_unlock(&mut (*shm_data).lock);
                     return;
                 }
@@ -1597,12 +1604,7 @@ pub fn try_become_poller() -> bool {
 
         let current = poller_atomic.load(Ordering::SeqCst);
         if current != 0 && current != my_pid && !process_alive(current as i32) {
-            let _ = poller_atomic.compare_exchange(
-                current,
-                0,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+            let _ = poller_atomic.compare_exchange(current, 0, Ordering::SeqCst, Ordering::SeqCst);
         }
 
         match poller_atomic.compare_exchange(0, my_pid, Ordering::SeqCst, Ordering::SeqCst) {
@@ -1623,7 +1625,10 @@ fn process_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+    unsafe {
+        libc::kill(pid, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
 }
 
 /// Check if this worker is the designated poller
@@ -1760,6 +1765,9 @@ unsafe extern "C" fn metrics_zone_init(
                 lapi_poll_ok: AtomicU64::new(0),
                 lapi_poll_err: AtomicU64::new(0),
                 lapi_last_success_unix_secs: AtomicU64::new(0),
+                appsec_requests: AtomicU64::new(0),
+                appsec_blocks: AtomicU64::new(0),
+                appsec_errors: AtomicU64::new(0),
             },
         );
 
@@ -1818,29 +1826,89 @@ pub fn metrics_inc_lapi_poll_err() {
     metrics_add(|m| &m.lapi_poll_err);
 }
 
+#[inline]
+pub fn metrics_inc_appsec_request() {
+    metrics_add(|m| &m.appsec_requests);
+}
+
+#[inline]
+pub fn metrics_inc_appsec_block() {
+    metrics_add(|m| &m.appsec_blocks);
+}
+
+#[inline]
+pub fn metrics_inc_appsec_error() {
+    metrics_add(|m| &m.appsec_errors);
+}
+
 /// Snapshot for Prometheus exposition (best-effort relaxed reads).
-pub fn metrics_prometheus_snapshot() -> (u64, u64, u64, u64, u64, u64, u64, u32, u32) {
+#[derive(Clone, Copy, Debug)]
+pub struct MetricsSnapshot {
+    pub http_lookups: u64,
+    pub http_bans: u64,
+    pub http_captcha: u64,
+    pub http_bypass: u64,
+    pub lapi_poll_ok: u64,
+    pub lapi_poll_err: u64,
+    pub lapi_last_ok_unix: u64,
+    pub cache_entries: u32,
+    pub cache_evictions: u32,
+    pub appsec_requests: u64,
+    pub appsec_blocks: u64,
+    pub appsec_errors: u64,
+}
+
+pub fn metrics_prometheus_snapshot() -> MetricsSnapshot {
+    let cache_entries = get_active_count();
+    let cache_evictions = get_eviction_count();
     let Some(p) = get_metrics_shm() else {
-        return (0, 0, 0, 0, 0, 0, 0, get_active_count(), get_eviction_count());
+        return MetricsSnapshot {
+            http_lookups: 0,
+            http_bans: 0,
+            http_captcha: 0,
+            http_bypass: 0,
+            lapi_poll_ok: 0,
+            lapi_poll_err: 0,
+            lapi_last_ok_unix: 0,
+            cache_entries,
+            cache_evictions,
+            appsec_requests: 0,
+            appsec_blocks: 0,
+            appsec_errors: 0,
+        };
     };
     unsafe {
-        (
-            (*p).http_lookups.load(Ordering::Relaxed),
-            (*p).http_bans.load(Ordering::Relaxed),
-            (*p).http_captcha.load(Ordering::Relaxed),
-            (*p).http_bypass.load(Ordering::Relaxed),
-            (*p).lapi_poll_ok.load(Ordering::Relaxed),
-            (*p).lapi_poll_err.load(Ordering::Relaxed),
-            (*p).lapi_last_success_unix_secs.load(Ordering::Relaxed),
-            get_active_count(),
-            get_eviction_count(),
-        )
+        MetricsSnapshot {
+            http_lookups: (*p).http_lookups.load(Ordering::Relaxed),
+            http_bans: (*p).http_bans.load(Ordering::Relaxed),
+            http_captcha: (*p).http_captcha.load(Ordering::Relaxed),
+            http_bypass: (*p).http_bypass.load(Ordering::Relaxed),
+            lapi_poll_ok: (*p).lapi_poll_ok.load(Ordering::Relaxed),
+            lapi_poll_err: (*p).lapi_poll_err.load(Ordering::Relaxed),
+            lapi_last_ok_unix: (*p).lapi_last_success_unix_secs.load(Ordering::Relaxed),
+            cache_entries,
+            cache_evictions,
+            appsec_requests: (*p).appsec_requests.load(Ordering::Relaxed),
+            appsec_blocks: (*p).appsec_blocks.load(Ordering::Relaxed),
+            appsec_errors: (*p).appsec_errors.load(Ordering::Relaxed),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metrics_shm_layout_fits_zone() {
+        assert!(
+            std::mem::size_of::<MetricsShm>() + 2048 < METRICS_SHM_SIZE,
+            "MetricsShm {} too large for zone {}",
+            std::mem::size_of::<MetricsShm>(),
+            METRICS_SHM_SIZE
+        );
+        assert_eq!(METRICS_LAYOUT_VERSION, 2);
+    }
 
     #[test]
     fn origin_appsec_is_template_label_only() {
@@ -1923,17 +1991,21 @@ mod tests {
     #[test]
     fn test_expiration_uses_supplied_time() {
         let mut entry = ShmHashEntry::empty();
-        entry.expires = 100;
-        assert!(!entry.is_expired_at(100));
-        assert!(entry.is_expired_at(101));
-        entry.expires = 0;
+        entry.decision_types = DECISION_BIT_BAN | DECISION_BIT_CAPTCHA;
+        entry.expires.ban = 60;
+        entry.expires.captcha = 100;
+        assert_eq!(entry.decision_type_at(59), DecisionType::Ban);
+        assert_eq!(entry.decision_type_at(60), DecisionType::Captcha);
+        assert!(!entry.is_expired_at(99));
+        assert!(entry.is_expired_at(100));
+        entry.expires.captcha = 0;
         assert!(!entry.is_expired_at(i64::MAX));
     }
 
     #[test]
     fn test_shm_entry_size() {
-        // Verify entry size is what we expect (48 bytes with alignment)
-        assert_eq!(std::mem::size_of::<ShmHashEntry>(), 48);
+        // Includes one deadline per supported remediation.
+        assert_eq!(std::mem::size_of::<ShmHashEntry>(), 56);
     }
 
     #[test]

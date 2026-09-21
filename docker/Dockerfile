@@ -33,6 +33,7 @@ RUN wget -q https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz \
         --pid-path=/var/run/nginx.pid \
         --lock-path=/var/run/nginx.lock \
         --with-compat \
+        --with-threads \
         --with-http_ssl_module \
         --with-http_v2_module \
         --with-http_realip_module \
@@ -55,6 +56,8 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     clang \
     llvm \
+    python3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy NGINX build artifacts from previous stage
@@ -73,10 +76,15 @@ WORKDIR /build
 # needs to generate bindings that depend on our actual code structure
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
+COPY tests/unit ./tests/unit
+COPY tests/regression.py ./tests/regression.py
+COPY templates ./templates
 
 # Compile test targets and build against the same NGINX source as the runtime binary.
 # NGINX module unit-test binaries cannot link without the host NGINX executable.
-RUN cargo check --tests --locked && cargo build --release --locked
+RUN cargo test --manifest-path tests/unit/Cargo.toml --locked \
+    && cargo check --tests --locked && cargo build --release --locked \
+    && python3 tests/regression.py
 
 # =============================================================================
 # Stage 3: Create the final runtime image

@@ -29,7 +29,7 @@ RUN rustc --version
 
 # Same tree and configure step Ubuntu uses for third-party dynamic modules.
 WORKDIR /usr/share/nginx/src
-RUN ./configure --with-compat --with-cc-opt="-fPIC -I/usr/include" --with-ld-opt="-fPIC"
+RUN ./configure --with-compat --with-threads --with-cc-opt="-fPIC -I/usr/include" --with-ld-opt="-fPIC"
 
 ENV NGINX_SOURCE_DIR=/usr/share/nginx/src
 ENV NGINX_BUILD_DIR=/usr/share/nginx/src/objs
@@ -37,5 +37,6 @@ ENV NGINX_BUILD_DIR=/usr/share/nginx/src/objs
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
+COPY tests/unit ./tests/unit
 
 RUN cargo build --release --locked

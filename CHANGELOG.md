@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-21
+
+Minor: AppSec and captcha-provider HTTP run on nginx's native thread pool (workers no longer block on `ureq`), ban and captcha deadlines expire independently, and an AppSec `captcha` action is applied as a ban.
+
+**Upgrade requires a full `nginx` restart** (`systemctl restart nginx`), not `reload`:
+
+- Decision SHM is **layout version 4** (independent ban vs captcha expiry for IPs and CIDRs).
+- Metrics SHM is **layout version 2** (AppSec Prometheus counters).
+
+Reload after this restart is fine until the next layout bump. A layout mismatch logs that the zone is incompatible and skips reuse.
+
+nginx must be built with **`--with-threads`**. Ubuntu 24.04 apt (`1.24.0`), Debian 13 apt (`1.26.x`), and this project's Docker image (`1.30.3`) already enable it. Confirm with `nginx -V`. Size the pool in the main context if needed, for example `thread_pool default threads=4 max_queue=128;` — a full queue uses the configured AppSec/captcha failure policy, and queue wait is additional to the HTTP timeout.
+
+### Breaking / behavioral
+
+- **`--with-threads` is required** at compile time and at runtime. Source builds without it will fail to load the module.
+- **AppSec `captcha` is a ban.** Solving a stream captcha never bypasses a WAF rule. Captcha verification remains for LAPI stream decisions only.
+- **`crowdsec_appsec_failure_action deny`** and unreadable/too-large body deny use the same ban template / `crowdsec_ban_action` as an AppSec `ban` (no more bare nginx 403).
+
+### Added
+
+- **Thread-pool offload** — AppSec inspect and captcha-provider verify are posted to nginx's `default` pool (`ngx_thread_task_post`). Completions run back on the event loop; a non-cancelable keepalive timer holds the worker open while work is queued so `reload` does not abort with “open socket left in connection”. Compatible with nginx 1.24 (uses connection `error` instead of `r->terminated`, which exists only on ≥ 1.25.5).
+- **Prometheus AppSec counters** — `crowdsec_appsec_requests_total`, `crowdsec_appsec_blocks_total`, and `crowdsec_appsec_errors_total`. `requests` increments when the inspect is queued.
+- **Debian 13 (trixie) module image** — `docker/Dockerfile.debian-trixie-module` and `scripts/build-debian-trixie-module.sh` for apt nginx 1.26.x.
+- **Pure Rust unit crate** (`tests/unit`, `cargo test -p crowdsec-unit-tests`) and **in-image regressions** (`tests/regression.py`) covering captcha-session writes, AppSec captcha bans, slow verification, client disconnects, IP/CIDR expiry, metrics during uploads, queue saturation, and reload-during-inflight.
+
+### Changed
+
+- **Independent expiry** — an IP or CIDR can drop its ban at the ban deadline while a captcha decision on the same key remains, and the reverse. Unlimited (`expires=0`) still dominates a finite deadline when merging.
+- **Captcha sessions** — a valid cookie lets application POST/PUT/PATCH/DELETE through unchanged. Only the captcha verification submission itself 303-redirects.
+- **Usage metrics** — LAPI uploads serialize and ACK the same snapshot (`fetch_sub` the posted values) so traffic recorded during the HTTP round-trip is kept. Shutdown flush waits for the poller to finish.
+- **AppSec HTTP version** — `X-Crowdsec-Appsec-Http-Version` is the version nginx saw (`10` / `11` / `20` / `30`) instead of always `11`.
+- **Docs** — `crowdsec_appsec_timeout` no longer claims to block the worker; thread-pool sizing, AppSec captcha-as-ban, and the restart requirement are documented. Docker/Ubuntu module Dockerfiles pass `--with-threads`.
+- **CI** — builder runs `cargo test -p crowdsec-unit-tests` and `python3 tests/regression.py --captcha-stall`. BATS integration count is 22 (24 including challenge).
+
+### Fixed
+
+- JWT captcha claims parse with serde JSON, so signed tokens whose `uri` contains Unicode no longer panic in the worker.
+- Reload while an AppSec/captcha thread-pool task is in flight no longer hits `ngx_event_no_more_timers()` and worker abort.
+
 ## [0.4.2] - 2026-09-07
 
 Patch: AppSec inspection returns to **PRECONTENT** (nginx `mirror`), and AppSec bans use the ban template.

@@ -103,21 +103,6 @@ pub fn captcha_return_uri(request: &Request) -> String {
         .to_string()
 }
 
-/// 303 redirect so the client repeats the request as GET (for static origins that reject POST).
-pub fn send_see_other_redirect(request: &mut Request, redirect_uri: &str) -> Result<(), ()> {
-    let r: *mut ngx_http_request_t = request.as_mut() as *mut _;
-    request.set_status(HTTPStatus::SEE_OTHER);
-    request.set_content_length_n(0);
-    request.discard_request_body();
-    request.add_header_out("Location", redirect_uri);
-    request.add_header_out("Cache-Control", "no-store, no-cache, must-revalidate");
-    let header_status = request.send_header();
-    unsafe {
-        ngx::ffi::ngx_http_finalize_request(r, header_status.into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

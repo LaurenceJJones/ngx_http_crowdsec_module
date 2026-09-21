@@ -1,5 +1,6 @@
 .hub/
 .mock-state/
 target/
+tests/unit/target/
 .git/
 benchmarks/.state/

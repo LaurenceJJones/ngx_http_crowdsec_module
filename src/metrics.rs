@@ -2,12 +2,15 @@
 //!
 //! Configure a dedicated location with `crowdsec_metrics on;` (and typically `crowdsec off;`).
 //! Protect this endpoint with `allow` / `internal` / auth in production.
-//! Exposed series include HTTP/captcha counters, LAPI poll counters, `crowdsec_lapi_stream_last_success_unixtime`, and cache entry gauge.
+//! Exposed series include HTTP/captcha counters, LAPI poll counters, AppSec inspect/block/error
+//! counters, `crowdsec_lapi_stream_last_success_unixtime`, and cache entry gauge.
 
 use crate::config::LocConfig;
 use crate::handler::HandlerResult;
+use crate::response::{
+    HeaderFailureAction, body_chain, disable_keepalive, send_chain_and_finalize,
+};
 use crate::shm;
-use crate::response::{HeaderFailureAction, body_chain, disable_keepalive, send_chain_and_finalize};
 use ngx::http::{HTTPStatus, Method, Request};
 
 /// If `crowdsec_metrics` is enabled for this location, send Prometheus text and
@@ -27,8 +30,7 @@ pub fn try_serve_metrics(request: &mut Request, loc_conf: &LocConfig) -> Option<
         return Some(HandlerResult::Done);
     }
 
-    let (lookups, bans, captcha, bypass, poll_ok, poll_err, lapi_last_ok_unix, entries, evictions) =
-        shm::metrics_prometheus_snapshot();
+    let m = shm::metrics_prometheus_snapshot();
 
     let body = format!(
         "# HELP crowdsec_http_remediation_lookups_total Requests evaluated against the CrowdSec decision cache (crowdsec on).\n\
@@ -57,8 +59,28 @@ pub fn try_serve_metrics(request: &mut Request, loc_conf: &LocConfig) -> Option<
          crowdsec_decision_cache_entries {}\n\
          # HELP crowdsec_decision_cache_evictions_total Clock-hand evictions from the decision cache.\n\
          # TYPE crowdsec_decision_cache_evictions_total counter\n\
-         crowdsec_decision_cache_evictions_total {}\n",
-        lookups, bans, captcha, bypass, poll_ok, poll_err, lapi_last_ok_unix, entries, evictions
+         crowdsec_decision_cache_evictions_total {}\n\
+         # HELP crowdsec_appsec_requests_total Requests forwarded to the AppSec component.\n\
+         # TYPE crowdsec_appsec_requests_total counter\n\
+         crowdsec_appsec_requests_total {}\n\
+         # HELP crowdsec_appsec_blocks_total AppSec bans applied (matched rule or fail-closed deny), including the ban template.\n\
+         # TYPE crowdsec_appsec_blocks_total counter\n\
+         crowdsec_appsec_blocks_total {}\n\
+         # HELP crowdsec_appsec_errors_total AppSec inspect failures (timeout, HTTP error, unreadable/too-large body).\n\
+         # TYPE crowdsec_appsec_errors_total counter\n\
+         crowdsec_appsec_errors_total {}\n",
+        m.http_lookups,
+        m.http_bans,
+        m.http_captcha,
+        m.http_bypass,
+        m.lapi_poll_ok,
+        m.lapi_poll_err,
+        m.lapi_last_ok_unix,
+        m.cache_entries,
+        m.cache_evictions,
+        m.appsec_requests,
+        m.appsec_blocks,
+        m.appsec_errors,
     );
 
     if send_text_response(
