@@ -8,7 +8,7 @@ Stream bans, captcha, AppSec WAF, bot challenge, and Prometheus metrics. Compile
 
 - **Same job, fewer moving parts** — load a module, set `crowdsec on`; no bouncer scripts to ship or JIT on every request.
 - **Features you expect** — LAPI stream decisions, captcha providers, AppSec on GET/POST, trusted proxies, custom ban pages.
-- **Tested** — 21 CI tests against real CrowdSec v1.8.1; **100%** hub AppSec block coverage (211/211 rules; [details](docs/testing.md)).
+- **Tested** — 24 CI tests against real CrowdSec v1.8.1; **100%** hub AppSec block coverage (211/211 rules; [details](docs/testing.md)).
 
 ## Try it
 
@@ -31,7 +31,7 @@ docker build -f docker/Dockerfile -t nginx-crowdsec:test .
 ./scripts/test-bats-ci.sh
 ```
 
-**21 tests** — real CrowdSec v1.8.1 + AppSec, bot challenge. Full matrix: [docs/testing.md](docs/testing.md).
+**24 tests** — real CrowdSec v1.8.1 + AppSec, bot challenge. Full matrix: [docs/testing.md](docs/testing.md).
 
 Optional — run all **211 hub AppSec rule tests** against the module (~7 min, local only):
 

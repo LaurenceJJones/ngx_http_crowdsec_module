@@ -45,9 +45,11 @@ Run the pure Rust tests locally without nginx headers or linking:
 cargo test -p crowdsec-unit-tests --locked
 ```
 
-This workspace member imports the production source files directly and shares the root lockfile. It executes JWT, template, provider, protocol, and independent decision-expiry tests.
+This workspace member imports the production source files directly and shares the root lockfile. It executes JWT, template, provider, protocol, captcha-redirect, and independent decision-expiry tests.
 
 The Docker builder also runs `python3 tests/regression.py` against a real, single-worker nginx and local mock services. It checks valid captcha-session writes, AppSec captcha bans, slow verification, client disconnects, IP/CIDR expiry, metrics during uploads, and reloads. These regressions use no host bind mounts.
+
+CI also compiles the Ubuntu 24.04 apt (`nginx` 1.24) module image in a parallel job.
 
 ### Other checks (CI)
 

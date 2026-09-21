@@ -37,3 +37,19 @@ jobs:
         env:
           NGINX_CROWDSEC_IMAGE: nginx-crowdsec:test
         run: ./scripts/test-bats-ci.sh
+
+  ubuntu-module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build Ubuntu noble nginx 1.24 module
+        run: docker build --pull --file docker/Dockerfile.ubuntu-module --target builder --tag crowdsec-module:ubuntu-noble .
+      - name: Export module
+        run: |
+          mkdir -p dist
+          cid=$(docker create crowdsec-module:ubuntu-noble)
+          docker cp "$cid:/build/target/release/libngx_http_crowdsec_module.so" \
+            dist/ngx_http_crowdsec_module-ubuntu-noble-amd64.so
+          docker rm "$cid"
+          test -s dist/ngx_http_crowdsec_module-ubuntu-noble-amd64.so
+          file dist/ngx_http_crowdsec_module-ubuntu-noble-amd64.so

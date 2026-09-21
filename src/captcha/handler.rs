@@ -6,9 +6,9 @@
 use crate::captcha::config::CaptchaConfig;
 use crate::captcha::cookie::get_cookie;
 use crate::captcha::jwt::JwtManager;
+use crate::response::{body_chain, send_chain_and_finalize, HeaderFailureAction};
 use crate::shm;
 use crate::template::{Template, TemplateVariables};
-use crate::response::{HeaderFailureAction, body_chain, send_chain_and_finalize};
 use ngx::ffi::ngx_http_request_t;
 use ngx::http::{HTTPStatus, Request};
 use ngx::ngx_log_debug_http;
@@ -60,7 +60,12 @@ pub fn send_captcha_page(
     client_ip: &IpAddr,
     error_message: Option<&str>,
 ) -> Result<(), ()> {
-    let mut vars = captcha_template_vars(config, client_ip, captcha_return_uri(request), error_message);
+    let mut vars = captcha_template_vars(
+        config,
+        client_ip,
+        captcha_return_uri(request),
+        error_message,
+    );
     if let Ok(uri_str) = request.path().to_str() {
         vars.request_uri = Some(uri_str.to_string());
     }
@@ -96,11 +101,7 @@ pub fn send_captcha_page(
 
 /// URI the client should return to after captcha (path + query string).
 pub fn captcha_return_uri(request: &Request) -> String {
-    request
-        .unparsed_uri()
-        .to_str()
-        .unwrap_or("/")
-        .to_string()
+    crate::captcha::redirect::sanitize_return_uri(request.unparsed_uri().to_str().unwrap_or("/"))
 }
 
 #[cfg(test)]
@@ -126,10 +127,8 @@ mod tests {
 
     #[test]
     fn test_captcha_template_renders_error_variable() {
-        let tpl = Template::parse_with_content_type(
-            r#"{{captcha_error}}"#,
-            "text/html; charset=utf-8",
-        );
+        let tpl =
+            Template::parse_with_content_type(r#"{{captcha_error}}"#, "text/html; charset=utf-8");
         let mut vars = TemplateVariables::new();
         vars.captcha_error = Some("Verification failed".to_string());
 

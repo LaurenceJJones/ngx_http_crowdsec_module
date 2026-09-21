@@ -6,7 +6,7 @@
 //! - Expiration timestamp
 //! - Nonce for uniqueness
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
@@ -183,6 +183,14 @@ impl JwtManager {
             return Err(JwtError::Expired);
         }
 
+        if claims.typ != "captcha_pass" {
+            return Err(JwtError::InvalidPayload);
+        }
+
+        if claims.iat > now + 60 {
+            return Err(JwtError::InvalidPayload);
+        }
+
         // When bind_ip is on, `client_ip` is Some — require an exact match (reject anonymous).
         if let Some(ip) = client_ip {
             if claims.sub != ip {
@@ -318,6 +326,32 @@ mod tests {
         // bind_ip off: no client IP to check
         let result = manager.verify_and_validate(&token, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_wrong_typ() {
+        let key = [1u8; 32];
+        let manager = JwtManager::new(key);
+        let mut claims = CaptchaClaims::new(Some("192.0.2.1"), 3600, None);
+        claims.typ = "other".into();
+        let token = manager.create_token(&claims).unwrap();
+        assert_eq!(
+            manager.verify_and_validate(&token, None),
+            Err(JwtError::InvalidPayload)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_iat_too_far_in_future() {
+        let key = [1u8; 32];
+        let manager = JwtManager::new(key);
+        let mut claims = CaptchaClaims::new(Some("192.0.2.1"), 3600, None);
+        claims.iat += 120;
+        let token = manager.create_token(&claims).unwrap();
+        assert_eq!(
+            manager.verify_and_validate(&token, None),
+            Err(JwtError::InvalidPayload)
+        );
     }
 
     #[test]

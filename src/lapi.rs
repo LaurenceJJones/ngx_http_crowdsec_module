@@ -1,11 +1,8 @@
 //! Shared CrowdSec LAPI HTTP client settings.
 
 /// User-Agent sent on all CrowdSec LAPI requests (`<module>/<version>`).
-pub const BOUNCER_USER_AGENT: &str = concat!(
-    env!("CARGO_PKG_NAME"),
-    "/",
-    env!("CARGO_PKG_VERSION")
-);
+pub const BOUNCER_USER_AGENT: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 /// ureq agent configured with the bouncer User-Agent.
 pub fn agent() -> ureq::Agent {

@@ -20,6 +20,7 @@ Guidance for AI assistants working on **ngx_http_crowdsec_module** — a Rust NG
 | Local compose stack | `podman-compose up --build` (nginx `:9090`, real CrowdSec LAPI) |
 | AppSec POST + proxy test | `scripts/test-appsec-proxy-post.sh nginx-crowdsec:test` |
 | Ubuntu/apt nginx `.so` | `scripts/build-ubuntu-module.sh` → `dist/*-ubuntu-noble.so` |
+| Debian 13/apt nginx `.so` | `scripts/build-debian-trixie-module.sh` → `dist/*-debian-trixie.so` |
 | Unit check | `docker build --target rust-builder -t nginx-crowdsec:builder -f docker/Dockerfile . && docker run --rm nginx-crowdsec:builder cargo check --tests --locked` |
 
 Match **NGINX ABI** to production (Debian Docker image vs Ubuntu `nginx-dev` on VPS). After `.so` swap use **`systemctl restart nginx`**, not only reload, when testing phase-handler changes.

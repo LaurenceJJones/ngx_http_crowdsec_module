@@ -11,6 +11,7 @@ pub mod config;
 pub mod cookie;
 pub mod handler;
 pub mod jwt;
+pub mod redirect;
 pub mod verifier;
 
 // Public API - only export what's used externally

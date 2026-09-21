@@ -3,11 +3,10 @@ use crate::conf::{ConfValueError, NgxConfExt};
 use crate::realip::TrustedCidr;
 use crate::shm::{DecisionType, DecisionsSharedZone};
 use crate::template::Template;
-use ngx::core::{NGX_CONF_ERROR, NGX_CONF_OK, NgxStr};
+use ngx::core::{NgxStr, NGX_CONF_ERROR, NGX_CONF_OK};
 use ngx::ffi::{
-    NGX_CONF_1MORE, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF,
-    NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_SRV_CONF, ngx_command_t, ngx_conf_t, ngx_str_t,
-    ngx_uint_t,
+    ngx_command_t, ngx_conf_t, ngx_str_t, ngx_uint_t, NGX_CONF_1MORE, NGX_CONF_TAKE1,
+    NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_SRV_CONF,
 };
 use ngx::ngx_string;
 use std::collections::HashMap;
@@ -27,11 +26,7 @@ fn parse_on_off(s: &str) -> Option<bool> {
     }
 }
 
-fn set_flag_on_off(
-    cf: *mut ngx_conf_t,
-    slot: &mut Option<bool>,
-    dir: &'static str,
-) -> *mut c_char {
+fn set_flag_on_off(cf: *mut ngx_conf_t, slot: &mut Option<bool>, dir: &'static str) -> *mut c_char {
     unsafe {
         let cf_ref = &*cf;
         let args = cf_ref.args();
@@ -88,6 +83,8 @@ pub struct MainConfig {
     pub usage_metrics_interval_secs: Option<u64>,
     /// Set when any merged location has `crowdsec on` (including inherited).
     pub enforcement_requested: bool,
+    /// Set when any merged location has `crowdsec_appsec on` (including inherited).
+    pub appsec_requested: bool,
     /// Unknown LAPI remediation types: allow (ignore), ban, or captcha (http level only).
     pub fallback_remediation: Option<FallbackRemediation>,
 }
@@ -95,8 +92,8 @@ pub struct MainConfig {
 impl MainConfig {
     /// Warn when LAPI settings are incomplete but enforcement or partial LAPI config was requested.
     pub fn validate_lapi_config(&self, cf: &ngx_conf_t) {
-        use ngx::ngx_conf_log_error;
         use ngx::ffi::NGX_LOG_WARN;
+        use ngx::ngx_conf_log_error;
 
         let url_set = self.lapi_url.is_some();
         let key_set = self.api_key.is_some();
@@ -121,6 +118,20 @@ impl MainConfig {
                 "crowdsec: crowdsec_api_key is not set; LAPI stream polling disabled"
             );
         }
+    }
+
+    /// Warn when AppSec is enabled in a location but no agent URL is configured.
+    pub fn validate_appsec_config(&self, cf: &ngx_conf_t) {
+        if !self.appsec_requested || self.appsec_url.is_some() {
+            return;
+        }
+        use ngx::ffi::NGX_LOG_WARN;
+        use ngx::ngx_conf_log_error;
+        ngx_conf_log_error!(
+            NGX_LOG_WARN,
+            core::ptr::from_ref(cf).cast_mut(),
+            "crowdsec: crowdsec_appsec is on but crowdsec_appsec_url is not set; AppSec inspection disabled"
+        );
     }
 
     pub fn fallback_remediation_or_default(&self) -> FallbackRemediation {
@@ -278,9 +289,7 @@ impl LocConfig {
         self.captcha_provider.is_some()
             && self.captcha_site_key.is_some()
             && self.captcha_secret_key.is_some()
-            && self
-                .captcha_signing_key
-                .is_some_and(|k| k != [0u8; 32])
+            && self.captcha_signing_key.is_some_and(|k| k != [0u8; 32])
     }
 
     pub fn captcha_cookie_name(&self) -> &str {
@@ -400,7 +409,8 @@ impl LocConfig {
         match &self.static_asset_extensions {
             Some(exts) if exts.is_empty() => false,
             Some(exts) => path_has_static_suffix(path, exts),
-            None => path.as_bytes()
+            None => path
+                .as_bytes()
                 .get(path.len().saturating_sub(4)..)
                 .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".ico")),
         }
@@ -1254,6 +1264,34 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_provider(
     NGX_CONF_OK
 }
 
+const CAPTCHA_PROVIDER_KEY_MAX: usize = 256;
+
+fn set_captcha_provider_key(
+    cf: *mut ngx_conf_t,
+    conf: *mut c_void,
+    dir: &'static str,
+    slot: fn(&mut LocConfig) -> &mut Option<String>,
+) -> *mut c_char {
+    let cf = unsafe { cf.as_mut().expect("cf") };
+    let conf = unsafe { &mut *(conf as *mut LocConfig) };
+    let args = cf.args();
+    if args.len() < 2 {
+        return cf.error(dir, &ConfValueError("missing argument"));
+    }
+    let value_str = match unsafe { NgxStr::from_ngx_str(args[1]) }.to_str() {
+        Ok(s) => s,
+        Err(err) => return cf.error(dir, &err),
+    };
+    if value_str.is_empty() || value_str.len() > CAPTCHA_PROVIDER_KEY_MAX {
+        return cf.error(
+            dir,
+            &ConfValueError("must be 1-256 bytes (fits the captcha POST context)"),
+        );
+    }
+    *slot(conf) = Some(value_str.to_string());
+    NGX_CONF_OK
+}
+
 /// Directive handler for `crowdsec_captcha_site_key <key>;`
 ///
 /// # Safety
@@ -1264,21 +1302,9 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_site_key(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    let conf = unsafe { &mut *(conf as *mut LocConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => return NGX_CONF_ERROR,
-        };
-
-        conf.captcha_site_key = Some(value_str.to_string());
-    }
-
-    NGX_CONF_OK
+    set_captcha_provider_key(cf, conf, "crowdsec_captcha_site_key", |c| {
+        &mut c.captcha_site_key
+    })
 }
 
 /// Directive handler for `crowdsec_captcha_secret_key <key>;`
@@ -1291,21 +1317,9 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_secret_key(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
-    let conf = unsafe { &mut *(conf as *mut LocConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => return NGX_CONF_ERROR,
-        };
-
-        conf.captcha_secret_key = Some(value_str.to_string());
-    }
-
-    NGX_CONF_OK
+    set_captcha_provider_key(cf, conf, "crowdsec_captcha_secret_key", |c| {
+        &mut c.captcha_secret_key
+    })
 }
 
 /// Directive handler for `crowdsec_captcha_signing_key <hex-key>;`
@@ -1375,20 +1389,26 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_cookie_name(
     _cmd: *mut ngx_command_t,
     conf: *mut c_void,
 ) -> *mut c_char {
+    let cf = unsafe { cf.as_mut().expect("cf") };
     let conf = unsafe { &mut *(conf as *mut LocConfig) };
-
-    unsafe {
-        let args = (*(*cf).args).elts as *mut ngx_str_t;
-        let value = *args.add(1);
-
-        let value_str = match NgxStr::from_ngx_str(value).to_str() {
-            Ok(s) => s,
-            Err(_) => return NGX_CONF_ERROR,
-        };
-
-        conf.captcha_cookie_name = Some(value_str.to_string());
+    let args = cf.args();
+    if args.len() < 2 {
+        return cf.error(
+            "crowdsec_captcha_cookie_name",
+            &ConfValueError("missing argument"),
+        );
     }
-
+    let value_str = match unsafe { NgxStr::from_ngx_str(args[1]) }.to_str() {
+        Ok(s) => s,
+        Err(err) => return cf.error("crowdsec_captcha_cookie_name", &err),
+    };
+    if !crate::captcha::redirect::is_cookie_name(value_str) {
+        return cf.error(
+            "crowdsec_captcha_cookie_name",
+            &ConfValueError("must be 1-64 ASCII letters, digits, '-' or '_'"),
+        );
+    }
+    conf.captcha_cookie_name = Some(value_str.to_string());
     NGX_CONF_OK
 }
 
@@ -1443,7 +1463,11 @@ pub extern "C" fn ngx_http_crowdsec_set_captcha_fail_open(
     conf: *mut c_void,
 ) -> *mut c_char {
     let conf = unsafe { &mut *(conf as *mut LocConfig) };
-    set_flag_on_off(cf, &mut conf.captcha_fail_open, "crowdsec_captcha_fail_open")
+    set_flag_on_off(
+        cf,
+        &mut conf.captcha_fail_open,
+        "crowdsec_captcha_fail_open",
+    )
 }
 
 /// Directive handler for `crowdsec_unenforceable_action allow|block;`
@@ -1797,9 +1821,7 @@ pub extern "C" fn ngx_http_crowdsec_set_static_extensions(
             }
         }
 
-        let list = conf
-            .static_asset_extensions
-            .get_or_insert_with(Vec::new);
+        let list = conf.static_asset_extensions.get_or_insert_with(Vec::new);
 
         for i in 1..nelts {
             let token = *args.add(i);

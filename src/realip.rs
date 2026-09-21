@@ -204,6 +204,15 @@ pub fn get_effective_client_ip(
     )))
 }
 
+pub fn peer_is_trusted_proxy(request: &Request, trusted: &[TrustedCidr]) -> bool {
+    if trusted.is_empty() {
+        return false;
+    }
+    socket_peer_ip(request)
+        .map(canonicalize_ip)
+        .is_some_and(|ip| peer_in_trusted_list(&ip, trusted))
+}
+
 fn socket_peer_ip(request: &Request) -> Option<IpAddr> {
     let connection = request.connection();
     if connection.is_null() {
@@ -293,7 +302,10 @@ mod tests {
     #[test]
     fn canonicalize_mapped_v6() {
         let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
-        assert_eq!(canonicalize_ip(mapped), "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            canonicalize_ip(mapped),
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        );
         let t = TrustedCidr::parse("10.0.0.0/8").unwrap();
         assert!(t.contains(&mapped));
     }

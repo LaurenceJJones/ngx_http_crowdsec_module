@@ -1,10 +1,10 @@
 use crate::config::{AppSecFailureAction, LocConfig, MainConfig};
-use crate::handler::{HandlerResult, StoredPhaseResult, get_client_ip, send_raw_response};
+use crate::handler::{get_client_ip, send_raw_response, HandlerResult, StoredPhaseResult};
 use crate::lapi;
 use crate::request_body::{
-    APPSEC_BODY_CTX_MAGIC, BodyExtractResult, extract_request_body_limited, finalize_allow,
-    finish_phase_body_read, get_content_length, has_request_body, initiate_body_read,
-    module_ctx_slot, request_body_buffered, request_ctx_magic,
+    extract_request_body_limited, finalize_allow, finish_phase_body_read, get_content_length,
+    has_request_body, initiate_body_read, module_ctx_slot, request_body_buffered,
+    request_ctx_magic, BodyExtractResult, APPSEC_BODY_CTX_MAGIC,
 };
 use crate::shm;
 use ngx::ffi::{ngx_http_finalize_request, ngx_http_request_t, ngx_int_t};
@@ -241,12 +241,28 @@ pub fn inspect(
     )
 }
 
-fn unreadable_body_action(config: &AppSecConfig) -> AppSecFailureAction {
+fn inspect_or_drop_unforwardable_body(
+    request: &mut Request,
+    loc: &LocConfig,
+    ip: &IpAddr,
+    config: &AppSecConfig,
+    failure_action: AppSecFailureAction,
+    internal_challenge: bool,
+    shm_ban: bool,
+) -> HandlerResult {
     if config.drop_unreadable_body {
-        AppSecFailureAction::Deny
-    } else {
-        AppSecFailureAction::Passthrough
+        return fail_closed(request, loc, Some(ip), AppSecFailureAction::Deny);
     }
+    inspect_with_body(
+        request,
+        loc,
+        ip,
+        config,
+        failure_action,
+        internal_challenge,
+        None,
+        shm_ban,
+    )
 }
 
 fn inspect_request_body(
@@ -260,15 +276,18 @@ fn inspect_request_body(
     shm_ban: bool,
 ) -> HandlerResult {
     if unsafe { request_body_buffered(r) } {
-        let body = match unsafe {
-            extract_request_body_limited(r, config.max_body_size, !config.drop_unreadable_body)
-        } {
+        let body = match unsafe { extract_request_body_limited(r, config.max_body_size, false) } {
             BodyExtractResult::Ok(body) => body,
-            BodyExtractResult::TooLarge => {
-                return fail_closed(request, loc, Some(ip), failure_action);
-            }
-            BodyExtractResult::Unreadable => {
-                return fail_closed(request, loc, Some(ip), unreadable_body_action(config));
+            BodyExtractResult::TooLarge | BodyExtractResult::Unreadable => {
+                return inspect_or_drop_unforwardable_body(
+                    request,
+                    loc,
+                    ip,
+                    config,
+                    failure_action,
+                    internal_challenge,
+                    shm_ban,
+                );
             }
         };
         return inspect_with_body(
@@ -285,7 +304,15 @@ fn inspect_request_body(
 
     let content_length = unsafe { get_content_length(r) };
     if content_length > config.max_body_size as i64 {
-        return fail_closed(request, loc, Some(ip), failure_action);
+        return inspect_or_drop_unforwardable_body(
+            request,
+            loc,
+            ip,
+            config,
+            failure_action,
+            internal_challenge,
+            shm_ban,
+        );
     }
 
     unsafe {
@@ -404,32 +431,22 @@ unsafe extern "C" fn appsec_body_handler(r: *mut ngx_http_request_t) {
             }
         };
 
-        let body = match extract_request_body_limited(
-            r,
-            config.max_body_size,
-            !config.drop_unreadable_body,
-        ) {
+        let body = match extract_request_body_limited(r, config.max_body_size, false) {
             BodyExtractResult::Ok(body) => body,
-            BodyExtractResult::TooLarge => {
+            BodyExtractResult::TooLarge | BodyExtractResult::Unreadable => {
                 let mut request = Request::from_ngx_http_request(main_r);
                 let Some(loc) = crate::crowdsec_loc_conf(&request).cloned() else {
                     finish(HandlerResult::Forbidden);
                     return;
                 };
-                finish(fail_closed(&mut request, &loc, Some(&ip), failure_action));
-                return;
-            }
-            BodyExtractResult::Unreadable => {
-                let mut request = Request::from_ngx_http_request(main_r);
-                let Some(loc) = crate::crowdsec_loc_conf(&request).cloned() else {
-                    finish(HandlerResult::Forbidden);
-                    return;
-                };
-                finish(fail_closed(
+                finish(inspect_or_drop_unforwardable_body(
                     &mut request,
                     &loc,
-                    Some(&ip),
-                    unreadable_body_action(&config),
+                    &ip,
+                    &config,
+                    failure_action,
+                    context.internal_challenge != 0,
+                    context.shm_ban != 0,
                 ));
                 return;
             }
@@ -517,6 +534,13 @@ fn inspect_with_body(
             },
             move |r, response| {
                 let mut request = Request::from_ngx_http_request(r);
+                let ctx = *module_ctx_slot(r) as *mut AppSecBodyContext;
+                if ctx.is_null() || (*ctx).magic != APPSEC_BODY_CTX_MAGIC {
+                    let result =
+                        fail_closed(&mut request, &loc_owned, Some(&client_ip), failure_action);
+                    finalize_async_result(r, result);
+                    return;
+                }
                 let result = match response {
                     Ok(Ok(response)) => apply_appsec_response(
                         &mut request,
@@ -531,7 +555,6 @@ fn inspect_with_body(
                     _ => fail_closed(&mut request, &loc_owned, Some(&client_ip), failure_action),
                 };
                 if !matches!(result, HandlerResult::Done | HandlerResult::BodyReadPending) {
-                    let ctx = *module_ctx_slot(r) as *mut AppSecBodyContext;
                     (*ctx).store_result(result);
                     finalize_async_result(r, result);
                 }
@@ -578,34 +601,32 @@ fn prepare_appsec_request(
     } else {
         AGENT.get(&config.url)
     }
-    .set("User-Agent", lapi::BOUNCER_USER_AGENT)
-    .set("X-Crowdsec-Appsec-Ip", &ip.to_string())
-    .set("X-Crowdsec-Appsec-Uri", uri)
-    .set("X-Crowdsec-Appsec-Host", host)
-    .set("X-Crowdsec-Appsec-Verb", request.method().as_str())
-    .set("X-Crowdsec-Appsec-Api-Key", &config.api_key)
-    .set("X-Crowdsec-Appsec-User-Agent", user_agent)
-    .set(
-        "X-Crowdsec-Appsec-Http-Version",
-        appsec_http_version_header(request.as_ref().http_version),
-    )
     .timeout(Duration::from_millis(config.timeout_ms));
 
     for (name, value) in request.headers_in_iterator() {
         let (Ok(name), Ok(value)) = (name.to_str(), value.to_str()) else {
             continue;
         };
-        if !name.to_ascii_lowercase().starts_with("x-crowdsec-appsec-")
-            && !matches!(
-                name.to_ascii_lowercase().as_str(),
-                "connection" | "transfer-encoding" | "upgrade" | "user-agent"
-            )
-        {
-            call = call.set(name, value);
+        if skip_forwarded_appsec_header(name) {
+            continue;
         }
+        call = call.set(name, value);
     }
 
-    call
+    // Copy client headers first, then CrowdSec metadata last so our
+    // X-Crowdsec-Appsec-* values overwrite any client copies. Client
+    // X-Crowdsec-* names are also skipped in the copy (defense in depth).
+    call.set("User-Agent", lapi::BOUNCER_USER_AGENT)
+        .set("X-Crowdsec-Appsec-Ip", &ip.to_string())
+        .set("X-Crowdsec-Appsec-Uri", uri)
+        .set("X-Crowdsec-Appsec-Host", host)
+        .set("X-Crowdsec-Appsec-Verb", request.method().as_str())
+        .set("X-Crowdsec-Appsec-Api-Key", &config.api_key)
+        .set("X-Crowdsec-Appsec-User-Agent", user_agent)
+        .set(
+            "X-Crowdsec-Appsec-Http-Version",
+            appsec_http_version_header(request.as_ref().http_version),
+        )
 }
 
 fn apply_appsec_ban_page(request: &mut Request, loc: &LocConfig, ip: &IpAddr) -> HandlerResult {
@@ -721,6 +742,23 @@ fn appsec_http_version_header(http_version: ngx::ffi::ngx_uint_t) -> &'static st
     }
 }
 
+fn skip_forwarded_appsec_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "host"
+            | "content-length"
+            | "user-agent"
+    ) || lower.starts_with("x-crowdsec-")
+}
+
 fn safe_header(name: &str, value: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -757,6 +795,16 @@ mod tests {
         assert!(safe_header("Location", "/challenge"));
         assert!(!safe_header("X-Test", "ok\r\nInjected: yes"));
         assert!(!safe_header("Content-Length", "1"));
+    }
+
+    #[test]
+    fn appsec_does_not_forward_host_or_hop_by_hop_headers() {
+        assert!(skip_forwarded_appsec_header("Host"));
+        assert!(skip_forwarded_appsec_header("Content-Length"));
+        assert!(skip_forwarded_appsec_header("Connection"));
+        assert!(skip_forwarded_appsec_header("X-Crowdsec-Appsec-Ip"));
+        assert!(skip_forwarded_appsec_header("x-crowdsec-appsec-host"));
+        assert!(!skip_forwarded_appsec_header("Accept"));
     }
 
     #[test]

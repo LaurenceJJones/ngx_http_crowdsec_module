@@ -1,17 +1,19 @@
-use crate::captcha::cookie::{
-    SameSite, build_clear_cookie_with_attrs, get_cookie, response_has_set_cookie,
-    should_cookie_be_secure,
-};
-use crate::captcha::handler::{
-    captcha_session_valid, send_captcha_page,
-};
 use crate::captcha;
-use crate::config::{BanActionMode, FallbackRemediation, LocConfig, MainConfig, UnenforceableAction};
+use crate::captcha::cookie::{
+    build_clear_cookie_with_attrs, get_cookie, response_has_set_cookie, should_cookie_be_secure,
+    SameSite,
+};
+use crate::captcha::handler::{captcha_session_valid, send_captcha_page};
+use crate::config::{
+    BanActionMode, FallbackRemediation, LocConfig, MainConfig, UnenforceableAction,
+};
 use crate::realip;
+use crate::response::{
+    body_chain, disable_keepalive, send_chain_and_finalize, HeaderFailureAction,
+};
 use crate::shm::{self, DecisionType, LookupResult};
-use crate::usage_metrics;
 use crate::template::{Template, TemplateVariables};
-use crate::response::{HeaderFailureAction, body_chain, disable_keepalive, send_chain_and_finalize};
+use crate::usage_metrics;
 use ngx::core::Status;
 use ngx::ffi::ngx_http_request_t;
 use ngx::http::{HTTPStatus, Method, Request};
@@ -246,7 +248,13 @@ pub(crate) fn handle_ban_decision(
     if loc_conf.ban_action == Some(BanActionMode::Redirect) {
         if let Some(ref url) = loc_conf.ban_redirect_url {
             let code = loc_conf.ban_redirect_code.unwrap_or(302);
-            if send_ban_redirect(request, url, HTTPStatus::from_u16(code).unwrap_or(HTTPStatus::MOVED_TEMPORARILY)).is_ok() {
+            if send_ban_redirect(
+                request,
+                url,
+                HTTPStatus::from_u16(code).unwrap_or(HTTPStatus::MOVED_TEMPORARILY),
+            )
+            .is_ok()
+            {
                 record_ban_applied(client_ip, lookup);
                 return HandlerResult::Done;
             }
@@ -289,7 +297,9 @@ fn handle_unknown_decision(
     match main_conf.fallback_remediation_or_default() {
         FallbackRemediation::Allow => HandlerResult::Declined,
         FallbackRemediation::Ban => handle_ban_decision(request, loc_conf, client_ip, lookup),
-        FallbackRemediation::Captcha => handle_captcha_decision(request, loc_conf, client_ip, lookup),
+        FallbackRemediation::Captcha => {
+            handle_captcha_decision(request, loc_conf, client_ip, lookup)
+        }
     }
 }
 
@@ -332,19 +342,28 @@ pub(crate) fn handle_captcha_decision(
         return HandlerResult::Declined;
     }
 
-    usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
-
-    // Handle based on request method
     match request.method() {
-        Method::GET | Method::HEAD => try_send_captcha_page(request, loc_conf, &captcha_config, client_ip, None),
+        Method::GET | Method::HEAD => {
+            let result = try_send_captcha_page(request, loc_conf, &captcha_config, client_ip, None);
+            if matches!(result, HandlerResult::Done) {
+                usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
+            }
+            result
+        }
         Method::POST => {
             if loc_conf.captcha_template.is_none() {
                 return apply_unenforceable_action(request, loc_conf);
             }
-            // Handle captcha verification
+            usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
             handle_captcha_post(request, loc_conf, &captcha_config, client_ip)
         }
-        _ => try_send_captcha_page(request, loc_conf, &captcha_config, client_ip, None),
+        _ => {
+            let result = try_send_captcha_page(request, loc_conf, &captcha_config, client_ip, None);
+            if matches!(result, HandlerResult::Done) {
+                usage_metrics::record_dropped(client_ip, lookup.origin, lookup.scenario_id);
+            }
+            result
+        }
     }
 }
 
@@ -471,15 +490,11 @@ fn maybe_clear_stale_captcha_cookie(request: &mut Request, loc_conf: &LocConfig)
 
     if has_cookie && !response_has_set_cookie(request, cookie_name) {
         let r: *const ngx_http_request_t = request.as_ref();
-        let is_secure =
-            unsafe { should_cookie_be_secure(r, loc_conf.captcha_cookie_secure.unwrap_or_default()) };
-        let clear_cookie = build_clear_cookie_with_attrs(
-            cookie_name,
-            "/",
-            is_secure,
-            true,
-            SameSite::Lax,
-        );
+        let is_secure = unsafe {
+            should_cookie_be_secure(r, loc_conf.captcha_cookie_secure.unwrap_or_default())
+        };
+        let clear_cookie =
+            build_clear_cookie_with_attrs(cookie_name, "/", is_secure, true, SameSite::Lax);
         request.add_header_out("Set-Cookie", &clear_cookie);
     }
 }

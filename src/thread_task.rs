@@ -3,7 +3,7 @@
 use ngx::ffi::*;
 use std::ffi::c_void;
 use std::mem;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -11,7 +11,7 @@ static POOL: AtomicPtr<ngx_thread_pool_t> = AtomicPtr::new(ptr::null_mut());
 
 /// Keep a non-cancelable timer while work is queued so a reloading worker does
 /// not call `ngx_worker_process_exit` (no timers ⇒ exit, even with open sockets).
-const KEEP_ALIVE_MS: ngx_msec_t = 1000;
+const KEEP_ALIVE_MS: ngx_msec_t = 5000;
 
 pub unsafe fn configure(cf: *mut ngx_conf_t) -> bool {
     let pool = unsafe { ngx_thread_pool_add(cf, ptr::null_mut()) };
@@ -56,16 +56,21 @@ where
         (*task).event.data = data.cast();
         (*task).event.handler = Some(done::<F, T, C>);
         (*task).event.log = (*(*r).connection).log;
-        if ngx_thread_task_post(pool, task) != NGX_OK as ngx_int_t {
-            drop(Box::from_raw(data));
-            return Err(());
-        }
         (*data).keep.handler = Some(keep_alive);
         (*data).keep.log = (*(*r).connection).log;
         ngx_add_timer(ptr::addr_of_mut!((*data).keep), KEEP_ALIVE_MS);
         let main = (*r).main;
         (*main).set_blocked((*main).blocked() + 1);
         (*r).set_aio(1);
+        if ngx_thread_task_post(pool, task) != NGX_OK as ngx_int_t {
+            if (*data).keep.timer_set() != 0 {
+                ngx_del_timer(ptr::addr_of_mut!((*data).keep));
+            }
+            (*main).set_blocked((*main).blocked() - 1);
+            (*r).set_aio(0);
+            drop(Box::from_raw(data));
+            return Err(());
+        }
         Ok(())
     }
 }
@@ -105,19 +110,23 @@ where
         let connection = (*r).connection;
         (*main).set_blocked((*main).blocked() - 1);
         (*r).set_aio(0);
-        // Match nginx's copy-filter thread completion for HTTP/2 streams.
         if (*r).http_version == 2000 {
             (*(*connection).write).set_ready(1);
             (*(*connection).write).set_active(0);
         }
-        // `r->terminated` exists only on nginx ≥ 1.25.5; connection error is portable.
-        if (*r).done() != 0 || (*connection).error() != 0 {
+        let skip_complete = (*r).done() != 0 || (*connection).error() != 0;
+        if skip_complete {
             if let Some(handler) = (*(*connection).write).handler {
                 handler((*connection).write);
             }
+            ngx_http_run_posted_requests(connection);
             return;
         }
-        (task.complete.take().unwrap())(r, task.result.take().unwrap_or(Err(())));
+        let complete = task.complete.take();
+        let result = task.result.take().unwrap_or(Err(()));
+        if let Some(complete) = complete {
+            let _ = catch_unwind(AssertUnwindSafe(|| complete(r, result)));
+        }
         ngx_http_run_posted_requests(connection);
     }
 }

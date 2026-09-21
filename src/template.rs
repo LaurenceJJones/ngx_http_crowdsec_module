@@ -410,10 +410,8 @@ mod tests {
 
     #[test]
     fn test_json_template_escapes() {
-        let template = Template::parse_with_content_type(
-            r#"{"uri": "{{request_uri}}"}"#,
-            "application/json",
-        );
+        let template =
+            Template::parse_with_content_type(r#"{"uri": "{{request_uri}}"}"#, "application/json");
         let mut vars = TemplateVariables::new();
         vars.request_uri = Some("/path\"with\"quotes".to_string());
 

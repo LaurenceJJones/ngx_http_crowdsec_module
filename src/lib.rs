@@ -12,8 +12,8 @@ mod captcha;
 mod conf;
 mod config;
 mod expiry;
-mod lapi;
 mod handler;
+mod lapi;
 mod metrics;
 mod realip;
 mod request_body;
@@ -25,14 +25,14 @@ mod thread_task;
 mod types;
 mod usage_metrics;
 
-use config::{DEFAULT_SHM_SIZE, LocConfig, MainConfig, NGX_HTTP_CROWDSEC_COMMANDS};
 use conf::{ConfValueError, NgxConfExt};
+use config::{LocConfig, MainConfig, DEFAULT_SHM_SIZE, NGX_HTTP_CROWDSEC_COMMANDS};
 use handler::{handle_access, handle_precontent};
 use ngx::core::Status;
 use ngx::ffi::{
-    NGX_HTTP_MODULE, NGX_OK, ngx_array_push, ngx_conf_t, ngx_cycle_t, ngx_http_handler_pt,
-    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE,
-    ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE, ngx_int_t, ngx_module_t,
+    ngx_array_push, ngx_conf_t, ngx_cycle_t, ngx_http_handler_pt, ngx_http_module_t,
+    ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_phases_NGX_HTTP_PRECONTENT_PHASE, ngx_int_t,
+    ngx_module_t, NGX_HTTP_MODULE, NGX_OK,
 };
 use ngx::http::{
     HttpModule, HttpModuleLocationConf, HttpModuleMainConf, Merge, MergeConfigError,
@@ -57,6 +57,10 @@ struct Module;
 
 pub(crate) fn crowdsec_loc_conf(request: &Request) -> Option<&LocConfig> {
     Module::location_conf(request)
+}
+
+pub(crate) fn crowdsec_main_conf(request: &Request) -> Option<&MainConfig> {
+    Module::main_conf(request)
 }
 
 unsafe impl HttpModuleMainConf for Module {
@@ -109,10 +113,8 @@ impl HttpModule for Module {
         unsafe { &*::core::ptr::addr_of!(ngx_http_crowdsec_module) }
     }
 
-    unsafe extern "C" fn init_main_conf(cf: *mut ngx_conf_t, conf: *mut c_void) -> *mut c_char {
-        let cf = unsafe { cf.as_ref().expect("cf") };
-        let conf = unsafe { &*(conf as *mut MainConfig) };
-        conf.validate_lapi_config(cf);
+    unsafe extern "C" fn init_main_conf(_cf: *mut ngx_conf_t, _conf: *mut c_void) -> *mut c_char {
+        // Location merges (and `enforcement_requested` / `appsec_requested`) run after this.
         core::ptr::null_mut()
     }
 
@@ -127,9 +129,12 @@ impl HttpModule for Module {
 
         match conf.merge_from(prev) {
             Ok(()) => {
-                if conf.enabled == Some(true) {
-                    if let Some(main) = Self::main_conf_mut(cf) {
+                if let Some(main) = Self::main_conf_mut(cf) {
+                    if conf.enabled == Some(true) {
                         main.enforcement_requested = true;
+                    }
+                    if conf.appsec_enabled == Some(true) {
+                        main.appsec_requested = true;
                     }
                 }
                 core::ptr::null_mut()
@@ -148,6 +153,8 @@ impl HttpModule for Module {
                 Some(c) => c,
                 None => return Status::NGX_ERROR.into(),
             };
+            conf.validate_lapi_config(&*cf);
+            conf.validate_appsec_config(&*cf);
 
             // Initialize shared memory zone
             let shm_size = conf.shm_size.unwrap_or(DEFAULT_SHM_SIZE);
@@ -287,7 +294,7 @@ pub unsafe extern "C" fn ngx_http_crowdsec_exit_worker(_cycle: *mut ngx_cycle_t)
             usage_metrics::flush_on_shutdown(
                 &config.url,
                 &config.api_key,
-                config.timeout_secs,
+                usage_metrics::SHUTDOWN_FLUSH_TIMEOUT_SECS,
                 config.usage_metrics_interval_secs,
             );
         }
@@ -390,10 +397,7 @@ mod tests {
 
     #[test]
     fn fallback_remediation_resolve_unknown_type() {
-        assert_eq!(
-            FallbackRemediation::Allow.resolve_unknown_type("mfa"),
-            None
-        );
+        assert_eq!(FallbackRemediation::Allow.resolve_unknown_type("mfa"), None);
         assert_eq!(
             FallbackRemediation::Ban.resolve_unknown_type("mfa"),
             Some(crate::shm::DecisionType::Ban)

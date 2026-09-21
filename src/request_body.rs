@@ -275,7 +275,10 @@ mod tests {
 
     #[test]
     fn body_extract_result_variants() {
-        assert_eq!(BodyExtractResult::Ok(vec![1]), BodyExtractResult::Ok(vec![1]));
+        assert_eq!(
+            BodyExtractResult::Ok(vec![1]),
+            BodyExtractResult::Ok(vec![1])
+        );
         assert_ne!(BodyExtractResult::Ok(vec![]), BodyExtractResult::Unreadable);
     }
 }

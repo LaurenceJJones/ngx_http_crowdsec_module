@@ -4,20 +4,21 @@
 //! provides utilities to read the body asynchronously using callbacks.
 
 use crate::captcha::config::CaptchaConfig;
-use crate::captcha::cookie::{SameSite, build_set_cookie, should_cookie_be_secure};
+use crate::captcha::cookie::{build_set_cookie, should_cookie_be_secure, SameSite};
 use crate::captcha::handler::{captcha_return_uri, captcha_template_vars};
 use crate::captcha::jwt::JwtManager;
-use crate::captcha::verifier::{VerifyResult, parse_captcha_response, verify_captcha};
+use crate::captcha::redirect::is_safe_header_value;
+use crate::captcha::verifier::{parse_captcha_response, verify_captcha, VerifyResult};
 use crate::handler::{HandlerResult, StoredPhaseResult};
 use crate::request_body::{
-    BodyExtractResult, CAPTCHA_POST_CTX_MAGIC, extract_request_body_limited, finalize_allow,
-    finish_phase_body_read, get_content_length, get_request_log,
-    initiate_body_read as start_body_read, module_ctx_slot, request_ctx_magic,
+    extract_request_body_limited, finalize_allow, finish_phase_body_read, get_content_length,
+    get_request_log, initiate_body_read as start_body_read, module_ctx_slot, request_ctx_magic,
+    BodyExtractResult, CAPTCHA_POST_CTX_MAGIC,
 };
 use crate::template::Template;
 use ngx::ffi::{
-    NGX_HTTP_INTERNAL_SERVER_ERROR, ngx_buf_t, ngx_http_finalize_request, ngx_http_request_t,
-    ngx_int_t, ngx_palloc,
+    ngx_buf_t, ngx_http_finalize_request, ngx_http_request_t, ngx_int_t, ngx_palloc,
+    NGX_HTTP_INTERNAL_SERVER_ERROR,
 };
 use ngx::http::Request;
 use ngx::ngx_log_debug;
@@ -159,9 +160,12 @@ impl CaptchaPostContext {
                 (*ctx_mut).store_result(result);
             }
             match result {
-                HandlerResult::Declined | HandlerResult::Error => finalize_allow(r),
-                HandlerResult::Forbidden => {
-                    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR as ngx_int_t);
+                HandlerResult::Declined => finalize_allow(r),
+                HandlerResult::Error | HandlerResult::Forbidden => {
+                    ngx_http_finalize_request(
+                        r,
+                        ngx::core::Status::from(ngx::http::HTTPStatus::FORBIDDEN).0,
+                    );
                 }
                 HandlerResult::Done | HandlerResult::BodyReadPending => {}
             }
@@ -252,7 +256,7 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
             Ok(ip) => ip,
             Err(_) => {
                 ngx_log_debug!(log, "crowdsec: failed to parse client IP from context");
-                finish(HandlerResult::Error);
+                finish(HandlerResult::Forbidden);
                 return;
             }
         };
@@ -307,7 +311,7 @@ unsafe extern "C" fn captcha_body_handler(r: *mut ngx_http_request_t) {
             },
         );
         if posted.is_err() {
-            complete_verification(r, verification_unavailable());
+            send_error("Verification service unavailable. Please try again.");
         }
     }
 }
@@ -341,7 +345,7 @@ unsafe fn complete_verification(r: *mut ngx_http_request_t, result: VerifyResult
             Ok(ip) => ip,
             Err(_) => {
                 ngx_log_debug!(log, "crowdsec: failed to parse client IP from context");
-                finish(HandlerResult::Error);
+                finish(HandlerResult::Forbidden);
                 return;
             }
         };
@@ -550,6 +554,13 @@ unsafe fn send_captcha_error_page(
 /// Add a header to the response
 unsafe fn add_header(r: *mut ngx_http_request_t, name: &str, value: &str) {
     unsafe {
+        if !is_safe_header_value(value)
+            || name.is_empty()
+            || name.contains(['\r', '\n', ':'])
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return;
+        }
         let h = ngx::ffi::ngx_list_push(&mut (*r).headers_out.headers)
             as *mut ngx::ffi::ngx_table_elt_t;
         if h.is_null() {

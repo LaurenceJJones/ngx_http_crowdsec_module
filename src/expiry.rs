@@ -38,6 +38,25 @@ impl DecisionExpiry {
         }
         active
     }
+
+    pub fn clear_bit(&mut self, bit: u8) {
+        match bit {
+            1 => self.ban = 0,
+            2 => self.captcha = 0,
+            _ => {}
+        }
+    }
+
+    pub fn prune_inactive(&mut self, present: u8, now: i64) -> u8 {
+        let active = self.active_mask(present, now);
+        if active & 1 == 0 {
+            self.ban = 0;
+        }
+        if active & 2 == 0 {
+            self.captcha = 0;
+        }
+        active
+    }
 }
 
 #[cfg(test)]
@@ -65,5 +84,15 @@ mod tests {
         assert_eq!(expiry.active_mask(1, i64::MAX), 1);
         expiry.merge(0, 1, 300);
         assert_eq!(expiry.active_mask(1, 300), 0);
+    }
+
+    #[test]
+    fn prune_inactive_clears_expired_deadlines() {
+        let mut expiry = DecisionExpiry::empty();
+        expiry.merge(0, 1, 60);
+        expiry.merge(1, 2, 3600);
+        assert_eq!(expiry.prune_inactive(3, 60), 2);
+        assert_eq!(expiry.ban, 0);
+        assert_eq!(expiry.captcha, 3600);
     }
 }

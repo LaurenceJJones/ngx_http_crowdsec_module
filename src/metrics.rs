@@ -8,7 +8,7 @@
 use crate::config::LocConfig;
 use crate::handler::HandlerResult;
 use crate::response::{
-    HeaderFailureAction, body_chain, disable_keepalive, send_chain_and_finalize,
+    body_chain, disable_keepalive, send_chain_and_finalize, HeaderFailureAction,
 };
 use crate::shm;
 use ngx::http::{HTTPStatus, Method, Request};

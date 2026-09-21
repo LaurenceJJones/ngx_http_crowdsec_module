@@ -33,14 +33,14 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_fallback_remediation` | http | `allow` | Unknown LAPI types: `allow` (ignore), `ban`, or `captcha` |
 | `crowdsec_unenforceable_action` | http, server, location | `allow` | When ban/captcha cannot be applied: `allow` or `block` (`crowdsec_ban_status`) |
 | `crowdsec_captcha_provider` | http, server, location | - | **Required for captcha.** `hcaptcha`, `recaptcha`, or `turnstile` |
-| `crowdsec_captcha_site_key` | http, server, location | - | Provider site key |
-| `crowdsec_captcha_secret_key` | http, server, location | - | Provider secret key |
+| `crowdsec_captcha_site_key` | http, server, location | - | Provider site key (1–256 bytes) |
+| `crowdsec_captcha_secret_key` | http, server, location | - | Provider secret key (1–256 bytes) |
 | `crowdsec_captcha_signing_key` | http, server, location | - | 64-char hex key (`openssl rand -hex 32`) |
-| `crowdsec_captcha_cookie_name` | http, server, location | `crowdsec_captcha` | Session cookie name |
+| `crowdsec_captcha_cookie_name` | http, server, location | `crowdsec_captcha` | Session cookie name (1–64 `A–Z a–z 0–9 _ -`) |
 | `crowdsec_captcha_expiry` | http, server, location | `3600` | Session lifetime (seconds) |
 | `crowdsec_captcha_fail_open` | http, server, location | `on` | Allow on provider verification failure (POST) |
 | `crowdsec_captcha_bind_ip` | http, server, location | `on` | Bind sessions to client IP |
-| `crowdsec_captcha_cookie_secure` | http, server, location | `auto` | `auto`, `on`, or `off` |
+| `crowdsec_captcha_cookie_secure` | http, server, location | `auto` | `auto`, `on`, or `off`. `auto` sets `Secure` on TLS connections, and on `X-Forwarded-Proto: https` only when the TCP peer is in `crowdsec_trusted_proxies` |
 | `crowdsec_captcha_template` | http, server, location | - | Required when captcha keys are set and `unenforceable_action` is `block` |
 | `crowdsec_appsec_url` | http | - | AppSec agent base URL |
 | `crowdsec_appsec` | http, server, location | `off` | Enable AppSec inspection |
@@ -50,7 +50,7 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_appsec_timeout` | http | `1000` | AppSec timeout (ms). Runs on nginx's `default` thread pool; does not block the request event loop. |
 | `crowdsec_appsec_max_body_size` | http | `10m` | Max body forwarded to AppSec |
 | `crowdsec_appsec_failure_action` | http, server, location | `passthrough` | When AppSec is unreachable or returns a non-403 error: `passthrough` or `deny` (`deny` uses the ban template / `crowdsec_ban_action`) |
-| `crowdsec_appsec_drop_unreadable_body` | http | `off` | When `on`, unreadable bodies are denied with the ban template |
+| `crowdsec_appsec_drop_unreadable_body` | http | `off` | When `on`, temp-file / unreadable / oversized bodies are denied with the ban template. When `off`, AppSec still inspects headers (no body) |
 | `crowdsec_bot_challenge` | http, server, location | `off` | CrowdSec 1.8 bot challenge (experimental) |
 | `crowdsec_usage_metrics_interval` | http | `900` | Push bouncer metrics to LAPI (`POST /v1/usage-metrics`); `off` disables. Pending counters are flushed on worker shutdown (reload/stop). |
 | `crowdsec_metrics` | location | `off` | Expose Prometheus metrics at **this** location only (does not inherit). Pair with `crowdsec off`. |
@@ -140,7 +140,11 @@ crowdsec_bot_challenge on;  # experimental — CrowdSec 1.8
 
 Request bodies (POST/PUT/PATCH/DELETE, and any method with a body) are inspected in the **PRECONTENT** phase so `proxy_pass` keeps the correct content handler. AppSec and captcha-provider HTTP calls run on nginx's native `default` thread pool; they do not block its request event loop. The module requires nginx built with `--with-threads` (check `nginx -V`). Captcha-provider calls have a five-second timeout; AppSec uses `crowdsec_appsec_timeout`.
 
-The pool can be sized with nginx's main-context directive, for example `thread_pool default threads=4 max_queue=128;` outside `http {}`. A full queue uses the configured AppSec/captcha failure policy. Queue wait is additional to the HTTP timeout, so bound the queue for your workload.
+The AppSec HTTP request uses the **AppSec agent** as `Host`. The incoming vhost is sent as `X-Crowdsec-Appsec-Host`. Client hop-by-hop headers, `Host`, `Content-Length`, and `User-Agent` are not forwarded; remaining client headers are copied first, then CrowdSec `X-Crowdsec-Appsec-*` headers are applied last so they overwrite any client copies.
+
+Bodies that nginx spilled to a temp file, or that exceed `crowdsec_appsec_max_body_size`, are not read on the event loop. By default AppSec still inspects headers; `crowdsec_appsec_drop_unreadable_body on` denies those requests with the ban template.
+
+The pool can be sized with nginx's main-context directive, for example `thread_pool default threads=4 max_queue=128;` outside `http {}`. A full queue uses the configured AppSec/captcha failure policy (captcha queue-unavailable shows the challenge error page rather than fail-open). Queue wait is additional to the HTTP timeout, so bound the queue for your workload.
 
 AppSec `captcha` responses are treated as bans: solving a stream captcha never bypasses a WAF rule. Captcha verification is supported only for LAPI stream decisions. Once verified, all application methods and bodies pass through normally; only the verification submission receives a 303 redirect.
 

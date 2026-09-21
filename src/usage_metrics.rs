@@ -104,7 +104,11 @@ fn ip_type_byte(ip: &IpAddr) -> u8 {
 }
 
 fn ip_type_label(ip_type: u8) -> &'static str {
-    if ip_type == 6 { "ipv6" } else { "ipv4" }
+    if ip_type == 6 {
+        "ipv6"
+    } else {
+        "ipv4"
+    }
 }
 
 /// Origin label for usage metrics (lists use `lists:<scenario>` like lua-cs-bouncer).
@@ -128,7 +132,9 @@ fn header_ptr() -> Option<*mut UsageMetricsHeader> {
     }
     unsafe {
         let data = (*zone).data.cast::<UsageMetricsHeader>();
-        if data.is_null() { None } else if (*data).magic != USAGE_MAGIC || (*data).layout_version != USAGE_LAYOUT_VERSION {
+        if data.is_null() {
+            None
+        } else if (*data).magic != USAGE_MAGIC || (*data).layout_version != USAGE_LAYOUT_VERSION {
             None
         } else {
             Some(data)
@@ -315,7 +321,8 @@ fn collect_items() -> Vec<(BucketKey, u64)> {
     let mut out = Vec::new();
     for i in 0..count {
         let bucket = unsafe { &*buckets.add(i) };
-        if bucket.key_hash.load(Ordering::Acquire) == 0 || bucket.ready.load(Ordering::Acquire) == 0 {
+        if bucket.key_hash.load(Ordering::Acquire) == 0 || bucket.ready.load(Ordering::Acquire) == 0
+        {
             continue;
         }
         let value = bucket.value.load(Ordering::Relaxed);
@@ -376,7 +383,14 @@ fn reset_after_push(items: &[(BucketKey, u64)]) {
     }
 }
 
-fn build_payload(items: &[(BucketKey, u64)], window_secs: u64, now: u64, startup: u64, os_name: &str, os_version: &str) -> String {
+fn build_payload(
+    items: &[(BucketKey, u64)],
+    window_secs: u64,
+    now: u64,
+    startup: u64,
+    os_name: &str,
+    os_version: &str,
+) -> String {
     let mut metric_items = Vec::new();
 
     for &(key, value) in items {
@@ -493,10 +507,7 @@ pub fn push_to_lapi(
 
     let (os_name, os_version) = read_os_info();
     let body = build_payload(&items, window, now, startup, &os_name, &os_version);
-    let url = format!(
-        "{}/v1/usage-metrics",
-        lapi_url.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/usage-metrics", lapi_url.trim_end_matches('/'));
 
     let agent = crate::lapi::agent();
     let response = crate::lapi::with_api_key(agent.post(&url), api_key)
@@ -526,17 +537,20 @@ pub fn push_to_lapi(
 /// Called from the elected poller worker's `exit_process` hook so counters are not
 /// lost on full restart. On `reload`, shared-memory counters survive, but flushing
 /// still closes the current reporting window cleanly for LAPI.
-pub fn flush_on_shutdown(
-    lapi_url: &str,
-    api_key: &str,
-    timeout_secs: u64,
-    interval_secs: u64,
-) {
+///
+/// Keep this short: nginx is exiting the worker and a full LAPI timeout would stall
+/// `nginx -s reload` / `stop`.
+pub const SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 2;
+
+pub fn flush_on_shutdown(lapi_url: &str, api_key: &str, timeout_secs: u64, interval_secs: u64) {
     if interval_secs == 0 {
         return;
     }
     match push_to_lapi(lapi_url, api_key, timeout_secs, interval_secs) {
-        Ok(()) => crowdsec_notice!(cycle_log(), "crowdsec: usage-metrics flushed on worker shutdown"),
+        Ok(()) => crowdsec_notice!(
+            cycle_log(),
+            "crowdsec: usage-metrics flushed on worker shutdown"
+        ),
         Err(e) => crowdsec_warn!(
             cycle_log(),
             "crowdsec: usage-metrics flush on shutdown failed: {e}"
@@ -614,11 +628,7 @@ unsafe extern "C" fn usage_metrics_zone_init(
                 bucket_count: MAX_BUCKETS as u32,
             },
         );
-        ptr::write_bytes(
-            p.add(header_size).cast::<UsageBucket>(),
-            0,
-            MAX_BUCKETS,
-        );
+        ptr::write_bytes(p.add(header_size).cast::<UsageBucket>(), 0, MAX_BUCKETS);
 
         (*shm_zone).data = p;
     }

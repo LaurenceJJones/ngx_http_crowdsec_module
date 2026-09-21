@@ -4,8 +4,8 @@ use core::error::Error as StdError;
 use core::ffi::c_char;
 use core::ptr;
 
-use ngx::ffi::{ngx_conf_t, ngx_str_t, NGX_LOG_EMERG};
 use ngx::core::NGX_CONF_ERROR;
+use ngx::ffi::{ngx_conf_t, ngx_str_t, NGX_LOG_EMERG};
 use ngx::ngx_conf_log_error;
 
 pub trait NgxConfExt {
@@ -16,12 +16,7 @@ pub trait NgxConfExt {
 impl NgxConfExt for ngx_conf_t {
     fn args(&self) -> &[ngx_str_t] {
         // SAFETY: cf.args is an ngx_array_t of ngx_str_t when populated by the parser.
-        unsafe {
-            self.args
-                .as_ref()
-                .map(|x| x.as_slice())
-                .unwrap_or_default()
-        }
+        unsafe { self.args.as_ref().map(|x| x.as_slice()).unwrap_or_default() }
     }
 
     fn error(&self, dir: impl AsRef<[u8]>, err: &dyn StdError) -> *mut c_char {

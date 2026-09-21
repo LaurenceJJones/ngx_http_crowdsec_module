@@ -10,8 +10,8 @@ use crate::realip::canonicalize_ip;
 use crate::shm::{self, CidrDecisionInfo, DecisionInfo, DecisionType, Origin};
 use crate::types::StreamResponse;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -139,7 +139,8 @@ impl StreamClient {
                 continue;
             }
             if let Some(ref value) = decision.value {
-                let Some(decision_type) = self.resolve_decision_type(&decision.decision_type) else {
+                let Some(decision_type) = self.resolve_decision_type(&decision.decision_type)
+                else {
                     continue;
                 };
 
@@ -170,7 +171,8 @@ impl StreamClient {
             }
             if let Some(ref value) = decision.value {
                 let duration_secs = decision.duration.as_ref().and_then(|d| parse_duration(d));
-                let Some(decision_type) = self.resolve_decision_type(&decision.decision_type) else {
+                let Some(decision_type) = self.resolve_decision_type(&decision.decision_type)
+                else {
                     continue;
                 };
                 let origin = decision
@@ -387,15 +389,17 @@ impl StreamClient {
             }
 
             if metrics_interval.as_secs() > 0 && last_metrics_push.elapsed() >= metrics_interval {
-                if let Err(e) = crate::usage_metrics::push_to_lapi(
+                match crate::usage_metrics::push_to_lapi(
                     &self.config.url,
                     &self.config.api_key,
                     self.config.timeout_secs,
                     metrics_interval.as_secs(),
                 ) {
-                    crowdsec_warn!(cycle_log(), "crowdsec: usage-metrics push failed: {e}");
+                    Ok(()) => last_metrics_push = std::time::Instant::now(),
+                    Err(e) => {
+                        crowdsec_warn!(cycle_log(), "crowdsec: usage-metrics push failed: {e}")
+                    }
                 }
-                last_metrics_push = std::time::Instant::now();
             }
         }
 
@@ -467,14 +471,8 @@ mod tests {
             fallback_remediation: FallbackRemediation::Ban,
             ..Default::default()
         });
-        assert_eq!(
-            client.resolve_decision_type("mfa"),
-            Some(DecisionType::Ban)
-        );
-        assert_eq!(
-            client.resolve_decision_type("ban"),
-            Some(DecisionType::Ban)
-        );
+        assert_eq!(client.resolve_decision_type("mfa"), Some(DecisionType::Ban));
+        assert_eq!(client.resolve_decision_type("ban"), Some(DecisionType::Ban));
 
         let client = StreamClient::new(StreamClientConfig::default());
         assert_eq!(client.resolve_decision_type("mfa"), None);

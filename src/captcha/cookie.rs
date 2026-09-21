@@ -151,22 +151,30 @@ pub unsafe fn is_https(request: *const ngx_http_request_t) -> bool {
             return true;
         }
 
-        // Check X-Forwarded-Proto header (common when behind reverse proxy)
-        if let Some(proto) = get_header(request, "X-Forwarded-Proto") {
-            if proto.eq_ignore_ascii_case("https") {
-                return true;
+        // Check X-Forwarded-Proto only when the TCP peer is a trusted proxy.
+        if forwarded_proto_trusted(request) {
+            if let Some(proto) = get_header(request, "X-Forwarded-Proto") {
+                if proto.eq_ignore_ascii_case("https") {
+                    return true;
+                }
             }
-        }
-
-        // Check X-Forwarded-Ssl header (alternative)
-        if let Some(ssl) = get_header(request, "X-Forwarded-Ssl") {
-            if ssl.eq_ignore_ascii_case("on") {
-                return true;
+            if let Some(ssl) = get_header(request, "X-Forwarded-Ssl") {
+                if ssl.eq_ignore_ascii_case("on") {
+                    return true;
+                }
             }
         }
 
         false
     }
+}
+
+fn forwarded_proto_trusted(request: *const ngx_http_request_t) -> bool {
+    let request = unsafe { ngx::http::Request::from_ngx_http_request(request.cast_mut()) };
+    let Some(main) = crate::crowdsec_main_conf(&request) else {
+        return false;
+    };
+    crate::realip::peer_is_trusted_proxy(&request, &main.trusted_proxies)
 }
 
 /// Determine if cookie should have Secure flag based on config and request

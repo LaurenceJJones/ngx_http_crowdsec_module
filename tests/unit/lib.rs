@@ -12,6 +12,8 @@ mod expiry;
 mod jwt;
 #[path = "../../src/lapi.rs"]
 mod lapi;
+#[path = "../../src/captcha/redirect.rs"]
+mod redirect;
 #[path = "../../src/template.rs"]
 mod template;
 #[path = "../../src/types.rs"]

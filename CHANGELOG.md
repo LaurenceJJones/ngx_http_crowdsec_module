@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-09-21
+
+Hardening after 0.5.1: AppSec header handling, captcha open-redirect/JWT checks, SHM lock reclaim, and thread-pool task posting. No SHM layout bump — `reload` is enough if you already restarted for 0.5.0.
+
+### Changed
+
+- **AppSec request** — HTTP `Host` is the AppSec agent. The incoming vhost is `X-Crowdsec-Appsec-Host`. Client headers are copied first (skipping `Host`, `Content-Length`, hop-by-hop, `User-Agent`, and client `X-Crowdsec-*`); CrowdSec metadata headers are applied last so they overwrite any leftover copies.
+- **AppSec oversized / temp-file bodies** — headers-only inspect by default (no event-loop file read). `crowdsec_appsec_drop_unreadable_body on` still denies with the ban template.
+- **Captcha `Secure` cookie (`auto`)** — `X-Forwarded-Proto` / `X-Forwarded-Ssl` are trusted only when the TCP peer is in `crowdsec_trusted_proxies`.
+- **Usage metrics** — failed LAPI pushes retry on the next poll instead of waiting a full interval; worker-exit flush uses a 2s timeout so reload/stop is not blocked by the LAPI HTTP timeout.
+- **Config warnings** — `crowdsec on` without `crowdsec_url` / `crowdsec_api_key`, and `crowdsec_appsec on` without `crowdsec_appsec_url`, are logged after location merge (previously the LAPI warning ran too early to see `crowdsec on`).
+
+### Fixed
+
+- Protocol-relative captcha return URIs (`//host`) no longer become open redirects.
+- Captcha JWT requires `typ=captcha_pass` and rejects `iat` more than 60s in the future.
+- Captcha provider-key and cookie-name lengths are rejected at config parse (they must fit the POST context).
+- Thread-pool tasks arm keepalive / `blocked` / `aio` before `ngx_thread_task_post`, and roll those back if the queue is full. Captcha queue-unavailable shows the challenge error page instead of fail-open.
+- Completing a thread-pool task after client disconnect runs `ngx_http_run_posted_requests`; panics in work/complete are caught.
+- SHM writer lock is cleared when reclaiming a dead poller PID (not only on zone init). Clock eviction prefers expired slots; `clear_all` zeros CIDR prefix scratch; removing a decision type clears its expiry bit.
+- Usage `dropped` counters increment only after a captcha page is actually sent (or a verification POST starts).
+- Captcha template/IP/header failures return 403 instead of 500 or allow.
+
+### Added
+
+- CI job that compiles the Ubuntu 24.04 / nginx 1.24 apt module. Release artifacts include the Debian 13 (trixie) `.so`.
+
 ## [0.5.1] - 2026-09-21
 
 Patch: bump `rustls` 0.23.43 → 0.23.45 so `cargo audit` passes ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285) / GHSA-2mjx-qc3c-rqvc). TLS 1.3 handshake messages packed across a key change in the same record are now rejected. Transitive via `ureq`; no module API change. Full restart is **not** required if you already restarted for 0.5.0.

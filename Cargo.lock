@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "ngx_http_crowdsec_module"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "base64",
  "form_urlencoded",

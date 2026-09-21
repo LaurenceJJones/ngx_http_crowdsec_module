@@ -103,5 +103,4 @@ mod tests {
         assert_eq!(response.new.unwrap().len(), 1);
         assert_eq!(response.deleted.unwrap().len(), 1);
     }
-
 }

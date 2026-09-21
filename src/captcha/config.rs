@@ -159,11 +159,9 @@ mod tests {
     #[test]
     fn test_provider_urls() {
         assert!(CaptchaProvider::HCaptcha.verify_url().contains("hcaptcha"));
-        assert!(
-            CaptchaProvider::Turnstile
-                .verify_url()
-                .contains("cloudflare")
-        );
+        assert!(CaptchaProvider::Turnstile
+            .verify_url()
+            .contains("cloudflare"));
         assert!(CaptchaProvider::ReCaptcha.verify_url().contains("google"));
     }
 
