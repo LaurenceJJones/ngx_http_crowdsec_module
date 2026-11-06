@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-06
+
+Patch: a solved stream captcha no longer skips AppSec. No SHM layout bump — `reload` is enough if you already restarted for 0.5.0.
+
 ### Fixed
 
-- A solved stream captcha no longer skips AppSec. The cookie clears only the LAPI captcha remediation; WAF bans and bot-challenge responses still apply on the following request. Unsolved captcha and bans still skip AppSec unless `crowdsec_appsec_always` is on. A solved session also no longer replaces static files (such as `/favicon.ico`) with the captcha interstitial's empty response.
+- A solved stream captcha no longer skips AppSec. The captcha decision stays on the IP. A valid cookie lets that browser skip the captcha page, and WAF bans and bot-challenge responses still apply on the following request. Unsolved captcha and bans still skip AppSec unless `crowdsec_appsec_always` is on. A solved session also no longer replaces static files (such as `/favicon.ico`) with the captcha interstitial's empty response.
 
 ### Changed
 
