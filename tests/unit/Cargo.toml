@@ -10,8 +10,8 @@ serde_json = "1.0"
 ureq = { version = "2.9", features = ["json"] }
 hmac = "0.12"
 sha2 = "0.10"
-base64 = "0.22"
-rand = "0.8"
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+rand = "0.10"
 
 [lib]
 path = "lib.rs"

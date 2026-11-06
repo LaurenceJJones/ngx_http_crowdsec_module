@@ -58,6 +58,13 @@ class Mock(BaseHTTPRequestHandler):
                 time.sleep(0.8)
             if uri.startswith("/waf-captcha"):
                 self.reply(403, b'{"action":"captcha"}')
+            elif uri.startswith("/after-pass-ban"):
+                self.reply(403, b'{"action":"ban"}')
+            elif uri.startswith("/after-pass-challenge"):
+                self.reply(
+                    403,
+                    b'{"action":"challenge","http_status":403,"user_body_content":"bot-challenge"}',
+                )
             else:
                 self.reply(200, b"{}")
         else:
@@ -133,6 +140,7 @@ http {{
     crowdsec_appsec_url http://127.0.0.1:{port}/appsec;
     crowdsec_appsec_timeout 2000;
     crowdsec_appsec_failure_action deny;
+    crowdsec_bot_challenge on;
     crowdsec_ban_template {ROOT}/templates/default.html;
     crowdsec_captcha_provider hcaptcha;
     crowdsec_captcha_site_key regression;
@@ -186,10 +194,18 @@ http {{
                                        cookie=token("198.51.100.3"))
                 assert (status, body) == (200, f"{method}:hello=world".encode()), (status, body)
             assert b"hcaptcha" in request(ip="198.51.100.3")[1]
+            # Solved stream captcha must not skip AppSec when appsec_always is off.
+            passed = token("198.51.100.3")
+            status, body = request("/after-pass-challenge", ip="198.51.100.3")
+            assert b"hcaptcha" in body, (status, body)
+            status, body = request("/after-pass-challenge", ip="198.51.100.3", cookie=passed)
+            assert (status, body) == (403, b"bot-challenge"), (status, body)
+            status, body = request("/after-pass-ban", ip="198.51.100.3", cookie=passed)
+            assert status == 403 and b"security policy" in body, (status, body)
             for method in ["GET", "POST"]:
                 assert request("/waf-captcha", method, "198.51.100.3",
                                token("198.51.100.3"), "x=y" if method == "POST" else None)[0] == 403
-            print("PASS: valid stream captcha sessions preserve methods/bodies; WAF captcha is a ban", flush=True)
+            print("PASS: valid stream captcha sessions preserve methods/bodies; solved captcha still hits AppSec ban and bot challenge", flush=True)
 
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 slow_started.clear()

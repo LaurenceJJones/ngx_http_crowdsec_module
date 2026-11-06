@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A solved stream captcha no longer skips AppSec. The cookie clears only the LAPI captcha remediation; WAF bans and bot-challenge responses still apply on the following request. Unsolved captcha and bans still skip AppSec unless `crowdsec_appsec_always` is on. A solved session also no longer replaces static files (such as `/favicon.ico`) with the captcha interstitial's empty response.
+
+### Changed
+
+- Dependencies within the Rust 1.85 MSRV: `base64` 0.22 → 0.23 (std only; the `simd-unsafe` engines stay off), `rand` 0.8 → 0.10, `libc` 0.2.189 → 0.2.191, `serde_json` 1.0.151 → 1.0.154, and `rustls` 0.23.45 → 0.23.46 (via `ureq` 2). `ureq` stays on 2.12 (latest 2.x); 3.x is a different client. `hmac` 0.12 / `sha2` 0.10 stay because `sha2` 0.11 requires Rust 1.88. Transitive crates that need a newer compiler (ICU 2.3+, `idna_adapter` 1.2.2) stay on the 1.85-compatible versions.
+
 ## [0.5.2] - 2026-09-21
 
 Hardening after 0.5.1: AppSec header handling, captcha open-redirect/JWT checks, SHM lock reclaim, and thread-pool task posting. No SHM layout bump — `reload` is enough if you already restarted for 0.5.0.

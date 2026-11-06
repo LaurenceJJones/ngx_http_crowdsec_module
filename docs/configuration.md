@@ -44,7 +44,7 @@ All directives can be set at `http`, `server`, or `location` unless noted.
 | `crowdsec_captcha_template` | http, server, location | - | Required when captcha keys are set and `unenforceable_action` is `block` |
 | `crowdsec_appsec_url` | http | - | AppSec agent base URL |
 | `crowdsec_appsec` | http, server, location | `off` | Enable AppSec inspection |
-| `crowdsec_appsec_always` | http, server, location | `off` | Run AppSec even when the client IP has a ban/captcha decision |
+| `crowdsec_appsec_always` | http, server, location | `off` | Also inspect before a ban or an unsolved captcha. A solved captcha always reaches AppSec |
 | `crowdsec_static_extensions` | http, server, location | `.ico` | File extensions that skip HTML ban/captcha pages (e.g. `.css`, `.js`); use `off` to disable |
 | `crowdsec_appsec_api_key` | http | - | Defaults to `crowdsec_api_key` |
 | `crowdsec_appsec_timeout` | http | `1000` | AppSec timeout (ms). Runs on nginx's `default` thread pool; does not block the request event loop. |
@@ -146,7 +146,7 @@ Bodies that nginx spilled to a temp file, or that exceed `crowdsec_appsec_max_bo
 
 The pool can be sized with nginx's main-context directive, for example `thread_pool default threads=4 max_queue=128;` outside `http {}`. A full queue uses the configured AppSec/captcha failure policy (captcha queue-unavailable shows the challenge error page rather than fail-open). Queue wait is additional to the HTTP timeout, so bound the queue for your workload.
 
-AppSec `captcha` responses are treated as bans: solving a stream captcha never bypasses a WAF rule. Captcha verification is supported only for LAPI stream decisions. Once verified, all application methods and bodies pass through normally; only the verification submission receives a 303 redirect.
+AppSec `captcha` responses are treated as bans: solving a stream captcha never bypasses a WAF rule. Captcha verification is supported only for LAPI stream decisions. A valid captcha cookie clears only that stream remediation. The next request is still inspected by AppSec, so a WAF ban or bot challenge still applies before the application. When AppSec allows the request, application methods and bodies pass through unchanged; only the verification submission receives a 303 redirect. An unsolved captcha (and any ban) is applied without AppSec unless `crowdsec_appsec_always` is on.
 
 Internal `/crowdsec-internal/challenge/*` paths must stay on the bouncer, not the origin. IPv4-mapped IPv6 clients (`::ffff:a.b.c.d`) are treated as IPv4 for bans, bypass, and trusted proxies.
 

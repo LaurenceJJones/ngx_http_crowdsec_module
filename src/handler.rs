@@ -1,7 +1,7 @@
 use crate::captcha;
 use crate::captcha::cookie::{
-    build_clear_cookie_with_attrs, get_cookie, response_has_set_cookie, should_cookie_be_secure,
-    SameSite,
+    SameSite, build_clear_cookie_with_attrs, get_cookie, response_has_set_cookie,
+    should_cookie_be_secure,
 };
 use crate::captcha::handler::{captcha_session_valid, send_captcha_page};
 use crate::config::{
@@ -9,7 +9,7 @@ use crate::config::{
 };
 use crate::realip;
 use crate::response::{
-    body_chain, disable_keepalive, send_chain_and_finalize, HeaderFailureAction,
+    HeaderFailureAction, body_chain, disable_keepalive, send_chain_and_finalize,
 };
 use crate::shm::{self, DecisionType, LookupResult};
 use crate::template::{Template, TemplateVariables};
@@ -87,8 +87,40 @@ fn is_static_asset_request(request: &Request, loc_conf: &LocConfig) -> bool {
         .is_ok_and(|path| loc_conf.is_static_asset_path(path))
 }
 
-fn should_run_appsec(loc_conf: &LocConfig, lookup: &LookupResult) -> bool {
-    loc_conf.appsec_enabled == Some(true) && (!lookup.found || loc_conf.appsec_always == Some(true))
+/// AppSec runs when it is enabled and the stream decision would not already
+/// finish the request. A solved stream captcha clears only that remediation:
+/// the WAF and bot challenge still inspect. `crowdsec_appsec_always` also
+/// inspects before an active ban or an unsolved captcha.
+fn should_run_appsec(loc_conf: &LocConfig, lookup: &LookupResult, captcha_passed: bool) -> bool {
+    if loc_conf.appsec_enabled != Some(true) {
+        return false;
+    }
+    if !lookup.found || loc_conf.appsec_always == Some(true) {
+        return true;
+    }
+    captcha_passed && lookup.decision_type == DecisionType::Captcha
+}
+
+/// True when a valid captcha cookie would let this request past the stream
+/// captcha. Callers use it to keep AppSec on the path. Skipped when AppSec
+/// would already run, so the JWT is not verified twice for those requests.
+fn stream_captcha_passed(
+    request: &mut Request,
+    loc_conf: &LocConfig,
+    client_ip: &IpAddr,
+    lookup: &LookupResult,
+) -> bool {
+    if loc_conf.appsec_enabled != Some(true)
+        || loc_conf.appsec_always == Some(true)
+        || !lookup.found
+        || lookup.decision_type != DecisionType::Captcha
+    {
+        return false;
+    }
+    let Some(captcha_config) = loc_conf.captcha_config() else {
+        return false;
+    };
+    captcha_session_valid(request, &captcha_config, client_ip)
 }
 
 fn record_ban_applied(client_ip: &IpAddr, lookup: &LookupResult) {
@@ -159,8 +191,10 @@ pub fn handle_access(
     let lookup = shm::lookup_ip(&client_ip);
 
     // AppSec (including body reads) runs in PRECONTENT. Defer remediations so
-    // `crowdsec_appsec_always` can inspect before a ban/captcha page.
-    if should_run_appsec(loc_conf, &lookup) {
+    // inspection happens before a ban/captcha page (`crowdsec_appsec_always`)
+    // and after a solved stream captcha (that cookie must not skip the WAF).
+    let captcha_passed = stream_captcha_passed(request, loc_conf, &client_ip, &lookup);
+    if should_run_appsec(loc_conf, &lookup, captcha_passed) {
         return HandlerResult::Declined;
     }
 
@@ -204,8 +238,9 @@ pub fn handle_precontent(
     let lookup = shm::lookup_ip(&client_ip);
     let uri = request.unparsed_uri().to_str().unwrap_or("/");
     let internal_challenge = uri.starts_with("/crowdsec-internal/challenge/");
+    let captcha_passed = stream_captcha_passed(request, loc_conf, &client_ip, &lookup);
 
-    if !should_run_appsec(loc_conf, &lookup) && !internal_challenge {
+    if !should_run_appsec(loc_conf, &lookup, captcha_passed) && !internal_challenge {
         return HandlerResult::Declined;
     }
 
@@ -315,16 +350,6 @@ pub(crate) fn handle_captcha_decision(
         return result;
     }
 
-    // For static assets like .ico, return 200 without body
-    // This allows favicon to display on captcha page without sending HTML
-    if is_static_asset_request(request, loc_conf) {
-        if send_empty_response(request, HTTPStatus::OK).is_ok() {
-            shm::metrics_inc_http_captcha();
-            return HandlerResult::Done;
-        }
-        return apply_unenforceable_action(request, loc_conf);
-    }
-
     // Get captcha configuration from location config (inherits from parent levels)
     let captcha_config = match loc_conf.captcha_config() {
         Some(cfg) => cfg,
@@ -338,8 +363,20 @@ pub(crate) fn handle_captcha_decision(
         }
     };
 
+    // A solved captcha continues into AppSec and the real response, including
+    // static files. The empty-body shortcut is only for the interstitial page.
     if captcha_session_valid(request, &captcha_config, client_ip) {
         return HandlerResult::Declined;
+    }
+
+    // For static assets like .ico, return 200 without body.
+    // This allows favicon to display on the captcha page without sending HTML.
+    if is_static_asset_request(request, loc_conf) {
+        if send_empty_response(request, HTTPStatus::OK).is_ok() {
+            shm::metrics_inc_http_captcha();
+            return HandlerResult::Done;
+        }
+        return apply_unenforceable_action(request, loc_conf);
     }
 
     match request.method() {
@@ -629,14 +666,26 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(should_run_appsec(&loc, &lookup_none));
-        assert!(!should_run_appsec(&loc, &lookup_ban));
+        let lookup_captcha = LookupResult {
+            found: true,
+            decision_type: DecisionType::Captcha,
+            origin: Origin::Crowdsec,
+            scenario_id: 0,
+        };
+
+        assert!(should_run_appsec(&loc, &lookup_none, false));
+        assert!(!should_run_appsec(&loc, &lookup_ban, false));
+        assert!(!should_run_appsec(&loc, &lookup_ban, true));
+        assert!(!should_run_appsec(&loc, &lookup_captcha, false));
+        assert!(should_run_appsec(&loc, &lookup_captcha, true));
 
         loc.appsec_always = Some(true);
-        assert!(should_run_appsec(&loc, &lookup_ban));
+        assert!(should_run_appsec(&loc, &lookup_ban, false));
+        assert!(should_run_appsec(&loc, &lookup_captcha, false));
 
         loc.appsec_enabled = Some(false);
-        assert!(!should_run_appsec(&loc, &lookup_ban));
+        assert!(!should_run_appsec(&loc, &lookup_ban, true));
+        assert!(!should_run_appsec(&loc, &lookup_captcha, true));
     }
 
     #[test]

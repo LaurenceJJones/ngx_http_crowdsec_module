@@ -52,7 +52,7 @@ Verify symbols on [docs.rs/ngx/0.5.1](https://docs.rs/ngx/0.5.1/ngx/) or registr
 | Phase | Role |
 |-------|------|
 | **ACCESS** | IP ban/captcha only. Never reads the request body except captcha POST. |
-| **PRECONTENT** | **AppSec** (headers + body via `inspect`). Ban/captcha deferred here when `crowdsec_appsec_always` must inspect first. |
+| **PRECONTENT** | **AppSec** (headers + body via `inspect`). Deferred here when `crowdsec_appsec_always` must inspect before a ban or unsolved captcha, and whenever a solved stream captcha would otherwise skip the WAF. |
 
 **AppSec + request bodies** (`src/appsec.rs`, `src/request_body.rs`):
 
